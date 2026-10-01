@@ -78,7 +78,7 @@ ci: ## 与 CI 一致的校验
 
 .PHONY: tools
 tools: ## 安装 golangci-lint（protoc-gen-* 按需）
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
 .PHONY: tidy
 tidy: ## 整理依赖
