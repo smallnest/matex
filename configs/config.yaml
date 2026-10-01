@@ -1,0 +1,49 @@
+# matex demo 配置。
+#
+# ${VAR} 与 ${VAR:default} 会从环境变量展开。
+# 结构体 tag 语义：default=… / env=VAR / optional
+# 顶层除 "demo" 外的 key 是框架段；"demo" 是服务专属段
+#（key 必须等于 Service.Name()，内容由服务用 env.DecodeService 解码）。
+
+http:
+  addr: ":8080"          # 监听地址
+  timeout: 10s           # 单请求预算
+  max_body: 33554432     # 请求体上限（32MB）
+
+grpc:
+  addr: ":9090"          # gRPC 监听地址；留空或删除本段即禁用 gRPC server
+  dial_timeout: 3s       # gRPC client 拨号超时（Env.GRPCClient 使用）
+
+rpcx:
+  network: tcp           # tcp | quic | kcp | ws | http
+  addr: ":8972"          # rpcx 监听地址；留空或删除本段即禁用 rpcx server
+
+log:
+  level: info            # debug | info | warn | error
+
+# —— 以下各段可选：配置了才会初始化，未配置时对应 env 字段为 nil ——
+
+db:
+  driver: postgres       # postgres | mysql | sqlite（sqlite 为纯 Go 驱动，无需 cgo）
+  dsn: ${DB_DSN:postgres://matex:matex@localhost:5432/matex?sslmode=disable}
+  # mysql 示例: user:pass@tcp(localhost:3306)/matex?parseTime=true
+  # sqlite 示例: file:matex.db（或 :memory:）
+  max_open_conns: 16
+  max_idle_conns: 2
+  conn_max_lifetime: 30m
+  connect_timeout: 5s
+  slow_threshold: 250ms
+
+redis:
+  addr: ${REDIS_ADDR:localhost:6379}
+
+memcache:
+  addrs: ["localhost:11211"]
+
+kafka:
+  brokers: ${KAFKA_BROKERS:localhost:9092}   # 逗号分隔也可
+
+# —— 服务专属段 ——
+demo:
+  greeting: "Hello, "
+  consume: false

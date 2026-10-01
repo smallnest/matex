@@ -1,0 +1,25 @@
+{
+  "name": "matex",
+  "owner": {
+    "name": "smallnest",
+    "url": "https://github.com/smallnest"
+  },
+  "description": "matex 企业级 Go 脚手架 —— 大道至简。零 Web 框架、零 ORM，薄封装 PostgreSQL/Redis/Memcached/Kafka/gRPC/rpcx，AI skill 原生。",
+  "plugins": [
+    {
+      "name": "matex-skills",
+      "source": "./",
+      "description": "matex 脚手架的 AI skills：新增业务域 + 接入数据库/缓存/消息队列/gRPC/rpcx 的完整操作手册。",
+      "category": "engineering",
+      "keywords": [
+        "go",
+        "scaffold",
+        "framework",
+        "grpc",
+        "rpcx",
+        "kafka",
+        "redis"
+      ]
+    }
+  ]
+}

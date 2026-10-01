@@ -1,0 +1,12 @@
+# 零依赖最小配置：只需 http + log 即可启动，不连任何外部服务。
+# 用法：go run ./cmd/demo -conf configs/config.min.yaml
+# 需要 :8080 之外的端口时改 addr。
+http:
+  addr: ":8080"
+  timeout: 10s
+
+log:
+  level: info
+
+demo:
+  greeting: "Hello, "

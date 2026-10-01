@@ -1,0 +1,32 @@
+{
+  "name": "matex-skills",
+  "version": "1.0.0",
+  "description": "matex 企业级 Go 脚手架的 AI skills：新增业务域，接入 PostgreSQL / Redis / Memcached / Kafka / gRPC / rpcx，大道至简。",
+  "author": {
+    "name": "smallnest",
+    "url": "https://github.com/smallnest"
+  },
+  "homepage": "https://github.com/smallnest/matex",
+  "repository": "https://github.com/smallnest/matex",
+  "license": "MIT",
+  "keywords": [
+    "go",
+    "scaffold",
+    "framework",
+    "grpc",
+    "rpcx",
+    "kafka",
+    "redis",
+    "postgres",
+    "memcached"
+  ],
+  "skills": [
+    "./skills/matex-add-domain",
+    "./skills/matex-setup-database",
+    "./skills/matex-setup-redis",
+    "./skills/matex-setup-memcache",
+    "./skills/matex-setup-kafka",
+    "./skills/matex-setup-grpc",
+    "./skills/matex-setup-rpcx"
+  ]
+}

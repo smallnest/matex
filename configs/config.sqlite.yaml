@@ -1,0 +1,24 @@
+# 带数据库但零外部依赖：纯 Go SQLite（无 cgo、无 Docker、无需下载）。
+#
+# 首次：
+#   make migrate DRIVER=sqlite DSN=file:matex.db
+# 然后：
+#   make run-sqlite            # 等价于 go run ./cmd/demo -conf configs/config.sqlite.yaml
+#
+# 想验证持久化：多调几次 /api/v1/hello/world，再看 /api/v1/hello/world/stats。
+
+http:
+  addr: ":8080"
+  timeout: 10s
+
+log:
+  level: info
+
+db:
+  driver: sqlite
+  dsn: file:matex.db
+  slow_threshold: 250ms
+
+demo:
+  greeting: "Hello, "
+  consume: false

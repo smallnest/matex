@@ -1,0 +1,41 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - depguard
+  settings:
+    depguard:
+      rules:
+        # 单一基础设施入口：业务代码只能经 pkg/core 访问驱动库。
+        business-no-drivers:
+          files:
+            - "**/internal/**"
+          deny:
+            - pkg: github.com/jackc/pgx
+              desc: use pkg/core/db
+            - pkg: github.com/go-sql-driver/mysql
+              desc: use pkg/core/db
+            - pkg: modernc.org/sqlite
+              desc: use pkg/core/db
+            - pkg: github.com/redis/go-redis
+              desc: use pkg/core/redis
+            - pkg: github.com/bradfitz/gomemcache
+              desc: use pkg/core/memcache
+            - pkg: github.com/twmb/franz-go
+              desc: use pkg/core/kafka
+        # 零 Web 框架：路由用 net/http 的 ServeMux（pkg/core/httpx）。
+        no-web-framework:
+          files:
+            - "**/*.go"
+          deny:
+            - pkg: github.com/gin-gonic/gin
+              desc: matex uses net/http via pkg/core/httpx
+            - pkg: github.com/labstack/echo
+              desc: matex uses net/http via pkg/core/httpx
+            - pkg: github.com/gofiber/fiber
+              desc: matex uses net/http via pkg/core/httpx
+            - pkg: github.com/go-chi/chi
+              desc: matex uses net/http via pkg/core/httpx
+            - pkg: github.com/gorilla/mux
+              desc: matex uses net/http via pkg/core/httpx
