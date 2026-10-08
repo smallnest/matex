@@ -1,16 +1,22 @@
 // Command observability demonstrates pkg/core/obs:
 //
 //   - structured JSON logs on stdout, every line carries "service"
-//   - a trace id taken from X-Request-ID (or generated) attached to every
-//     log line via obs.Info(ctx, …) and returned in the response body
+//   - a correlation id attached to every log line via obs.Info(ctx, …) and
+//     returned in the response body: the active span's trace id when
+//     tracing is on, the X-Request-ID otherwise
 //   - Prometheus metrics: the framework's http_server_* plus custom
 //     counters/gauges registered in Setup
+//   - OpenTelemetry tracing (opt-in via the `trace` config section): each
+//     request becomes a server span that joins the caller's trace, and
+//     obs.StartSpan adds child spans for the expensive parts
 //
 // Run:
 //
 //	go run ./examples/observability
 //
 //	curl -i -H 'X-Request-ID: demo-1' localhost:8080/api/v1/work/alice
+//	curl -i -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+//	  localhost:8080/api/v1/work/alice      # needs trace.enabled: true
 //	curl -s localhost:8080/metrics | grep -E '^(observe_|http_server_)'
 package main
 
@@ -63,12 +69,11 @@ func (s *obsService) workHandler(ctx context.Context, r *http.Request) (any, err
 	name := r.PathValue("name")
 	start := time.Now()
 
-	// ctx carries the trace id injected by httpx, so every line is
+	// ctx carries the correlation id injected by httpx, so every line is
 	// correlatable; no need to pass a logger around.
 	obs.Info(ctx, s.cfg.Prefix+" started", "name", name)
 
-	value := len(name) * 2
-	time.Sleep(5 * time.Millisecond)
+	value := s.compute(ctx, name)
 
 	s.work.WithLabelValues(name).Inc()
 	s.value.WithLabelValues(name).Set(float64(value))
@@ -81,6 +86,18 @@ func (s *obsService) workHandler(ctx context.Context, r *http.Request) (any, err
 		"value":    value,
 		"trace_id": obs.TraceID(ctx),
 	}, nil
+}
+
+// compute wraps the expensive step in its own span, nested under the
+// request's server span. obs.StartSpan is a no-op when tracing is off, so
+// the instrumentation stays unconditional — no `if tracing` branches.
+func (s *obsService) compute(ctx context.Context, name string) int {
+	ctx, span := obs.StartSpan(ctx, "compute")
+	defer span.End()
+
+	time.Sleep(5 * time.Millisecond)
+	obs.Debug(ctx, "computed", "name", name)
+	return len(name) * 2
 }
 
 func main() {

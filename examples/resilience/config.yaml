@@ -1,0 +1,18 @@
+# examples/resilience 的配置。
+# 框架段：http（必填）、log（必填）；服务专属段的 key 必须等于 Service.Name()。
+
+http:
+  addr: ":8082"
+  timeout: 5s
+  max_body: 1048576
+
+log:
+  level: info
+
+resilience:
+  # 登录接口限流：每个客户端 IP 每秒 2 次、突发 2 次
+  login_rate: 2
+  login_burst: 2
+  # 演示用的“下游”：持续失败，让重试耗尽后熔断打开。
+  # 调成 2 就能看到另一种现象——重试把瞬时故障吃掉，请求正常返回。
+  downstream_failures: 10

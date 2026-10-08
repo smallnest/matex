@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"go.opentelemetry.io/otel"
+
+	"github.com/smallnest/matex/pkg/core/httpx"
 	"github.com/smallnest/matex/pkg/core/obs"
 	"github.com/smallnest/matex/pkg/core/verticle"
 )
@@ -87,5 +93,67 @@ func TestFrameworkMetricsExist(t *testing.T) {
 	}
 	if !names["go_goroutines"] {
 		t.Error("expected the Go collector to be registered")
+	}
+}
+
+// TestTracingJoinsTheCallersTrace: with tracing on, an inbound traceparent
+// decides the trace id the service reports, and the handler's own spans
+// nest under it. This is what makes logs from two services line up.
+func TestTracingJoinsTheCallersTrace(t *testing.T) {
+	prevPropagator := otel.GetTextMapPropagator()
+	shutdown, err := obs.InitTracing(context.Background(), "observe", obs.TraceConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("init tracing: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = shutdown(context.Background())
+		if _, err := obs.InitTracing(context.Background(), "observe", obs.TraceConfig{}); err != nil {
+			t.Errorf("reset tracing: %v", err)
+		}
+		otel.SetTextMapPropagator(prevPropagator)
+	})
+
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	svc, _ := newTestService(t)
+	srv := httpx.New(httpx.Config{Timeout: time.Second})
+	if err := svc.BuildRouter(srv); err != nil {
+		t.Fatalf("build router: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/work/alice", nil)
+	req.Header.Set("traceparent", "00-"+traceID+"-00f067aa0ba902b7-01")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code %d body %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Request-ID"); got != traceID {
+		t.Fatalf("X-Request-ID = %q, want %q", got, traceID)
+	}
+	if !strings.Contains(rec.Body.String(), traceID) {
+		t.Fatalf("handler reported a different trace id: %s", rec.Body.String())
+	}
+}
+
+// TestTracingOffKeepsTheOldContract: the default (no `trace` section) must
+// behave exactly as before tracing existed.
+func TestTracingOffKeepsTheOldContract(t *testing.T) {
+	if _, err := obs.InitTracing(context.Background(), "observe", obs.TraceConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	svc, _ := newTestService(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/work/alice", nil)
+	req.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	req.SetPathValue("name", "alice")
+
+	data, err := svc.workHandler(req.Context(), req)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	got := data.(map[string]any)
+	if got["trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Fatal("tracing is off; the inbound traceparent must not become the trace id")
 	}
 }

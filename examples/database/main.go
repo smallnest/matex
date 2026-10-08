@@ -6,6 +6,8 @@
 //     via `db` tags (unknown columns ignored, NULL → nil pointer,
 //     RFC3339 string → time.Time)
 //   - WithTx: commit on nil, automatic rollback on error
+//   - a DAO written against db.Querier, so the same methods run against the
+//     pool and inside a transaction — no transaction-only twin methods
 //
 // It runs with zero external dependencies by default (a throwaway pure-Go
 // SQLite database):
@@ -57,12 +59,34 @@ type Article struct {
 	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
 }
 
+// articleDAO is written against db.Querier rather than *db.DB, which is what
+// lets the same methods serve the pool and a transaction. An interface method
+// cannot carry type parameters, so a QueryOne[T] *method* cannot live on an
+// interface — the package-level helpers plus Querier are how a DAO stays
+// generic *and* transaction-aware.
+type articleDAO struct{}
+
+func (articleDAO) bySlug(ctx context.Context, q db.Querier, slug string) (*Article, error) {
+	return db.QueryOne[Article](ctx, q, `SELECT * FROM articles WHERE slug = ?`, slug)
+}
+
+func (articleDAO) insert(ctx context.Context, q db.Querier, a Article, now string) error {
+	_, err := db.Exec(ctx, q, `INSERT INTO articles (slug, title, views, published, note, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`, a.Slug, a.Title, a.Views, a.Published, a.Note, now)
+	return err
+}
+
+func (articleDAO) count(ctx context.Context, q db.Querier) (int64, error) {
+	return db.QueryScalar[int64](ctx, q, `SELECT COUNT(*) FROM articles`)
+}
+
 // result is what run observed, so tests can assert on values instead of
 // parsing the printed output.
 type result struct {
 	InitialCount  int64
 	AfterCommit   int64
 	AfterRollback int64
+	AfterDAO      int64
 	First         Article
 	All           []Article
 }
@@ -176,6 +200,25 @@ func run(ctx context.Context, d *db.DB, out io.Writer) (result, error) {
 	}
 	res.All = all
 	line("query all", "%d row(s), first=%s", len(all), all[0].Slug)
+
+	// 9. One DAO, two call sites: the same methods run inside a transaction
+	// and against the pool. This is what db.Querier buys — without it every
+	// DAO method would need a second, transaction-only twin.
+	dao := articleDAO{}
+	if err := d.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
+		if err := dao.insert(ctx, tx, Article{Slug: "tx-d", Title: "written via the DAO"}, now); err != nil {
+			return err
+		}
+		// A read inside the transaction sees the transaction's own write.
+		_, err := dao.bySlug(ctx, tx, "tx-d")
+		return err
+	}); err != nil {
+		return res, fmt.Errorf("dao in tx: %w", err)
+	}
+	if res.AfterDAO, err = dao.count(ctx, d); err != nil {
+		return res, err
+	}
+	line("dao + tx", "count=%d (same DAO methods, tx and pool)", res.AfterDAO)
 
 	return res, nil
 }

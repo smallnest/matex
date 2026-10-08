@@ -1,0 +1,21 @@
+# examples/auth 的配置。
+# 框架段：http（必填）、log（必填）、auth（配了才建立 env.Auth）。
+# 本示例不需要服务专属段（Service.Name() == "authdemo" 的段可以缺省）。
+
+http:
+  addr: ":8081"
+  timeout: 10s
+  max_body: 1048576
+
+log:
+  level: info
+
+# 认证有两种模式，二选一：
+#   secret     HS256/384/512，共享密钥（内部调用、本示例）
+#   jwks_url   非对称，从 OIDC 的 JWKS 端点取公钥
+# 生产环境不要把 secret 落在文件里，用 ${AUTH_SECRET} 从环境变量注入
+# （见 examples/config 的变量展开）——本示例为离线可跑才写成字面量。
+auth:
+  issuer: matex-authdemo
+  secret: "demo-secret-change-me"
+  leeway: 30s

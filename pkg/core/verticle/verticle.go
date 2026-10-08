@@ -10,8 +10,9 @@
 //
 //  1. load config.yaml (path from WithConf / CONFIG_FILE / default)
 //  2. obs.Init(name, level)            — logging comes first
-//  3. init infra (db/redis/memcache/kafka producer — only the sections
-//     that are configured; the rest stay nil) plus the metrics registry
+//  3. init infra (db/redis/memcache/kafka producer/auth verifier — only
+//     the sections that are configured; the rest stay nil) plus the
+//     metrics registry
 //  4. svc.Setup(ctx, env)              — service-specific state (runs
 //     after env.Metrics exists, so services can register custom metrics)
 //  5. httpx server + /healthz /readyz /metrics
@@ -55,6 +56,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/smallnest/matex/pkg/core/app"
+	"github.com/smallnest/matex/pkg/core/auth"
 	"github.com/smallnest/matex/pkg/core/config"
 	"github.com/smallnest/matex/pkg/core/db"
 	"github.com/smallnest/matex/pkg/core/grpcx"
@@ -115,6 +117,8 @@ type FrameworkConfig struct {
 	HTTP     httpx.Config    `json:"http"`
 	GRPC     grpcx.Config    `json:"grpc" optional:""`
 	RPCX     rpcx.Config     `json:"rpcx" optional:""`
+	Auth     auth.Config     `json:"auth" optional:""`
+	Trace    obs.TraceConfig `json:"trace" optional:""`
 	Log      obs.LogConfig   `json:"log"`
 	DB       db.Config       `json:"db" optional:""`
 	Redis    redis.Config    `json:"redis" optional:""`
@@ -133,6 +137,7 @@ type Env struct {
 	Redis    *redis.Client
 	Memcache *memcache.Client
 	Kafka    *kafka.Producer
+	Auth     *auth.Verifier
 	KafkaCfg kafka.Config
 	GRPCCfg  grpcx.Config
 	RPCXCfg  rpcx.Config
@@ -258,6 +263,16 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 		return fmt.Errorf("verticle: init logging: %w", err)
 	}
 
+	// Step 2b: tracing, before any component can produce a span
+	shutdownTrace, err := obs.InitTracing(ctx, svc.Name(), fc.Trace)
+	if err != nil {
+		return fmt.Errorf("verticle: init tracing: %w", err)
+	}
+	if fc.Trace.Enabled {
+		obs.Info(ctx, "tracing initialized",
+			"endpoint", fc.Trace.Endpoint, "sample_ratio", fc.Trace.SampleRatio)
+	}
+
 	env := &Env{
 		Name:     svc.Name(),
 		ConfPath: confPath,
@@ -299,6 +314,16 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 		env.Kafka = p
 		obs.Info(ctx, "kafka producer initialized", "brokers", fc.Kafka.Brokers)
 	}
+	// Auth is built when either verification mode is configured; services
+	// opt in by using env.Auth.Middleware() in BuildRouter.
+	if fc.Auth.Secret != "" || fc.Auth.JWKSURL != "" {
+		v, err := auth.New(fc.Auth)
+		if err != nil {
+			return fmt.Errorf("verticle: init auth: %w", err)
+		}
+		env.Auth = v
+		obs.Info(ctx, "auth initialized", "mode", authMode(fc.Auth))
+	}
 
 	// Step 4: service setup
 	if err := svc.Setup(ctx, env); err != nil {
@@ -311,6 +336,9 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 		httpx.WithLogger(slog.Default().With("service", svc.Name())),
 		httpx.WithReadyCheck(makeReady(svc, env)),
 	)
+	// Registered before BuildRouter, so it lands outside whatever
+	// middleware the service adds — introspection should not need a token.
+	srv.Handle("GET", "/version", versionHandler(svc.Name()))
 	if err := svc.BuildRouter(srv); err != nil {
 		return fmt.Errorf("verticle: build router %s: %w", svc.Name(), err)
 	}
@@ -346,6 +374,17 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 
 	// Step 7: run
 	a := app.New(svc.Name())
+
+	// Tracing shuts down last so the final span batch still flushes —
+	// closers unwind in reverse registration order.
+	a.AddCloser(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTrace(cctx); err != nil {
+			obs.Warn(cctx, "tracing shutdown", "err", err)
+		}
+	})
+
 	a.ServeHTTP(srv)
 	if grpcSrv != nil {
 		a.Serve("grpc", fc.GRPC.Addr, grpcSrv.Serve, grpcSrv.Shutdown)
@@ -378,6 +417,14 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 
 	obs.Info(ctx, "service started", "name", svc.Name(), "conf", confPath)
 	return a.Run(ctx)
+}
+
+// authMode names the configured verification mode for logs.
+func authMode(cfg auth.Config) string {
+	if cfg.JWKSURL != "" {
+		return "jwks"
+	}
+	return "hmac"
 }
 
 // makeReady builds the readiness check: pings initialized infra, then

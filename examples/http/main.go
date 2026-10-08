@@ -14,7 +14,9 @@
 //	curl -i localhost:8080/api/v1/echo/world
 //	curl -i localhost:8080/api/v1/nothing
 //	curl -i localhost:8080/api/v1/errors/notfound
-//	curl -i -X POST localhost:8080/api/v1/users -d '{"name":"alice"}'
+//	curl -i -X POST localhost:8080/api/v1/users -d '{"name":"alice"}'   # → 401, needs the key
+//	curl -i -X POST localhost:8080/api/v1/users -H 'X-API-Key: demo-key' -d '{"name":"alice"}'
+//	curl -i localhost:8080/api/v1/admin/whoami -H 'X-API-Key: demo-key' -H 'X-Tag: alice'
 //	curl -i localhost:8080/raw/plain
 package main
 
@@ -32,6 +34,7 @@ import (
 
 type httpConfig struct {
 	Greeting string `json:"greeting" default:"Hello, "`
+	APIKey   string `json:"api_key" default:"demo-key"`
 }
 
 type httpService struct {
@@ -45,13 +48,62 @@ func (s *httpService) Setup(_ context.Context, env *verticle.Env) error {
 }
 
 func (s *httpService) BuildRouter(srv *httpx.Server) error {
+	// Outer middleware wraps the mux itself, so its header lands on every
+	// response — including HandleRaw routes and the builtin probes.
+	srv.UseOuter(serverHeader("matex/http-demo"))
+
+	// Public routes: registered before any Use, so nothing guards them.
 	srv.Handle("GET", "/api/v1/echo/{name}", s.echo)
-	srv.Handle("POST", "/api/v1/users", createUser)
 	srv.Handle("GET", "/api/v1/nothing", nothing)
 	srv.Handle("GET", "/api/v1/errors/{kind}", fail)
 	// Escape hatch: full control over status/headers/body.
 	srv.HandleRaw("GET /raw/plain", rawPlain)
+
+	// Everything below this line runs through both middleware, outermost
+	// first: tag the request, then demand the API key.
+	srv.Use(withTag, s.requireAPIKey)
+	srv.Handle("POST", "/api/v1/users", createUser)
+	srv.Handle("GET", "/api/v1/admin/whoami", whoami)
 	return nil
+}
+
+// serverHeader is an outer middleware: it needs the ResponseWriter, so it
+// lives outside the mux rather than in the envelope chain.
+func serverHeader(v string) httpx.OuterMiddleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Served-By", v)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+type tagKey struct{}
+
+// withTag is an envelope middleware: it enriches the request context so
+// the handler can read the value. No ResponseWriter in sight.
+func withTag(next httpx.HandlerFunc) httpx.HandlerFunc {
+	return func(ctx context.Context, r *http.Request) (any, error) {
+		return next(context.WithValue(ctx, tagKey{}, r.Header.Get("X-Tag")), r)
+	}
+}
+
+// requireAPIKey short-circuits with an errs value — the wrapper turns it
+// into 401 {"code":40101,...}. An empty configured key disables the check
+// (matex convention: unconfigured means off).
+func (s *httpService) requireAPIKey(next httpx.HandlerFunc) httpx.HandlerFunc {
+	return func(ctx context.Context, r *http.Request) (any, error) {
+		if s.cfg.APIKey != "" && r.Header.Get("X-API-Key") != s.cfg.APIKey {
+			return nil, errs.Unauthorized(40101, "missing or invalid X-API-Key")
+		}
+		return next(ctx, r)
+	}
+}
+
+// whoami proves ctx propagation: the tag injected by withTag is visible
+// here, in the route handler.
+func whoami(ctx context.Context, _ *http.Request) (any, error) {
+	return map[string]any{"greeting": "you are behind both middleware", "tag": ctx.Value(tagKey{})}, nil
 }
 
 // echo shows path values and the success envelope.

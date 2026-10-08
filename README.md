@@ -12,7 +12,8 @@
 - **基础设施一键初始化**：数据库、Kafka、Redis、Memcached、配置——`config.yaml` 里配了哪个就初始化哪个，没配的对应依赖为 `nil`（代码 `if env.X != nil` 防御）。
 - **Verticle 服务抽象**：一个部署单元 = `Name()` + `Setup(ctx, env)` + `BuildRouter(srv)`，`verticle.Run` 统一驱动生命周期与优雅退出，配置热更可插拔。
 - **零 Web 框架**：标准库 `net/http` + Go 1.22 ServeMux（方法路由 + 路径参数），`pkg/core/httpx` 统一处理 recover / 超时 / trace id / 访问日志 / metrics / JSON 响应与错误映射。
-- **AI skills**：顶层 `skills/` 目录（`matex-` 前缀命名，`npx skills add smallnest/matex --all` 可一次全装）内置 7 个 skill，新增 domain、接数据库/redis/memcache/kafka/grpc/rpcx 都有规可依（`AGENTS.md` 是总入口）。
+- **AI skills**：顶层 `skills/` 目录（`matex-` 前缀命名，`npx skills add smallnest/matex --all` 可一次全装）内置 12 个 skill：新增 domain、接数据库/缓存/redis/memcache/kafka/grpc/rpcx、加认证/链路追踪/稳定性防护/定时任务，都有规可依（`AGENTS.md` 是总入口）。
+- **企业级能力可插拔**：认证授权（HMAC/JWKS）、链路追踪（OpenTelemetry）、限流/熔断/重试/幂等、缓存模式（防击穿·防雪崩）、定时任务选主——**全部 opt-in，不配就不存在**，只跑 HTTP 的服务不必为它们付出代价。
 - **测试无 Docker、离线可用**：`dbtest`（默认纯 Go SQLite + 自动迁移，`DB_TEST_DRIVER/DSN` 可切真库）、`redistest`（miniredis）。
 
 ## 快速开始
@@ -41,7 +42,8 @@ make run
 cmd/<service>/            一个二进制一个部署单元
 internal/app/             实现 verticle.Service（Name/Setup/BuildRouter），装配 domain
 internal/domain/<name>/   业务域：handler.go（HTTP 边界）+ service.go（业务）+ dao.go（数据）
-pkg/core/                 基础设施：config / db / redis / memcache / kafka / httpx / obs / errs / verticle / app
+pkg/core/                 基础设施：config / db / redis / memcache / kafka / httpx / obs / errs
+                          / verticle / app / auth / ratelimit / breaker / retry / idempotency / cache / cron
 configs/config.yaml       配置（框架段 + 每服务一段，段 key = Service.Name()）
 migrations/*.sql          数据库迁移（文件名序执行，追加不修改）
 examples/<feature>/       每个能力一个可运行示例（离线可跑、带测试）
@@ -57,10 +59,14 @@ skills/                   AI skill（matex-* 前缀）
 |---|---|---|
 | `examples/config` | 配置：tag 语义 / `${VAR}` 展开 / 环境覆盖 | 无 |
 | `examples/errors` | 错误模型：Kind → 状态码、业务 code、Wrap | 无 |
-| `examples/database` | 数据库：三驱动、`?` 占位符、泛型扫描、事务 | 默认纯 Go SQLite |
-| `examples/http` | Web 层：路由、handler 约定、错误映射、`HandleRaw` | 无 |
-| `examples/observability` | 日志 / trace id / Prometheus（含自定义指标） | 无 |
+| `examples/database` | 数据库：三驱动、`?` 占位符、泛型扫描、事务、`Querier`（DAO 进出事务） | 默认纯 Go SQLite |
+| `examples/cache` | 缓存模式：防击穿（并发 miss 合并）、TTL 抖动防雪崩、写后失效 | Redis |
+| `examples/http` | Web 层：路由、handler 约定、错误映射、中间件槽、`HandleRaw` | 无 |
+| `examples/auth` | 认证：Bearer 验签（HMAC/JWKS）、分级授权、`Principal` 进 ctx | 无 |
+| `examples/observability` | 日志 / 相关 id / Prometheus / OpenTelemetry 链路 | 无 |
+| `examples/resilience` | 限流 / 幂等 / 熔断 / 退避重试 | 无 |
 | `examples/lifecycle` | 生命周期：Block、Closer、配置热更、优雅退出 | 无 |
+| `examples/cron` | 定时任务：多副本 redis 选主，每周期只跑一次 | 无（选主需 Redis） |
 | `examples/redis` | 缓存读写、`TryLock` 分布式锁 | Redis |
 | `examples/memcache` | JSON 缓存、TTL、Touch | Memcached |
 | `examples/kafka` | 生产者（同步/异步）+ 消费者循环 | Kafka |
@@ -77,12 +83,17 @@ make example NAME=http        # 等价于 go run ./examples/http
 | Skill | 用途 |
 |---|---|
 | `matex-add-domain` | 新增业务域（handler/service/dao + 路由 + 装配 + 测试） |
-| `matex-setup-database` | 接数据库 PostgreSQL / MySQL / SQLite（配置 / 迁移 / DAO / dbtest） |
+| `matex-setup-database` | 接数据库 PostgreSQL / MySQL / SQLite（配置 / 迁移 / DAO / `Querier` 进出事务 / dbtest） |
 | `matex-setup-redis` | 接 Redis（缓存 / 分布式锁） |
 | `matex-setup-memcache` | 接 Memcached |
 | `matex-setup-kafka` | 接 Kafka（生产者 / 消费者） |
 | `matex-setup-grpc` | 接 gRPC（注册服务 / client） |
 | `matex-setup-rpcx` | 接 rpcx（注册服务 / client，无需 IDL） |
+| `matex-setup-auth` | 认证授权（HMAC/JWKS 验签、分级授权、`Principal`） |
+| `matex-setup-tracing` | 链路追踪（OpenTelemetry span / 跨进程传播 / OTLP） |
+| `matex-setup-resilience` | 限流 / 幂等 / 熔断 / 退避重试 |
+| `matex-setup-cache` | 缓存模式（防击穿 / 防雪崩 / 写后失效） |
+| `matex-setup-cron` | 定时任务（多副本选主） |
 
 ## 核心约定
 
@@ -108,6 +119,7 @@ make docker TAG=v1.0.0                  # 镜像
 ## 设计取舍
 
 - **不用 ORM**：SQL 直写 + `*db.DB.QueryOne[T]` 泛型扫描（postgres / mysql / sqlite 三驱动，`?` 占位符统一），简单、可调试、可 review。
-- **不用 gin/echo**：ServeMux 够用，`httpx` 补齐统一响应与观测。
-- **不做服务发现/熔断/限流**：这些归 K8s + 网关；服务内只保留超时、recover、优雅退出（见 [docs/design.md](docs/design.md) 的论证）。
+- **不用 gin/echo**：ServeMux 够用，`httpx` 补齐统一响应与观测；横切能力走 `httpx.Use` 中间件槽，不引第三方路由。
+- **不做服务发现 / 注册中心**：归 K8s。
+- **不默认开启重治理**：限流、熔断、幂等、链路追踪都提供了薄封装，但**一律 opt-in**（不配就不存在）。网关的限流按路由/租户、粒度粗，服务内的能按用户/API key 这类业务维度；熔断和重试保护的是"本服务到某个下游"，这一层网关看不到。取舍的完整论证见 [docs/design.md](docs/design.md) §2.2–2.3。
 - **代码生成交给 AI**：skills 就是"生成器"，且不用维护一个生成器二进制。

@@ -28,6 +28,9 @@ func TestRun(t *testing.T) {
 	if res.AfterRollback != 3 {
 		t.Errorf("after rollback = %d, want 3 (tx-c must not persist)", res.AfterRollback)
 	}
+	if res.AfterDAO != 4 {
+		t.Errorf("after DAO tx = %d, want 4 (tx-d committed through the DAO)", res.AfterDAO)
+	}
 	if res.First.Slug != "hello-matex" || res.First.Views != 1 || res.First.Published {
 		t.Errorf("first row = %+v", res.First)
 	}

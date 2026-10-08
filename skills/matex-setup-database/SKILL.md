@@ -88,14 +88,45 @@ func (d *DAO) AddScore(ctx context.Context, name string, delta int64) error {
 - `d.db` 类型是 `*db.DB`；`QueryAll[T]` / `QueryOne[T]` / `QueryScalar[T]` / `Exec` 都是它的方法。
 - 字段用 `db:"col"` tag 匹配列名（缺省用字段名，大小写不敏感）；查不到的列会被忽略，`SELECT *` 安全。
 - 可空列用 `*string` / `*int64` / `sql.NullString` 等。
-- 事务：
+- **事务里要复用同一个 DAO，方法参数就得收 `db.Querier`**（见下）。
+
+### 3b. 让 DAO 能在事务里跑：参数收 `db.Querier`
+
+```go
+func (d *DAO) ByID(ctx context.Context, q db.Querier, id int64) (*Row, error) {
+	return db.QueryOne[Row](ctx, q, `SELECT id, name, score FROM users WHERE id = ?`, id)
+}
+```
+
+`*db.DB` 和 `*db.Tx` 都实现 `db.Querier`，所以同一个方法两处都能用：
+
+```go
+row, err := dao.ByID(ctx, env.DB, 1)                      // 池上
+
+err = env.DB.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
+	row, err := dao.ByID(ctx, tx, 1)                      // 事务内，同一份代码
+	if err != nil {
+		return err
+	}
+	_, err = dao.AddScore(ctx, tx, row.Name, 10)          // 复用，不重复写 SQL
+	return err
+})
+```
+
+为什么必须有这个接口：**接口的方法不能带类型参数**（类型可以 —— Go 1.27 起支持；接口不行，
+编译器报 `interface method must have no type parameters`），所以 `QueryOne[T]` 只能是包级
+函数 `db.QueryOne[T](ctx, q, …)`。
+
+**不要写 `ByID` + `ByIDTx` 两个方法** —— 那正是 `Querier` 要消灭的重复。
+
+### 3c. 事务
 
 ```go
 err := d.db.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
 	if _, err := tx.Exec(ctx, `UPDATE users SET score = score + 1 WHERE id = ?`, id); err != nil {
 		return err
 	}
-	return tx.Exec // ... 更多
+	return nil   // nil 提交；返回 error 或 panic 自动回滚
 })
 ```
 

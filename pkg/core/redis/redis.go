@@ -101,6 +101,10 @@ func GetJSON[T any](ctx context.Context, c *Client, key string) (v T, ok bool, e
 	return v, true, nil
 }
 
+// IsNotFound reports whether err is a missing-key error, so callers do not
+// have to reach for the driver's sentinel.
+func IsNotFound(err error) bool { return errors.Is(err, goredis.Nil) }
+
 // Del removes keys (missing keys are not an error).
 func (c *Client) Del(ctx context.Context, keys ...string) error {
 	if len(keys) == 0 {
@@ -110,6 +114,20 @@ func (c *Client) Del(ctx context.Context, keys ...string) error {
 		return fmt.Errorf("redis: del %v: %w", keys, err)
 	}
 	return nil
+}
+
+// Claim takes key for ttl, reporting false when someone already holds it.
+//
+// Unlike TryLock the caller never releases it: the key is meant to expire on
+// its own. That is what makes a windowed claim work — "exactly one instance
+// acts in each interval" — where a lock released the moment the work ends
+// would let a second instance with an offset clock act in the same window.
+func (c *Client) Claim(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	ok, err := c.c.SetNX(ctx, key, "1", ttl).Result()
+	if err != nil {
+		return false, fmt.Errorf("redis: claim %s: %w", key, err)
+	}
+	return ok, nil
 }
 
 // TryLock acquires a best-effort distributed lock. The returned release
@@ -137,6 +155,45 @@ var releaseScript = goredis.NewScript(`if redis.call("get", KEYS[1]) == ARGV[1] 
 else
 	return 0
 end`)
+
+// Script is a reusable Lua script. Wrap atomic read-modify-write sequences
+// that a helper API cannot express in one round trip — counters, sliding
+// windows, compare-and-set.
+type Script struct{ s *goredis.Script }
+
+// NewScript compiles src into a reusable script. go-redis sends EVALSHA and
+// transparently falls back to EVAL until the server has it cached.
+func NewScript(src string) *Script { return &Script{s: goredis.NewScript(src)} }
+
+// RunInt runs the script and returns its integer reply.
+func (s *Script) RunInt(ctx context.Context, c *Client, keys []string, args ...any) (int64, error) {
+	return s.s.Run(ctx, c.c, keys, args...).Int64()
+}
+
+// Run runs the script and returns the raw command, for reply shapes RunInt
+// does not cover.
+func (s *Script) Run(ctx context.Context, c *Client, keys []string, args ...any) *goredis.Cmd {
+	return s.s.Run(ctx, c.c, keys, args...)
+}
+
+// IncrBy increments key by n and returns the new value, arming ttl on the
+// first increment. It is the counter primitive behind fixed-window rate
+// limiting and idempotency bookkeeping.
+func (c *Client) IncrBy(ctx context.Context, key string, n int64, ttl time.Duration) (int64, error) {
+	v, err := incrWithTTL.RunInt(ctx, c, []string{key}, n, ttl.Milliseconds())
+	if err != nil {
+		return 0, fmt.Errorf("redis: incr %s: %w", key, err)
+	}
+	return v, nil
+}
+
+// incrWithTTL keeps the counter and its expiry in step: setting them in two
+// calls would let a crash leave a counter that never expires.
+var incrWithTTL = NewScript(`local n = redis.call("incrby", KEYS[1], ARGV[1])
+if n == tonumber(ARGV[1]) then
+	redis.call("pexpire", KEYS[1], ARGV[2])
+end
+return n`)
 
 func randomToken() string {
 	var b [16]byte

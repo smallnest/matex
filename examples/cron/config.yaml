@@ -1,0 +1,18 @@
+# examples/cron 的配置。
+
+http:
+  addr: ":8084"
+  timeout: 5s
+
+log:
+  level: info
+
+# 配了 redis → 多副本之间选主，每个周期只跑一个；没配 → 每副本都跑（适合单副本）。
+# redis:
+#   addr: ${REDIS_ADDR:localhost:6379}
+
+# 服务专属段：key = Service.Name()
+cron:
+  heartbeat_interval: 200ms   # 演示用：跑得频繁，便于观察
+  reconcile_interval: 1s
+  job_timeout: 2s             # 单次运行的上限

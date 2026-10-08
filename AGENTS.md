@@ -44,7 +44,12 @@ make migrate DSN=postgres://...            # 默认 postgres；-driver 可切 sq
 ## 加东西时按 skill 走
 
 - 新增业务域 → `matex-add-domain`
+- 接认证/授权 → `matex-setup-auth`
+- 接链路追踪 → `matex-setup-tracing`
+- 加限流/幂等/熔断/重试 → `matex-setup-resilience`
 - 接数据库 → `matex-setup-database`
+- 加缓存（防击穿/防雪崩）→ `matex-setup-cache`
+- 加定时任务（多副本选主）→ `matex-setup-cron`
 - 接 redis → `matex-setup-redis`
 - 接 memcache → `matex-setup-memcache`
 - 接 kafka（生产者/消费者）→ `matex-setup-kafka`

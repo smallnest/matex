@@ -1,11 +1,16 @@
-// Package obs provides observability: structured logging (slog) and
-// Prometheus metrics.
+// Package obs provides observability: structured logging (slog),
+// Prometheus metrics and OpenTelemetry tracing.
 //
 // Logging is JSON to stdout with a "service" field. Request context
-// carries a trace id (from the X-Request-ID header or generated) that is
-// attached to every log line via the ctx-aware package functions:
+// carries a correlation id that is attached to every log line via the
+// ctx-aware package functions:
 //
 //	obs.Info(ctx, "user created", "user_id", 123)
+//
+// That id is the active OpenTelemetry span's trace id when tracing is
+// enabled (see InitTracing), and the X-Request-ID otherwise — so logs
+// line up with traces the moment tracing is switched on, with no change
+// at the call sites.
 package obs
 
 import (
@@ -41,8 +46,13 @@ func WithTraceID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, traceIDKey{}, id)
 }
 
-// TraceID returns the trace id of ctx ("" when absent).
+// TraceID returns the correlation id of ctx: the active span's trace id
+// when tracing is enabled, otherwise the request-scoped id installed by
+// WithTraceID ("" when neither is present).
 func TraceID(ctx context.Context) string {
+	if id := SpanTraceID(ctx); id != "" {
+		return id
+	}
 	if v, ok := ctx.Value(traceIDKey{}).(string); ok {
 		return v
 	}

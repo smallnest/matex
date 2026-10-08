@@ -14,6 +14,11 @@
 //	success: 200 {"code":0,"msg":"ok","data":<data>}   (204 when data is nil)
 //	error:   <status> {"code":<code>,"msg":"<msg>","data":null}
 //
+// Cross-cutting concerns plug into two middleware slots — see
+// middleware.go. Use(Middleware) wraps handlers inside the wrapper (so it
+// speaks the envelope and can short-circuit with an errs value);
+// UseOuter(OuterMiddleware) wraps the whole mux at the net/http level.
+//
 // For full control (streams, files, custom encodings) register raw
 // handlers via HandleRaw.
 package httpx
@@ -39,6 +44,11 @@ type Config struct {
 	Addr    string        `json:"addr" default:":8080"`
 	Timeout time.Duration `json:"timeout" default:"10s"`
 	MaxBody int64         `json:"max_body" default:"33554432"` // 32MB
+	// Pprof mounts the standard profiler under /debug/pprof/. Off by
+	// default: a heap profile can contain credentials, and generating one
+	// costs CPU on the serving process. Enable it only where the endpoint is
+	// reachable by operators alone (a sidecar port, an internal network).
+	Pprof bool `json:"pprof" default:"false"`
 }
 
 // HandlerFunc is the matex handler signature.
@@ -66,6 +76,9 @@ type Server struct {
 	metrics *obs.Metrics
 	ready   func(ctx context.Context) error
 	http    *http.Server
+
+	mws    []Middleware      // envelope middleware, applied per route
+	outers []OuterMiddleware // net/http middleware, applied around the mux
 }
 
 // New creates a Server with /healthz, /readyz and (if metrics are
@@ -82,15 +95,20 @@ func New(cfg Config, opts ...Option) *Server {
 	if s.metrics != nil {
 		s.mux.Handle("GET /metrics", s.metrics.Handler())
 	}
-	s.http = &http.Server{Addr: cfg.Addr, Handler: s.outer(s.mux)}
+	if s.cfg.Pprof {
+		mountPprof(s.mux)
+	}
+	s.http = &http.Server{Addr: cfg.Addr}
+	s.rebuildHandler()
 	return s
 }
 
 // Handle registers a matex handler for "METHOD /path" (ServeMux syntax,
 // e.g. "POST /api/v1/users/{id}"). Panics on duplicate patterns — route
-// conflicts must surface at startup.
+// conflicts must surface at startup. Middleware added with Use before
+// this call guards the route.
 func (s *Server) Handle(method, pattern string, h HandlerFunc) {
-	s.mux.HandleFunc(method+" "+pattern, s.wrap(h))
+	s.mux.HandleFunc(method+" "+pattern, s.wrap(s.apply(h)))
 }
 
 // HandleRaw registers a raw http.HandlerFunc (escape hatch for
@@ -125,8 +143,11 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-// outer wraps the mux with recover and request body limiting.
-func (s *Server) outer(next http.Handler) http.Handler {
+// guard is the outermost layer: panic recovery and request body
+// limiting. It stays outside every OuterMiddleware so a panicking
+// middleware is still converted into a 500 instead of killing the
+// connection.
+func (s *Server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if p := recover(); p != nil {
@@ -148,12 +169,23 @@ func (s *Server) wrap(h HandlerFunc) http.HandlerFunc {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
 
+		// Continue the caller's trace and open a server span. Both are
+		// no-ops unless tracing is enabled, so this costs nothing by default.
+		ctx, span := obs.StartHTTPSpan(r.Context(), r)
+		defer func() { obs.EndHTTPSpan(span, sw.code) }()
+
+		// Correlation id precedence: what the caller sent, else the trace
+		// id, else a fresh one. Echoing it back lets a client correlate
+		// without a trace backend.
 		traceID := r.Header.Get("X-Request-ID")
+		if traceID == "" {
+			traceID = obs.TraceID(ctx)
+		}
 		if traceID == "" {
 			traceID = newTraceID()
 		}
 		w.Header().Set("X-Request-ID", traceID)
-		ctx := obs.WithTraceID(r.Context(), traceID)
+		ctx = obs.WithTraceID(ctx, traceID)
 		ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 		defer cancel()
 

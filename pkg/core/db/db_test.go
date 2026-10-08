@@ -210,3 +210,83 @@ func TestWithTx(t *testing.T) {
 		t.Fatalf("rollback failed: %d", n)
 	}
 }
+
+// userDAO is written against Querier, so one method serves both the pool and
+// a transaction. This is the pattern Querier exists for: without it, every
+// DAO method would need a second, transaction-only twin.
+type userDAO struct{}
+
+func (userDAO) insert(ctx context.Context, q Querier, id int64, name string) error {
+	_, err := Exec(ctx, q, `INSERT INTO users (id, name) VALUES (?, ?)`, id, name)
+	return err
+}
+
+func (userDAO) name(ctx context.Context, q Querier, id int64) (string, error) {
+	return QueryScalar[string](ctx, q, `SELECT name FROM users WHERE id = ?`, id)
+}
+
+func (userDAO) count(ctx context.Context, q Querier) (int64, error) {
+	return QueryScalar[int64](ctx, q, `SELECT COUNT(*) FROM users`)
+}
+
+func TestDAOIsUsableWithPoolAndTx(t *testing.T) {
+	ctx := t.Context()
+	d := sqliteTestDB(t)
+	if _, err := d.Exec(ctx, `CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	dao := userDAO{}
+
+	// Outside a transaction.
+	if err := dao.insert(ctx, d, 1, "alice"); err != nil {
+		t.Fatalf("insert via pool: %v", err)
+	}
+	if name, err := dao.name(ctx, d, 1); err != nil || name != "alice" {
+		t.Fatalf("read via pool: %q, %v", name, err)
+	}
+
+	// Inside one: the same calls, and the write is visible within the tx.
+	if err := d.WithTx(ctx, func(ctx context.Context, tx *Tx) error {
+		if err := dao.insert(ctx, tx, 2, "bob"); err != nil {
+			return err
+		}
+		name, err := dao.name(ctx, tx, 2)
+		if err != nil {
+			return err
+		}
+		if name != "bob" {
+			t.Fatalf("read inside tx: %q", name)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("tx: %v", err)
+	}
+	if n, _ := dao.count(ctx, d); n != 2 {
+		t.Fatalf("after commit: %d rows, want 2", n)
+	}
+
+	// A rolled-back transaction leaves nothing behind.
+	_ = d.WithTx(ctx, func(ctx context.Context, tx *Tx) error {
+		if err := dao.insert(ctx, tx, 3, "carol"); err != nil {
+			return err
+		}
+		return errors.New("nope")
+	})
+	if n, _ := dao.count(ctx, d); n != 2 {
+		t.Fatalf("rollback left %d rows, want 2", n)
+	}
+}
+
+// TestQuerierSealsTheSurface: db.Querier must not be satisfiable from
+// outside, so *DB and *Tx stay the only ways in.
+func TestQuerierSealsTheSurface(t *testing.T) {
+	var q Querier = sqliteTestDB(t)
+	if _, ok := q.(*DB); !ok {
+		t.Fatalf("a *DB is not a Querier: %T", q)
+	}
+	// The unexported conn() method is what keeps the interface sealed; an
+	// outside type cannot implement it.
+	if _, ok := any((*Tx)(nil)).(Querier); !ok {
+		t.Fatal("a *Tx is not a Querier")
+	}
+}

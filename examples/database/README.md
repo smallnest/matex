@@ -62,6 +62,37 @@ err := d.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
 
 `*db.Tx` 和 `*db.DB` 有同一组方法（Exec / QueryAll / QueryOne / QueryScalar）。
 
+### DAO 要能进事务：写 `db.Querier`
+
+**DAO 方法收 `db.Querier` 而不是 `*db.DB`**，同一个方法就能在池和事务里跑：
+
+```go
+type articleDAO struct{}
+
+func (articleDAO) bySlug(ctx context.Context, q db.Querier, slug string) (*Article, error) {
+	return db.QueryOne[Article](ctx, q, `SELECT * FROM articles WHERE slug = ?`, slug)
+}
+
+// 池上调用
+a, err := dao.bySlug(ctx, env.DB, "hello-matex")
+
+// 同一个方法，事务内调用：能读到本事务自己的写
+err = env.DB.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
+	_, err := dao.bySlug(ctx, tx, "hello-matex")
+	return err
+})
+```
+
+为什么要有 `Querier` 这个接口：**接口的方法不能带类型参数**（类型可以有泛型方法 ——
+Go 1.27 起支持；接口不行，编译器直接报 `interface method must have no type parameters`）。
+所以 `QueryOne[T]` 只能是**包级函数**（`db.QueryOne[T](ctx, q, …)`），而 `q` 的类型是
+`Querier`。`*DB` 和 `*Tx` 都实现它。
+
+接口是**密封的**（方法是未导出的），所以只有 `*DB` / `*Tx` 两种实现，业务代码不会长出
+第三条访问驱动的路。
+
+不要写 `bySlug` + `bySlugTx` 两个方法 —— 那正是 `Querier` 要消灭的重复。
+
 ### 可移植写法的几条硬规矩
 
 - 主键用 `VARCHAR(n)`，别用 `TEXT`（MySQL 不能索引裸 TEXT 主键）。

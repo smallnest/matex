@@ -186,22 +186,22 @@ func (d *DB) Close() error { return d.sql.Close() }
 
 // Exec runs a statement and returns its result. Use "?" placeholders.
 func (d *DB) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return exec(ctx, d.sql, d.driver, d.slow, query, args...)
+	return Exec(ctx, d, query, args...)
 }
 
 // QueryAll runs the query and scans every row into []T via db tags.
 func (d *DB) QueryAll[T any](ctx context.Context, query string, args ...any) ([]T, error) {
-	return queryAll[T](ctx, d.sql, d.driver, d.slow, query, args...)
+	return QueryAll[T](ctx, d, query, args...)
 }
 
 // QueryOne scans the first row into *T; ErrNoRow when nothing matched.
 func (d *DB) QueryOne[T any](ctx context.Context, query string, args ...any) (*T, error) {
-	return queryOne[T](ctx, d.sql, d.driver, d.slow, query, args...)
+	return QueryOne[T](ctx, d, query, args...)
 }
 
 // QueryScalar scans a single column of the first row (e.g. COUNT(*)).
 func (d *DB) QueryScalar[T any](ctx context.Context, query string, args ...any) (T, error) {
-	return queryScalar[T](ctx, d.sql, d.driver, d.slow, query, args...)
+	return QueryScalar[T](ctx, d, query, args...)
 }
 
 // WithTx runs fn inside a transaction: commit on a nil error, rollback
@@ -210,8 +210,9 @@ func (d *DB) WithTx(ctx context.Context, fn func(ctx context.Context, tx *Tx) er
 	return withTx(ctx, d.sql, d.driver, d.slow, fn)
 }
 
-// Tx is the transaction handle passed to DB.WithTx. Its helpers use the same
-// "?" placeholders and db-tag scanning as DB.
+// Tx is the transaction handle passed to DB.WithTx. It offers the same
+// helpers as DB under the Querier interface, so a DAO written against
+// db.Querier works here without a second code path.
 type Tx struct {
 	tx     *sql.Tx
 	driver Driver
@@ -220,28 +221,91 @@ type Tx struct {
 
 // Exec runs a statement inside the transaction.
 func (t *Tx) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return exec(ctx, t.tx, t.driver, t.slow, query, args...)
+	return Exec(ctx, t, query, args...)
 }
 
 // QueryAll scans every row into []T.
 func (t *Tx) QueryAll[T any](ctx context.Context, query string, args ...any) ([]T, error) {
-	return queryAll[T](ctx, t.tx, t.driver, t.slow, query, args...)
+	return QueryAll[T](ctx, t, query, args...)
 }
 
 // QueryOne scans the first row into *T; ErrNoRow when nothing matched.
 func (t *Tx) QueryOne[T any](ctx context.Context, query string, args ...any) (*T, error) {
-	return queryOne[T](ctx, t.tx, t.driver, t.slow, query, args...)
+	return QueryOne[T](ctx, t, query, args...)
 }
 
 // QueryScalar scans a single column of the first row.
 func (t *Tx) QueryScalar[T any](ctx context.Context, query string, args ...any) (T, error) {
-	return queryScalar[T](ctx, t.tx, t.driver, t.slow, query, args...)
+	return QueryScalar[T](ctx, t, query, args...)
 }
 
 // executor is the subset of *sql.DB / *sql.Tx the helpers need.
 type executor interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// conn is a query surface: where statements go, how placeholders are
+// rewritten, and when to complain about slowness.
+type conn struct {
+	ex     executor
+	driver Driver
+	slow   time.Duration
+}
+
+// Querier is the read/write surface shared by *DB and *Tx. A DAO method that
+// takes a Querier runs unchanged inside or outside a transaction:
+//
+//	func (d *UserDAO) ByID(ctx context.Context, q db.Querier, id int64) (*User, error) {
+//		return db.QueryOne[User](ctx, q, `SELECT * FROM users WHERE id = ?`, id)
+//	}
+//
+//	u, err := dao.ByID(ctx, env.DB, 1)                      // pool
+//	err = db.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
+//		_, err := dao.ByID(ctx, tx, 1)                      // same code, in a tx
+//		return err
+//	})
+//
+// The interface is sealed — its one method is unexported — so *DB and *Tx
+// are the only implementations and business code cannot invent a third way
+// to reach a driver.
+//
+// It exists because an interface method cannot carry type parameters. A
+// *type* may have generic methods (Go 1.27), an interface may not — the
+// compiler rejects it with "interface method must have no type parameters" —
+// so QueryAll[T] can only ever live as a package-level function.
+type Querier interface {
+	conn() conn
+}
+
+// conn implements Querier.
+func (d *DB) conn() conn { return conn{ex: d.sql, driver: d.driver, slow: d.slow} }
+
+// conn implements Querier.
+func (t *Tx) conn() conn { return conn{ex: t.tx, driver: t.driver, slow: t.slow} }
+
+// Exec runs a statement against q — a *DB or a *Tx.
+func Exec(ctx context.Context, q Querier, query string, args ...any) (sql.Result, error) {
+	c := q.conn()
+	return exec(ctx, c.ex, c.driver, c.slow, query, args...)
+}
+
+// QueryAll runs the query against q and scans every row into []T via db tags.
+func QueryAll[T any](ctx context.Context, q Querier, query string, args ...any) ([]T, error) {
+	c := q.conn()
+	return queryAll[T](ctx, c.ex, c.driver, c.slow, query, args...)
+}
+
+// QueryOne scans the first row from q into *T; ErrNoRow when nothing matched.
+func QueryOne[T any](ctx context.Context, q Querier, query string, args ...any) (*T, error) {
+	c := q.conn()
+	return queryOne[T](ctx, c.ex, c.driver, c.slow, query, args...)
+}
+
+// QueryScalar scans a single column of the first row from q.
+func QueryScalar[T any](ctx context.Context, q Querier, query string, args ...any) (T, error) {
+	c := q.conn()
+	return queryScalar[T](ctx, c.ex, c.driver, c.slow, query, args...)
 }
 
 func exec(ctx context.Context, ex executor, driver Driver, slow time.Duration, query string, args ...any) (sql.Result, error) {

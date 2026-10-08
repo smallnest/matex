@@ -9,3 +9,12 @@ log:
 
 observe:
   prefix: "work"       # 日志/响应里用的业务前缀
+
+# 分布式追踪（OpenTelemetry）。默认关闭：关着时 obs.StartSpan 是 no-op，
+# 相关 id 回落到 X-Request-ID，一切行为与接入前一致。
+trace:
+  enabled: false
+  # endpoint: "localhost:4317"   # OTLP/gRPC collector；留空则只生成 span 不外发
+  # sample_ratio: 1.0            # 采样比例 0~1（0 = 全丢，1 = 全采）
+  # export_timeout: 10s
+

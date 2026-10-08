@@ -1,0 +1,18 @@
+# examples/cache 的配置。
+
+http:
+  addr: ":8083"
+  timeout: 5s
+
+log:
+  level: info
+
+# 留空/删掉 redis 段也能跑：cache.GetOrLoad 在 client 为 nil 时直接回源，
+# 调用点不用写 `if env.Redis != nil`。
+redis:
+  addr: ${REDIS_ADDR:localhost:6379}
+
+# 服务专属段：key = Service.Name()
+cache:
+  ttl: 30s          # 基础存活时间
+  jitter: 5s        # 每个 key 的 TTL 再随机减掉最多 5s（防同时过期）
