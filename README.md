@@ -44,8 +44,32 @@ internal/domain/<name>/   业务域：handler.go（HTTP 边界）+ service.go（
 pkg/core/                 基础设施：config / db / redis / memcache / kafka / httpx / obs / errs / verticle / app
 configs/config.yaml       配置（框架段 + 每服务一段，段 key = Service.Name()）
 migrations/*.sql          数据库迁移（文件名序执行，追加不修改）
+examples/<feature>/       每个能力一个可运行示例（离线可跑、带测试）
 skills/                   AI skill（matex-* 前缀）
 .claude-plugin/           skill 插件清单（plugin.json = matex 大伞，一键全装）
+```
+
+## 示例
+
+`examples/` 下每个能力一个**可运行**示例（`examples/README.md` 有索引）：
+
+| 示例 | 能力 | 外部依赖 |
+|---|---|---|
+| `examples/config` | 配置：tag 语义 / `${VAR}` 展开 / 环境覆盖 | 无 |
+| `examples/errors` | 错误模型：Kind → 状态码、业务 code、Wrap | 无 |
+| `examples/database` | 数据库：三驱动、`?` 占位符、泛型扫描、事务 | 默认纯 Go SQLite |
+| `examples/http` | Web 层：路由、handler 约定、错误映射、`HandleRaw` | 无 |
+| `examples/observability` | 日志 / trace id / Prometheus（含自定义指标） | 无 |
+| `examples/lifecycle` | 生命周期：Block、Closer、配置热更、优雅退出 | 无 |
+| `examples/redis` | 缓存读写、`TryLock` 分布式锁 | Redis |
+| `examples/memcache` | JSON 缓存、TTL、Touch | Memcached |
+| `examples/kafka` | 生产者（同步/异步）+ 消费者循环 | Kafka |
+| `examples/grpc` | gRPC 服务注册 + 客户端拨号 | 无 |
+| `examples/rpcx` | rpcx 服务注册 + 客户端调用（无 IDL） | 无 |
+
+```sh
+go test ./examples/...        # 全部离线可跑（SQLite / miniredis / kfake / 进程内 gRPC·rpcx）
+make example NAME=http        # 等价于 go run ./examples/http
 ```
 
 ## Skills
@@ -73,6 +97,7 @@ skills/                   AI skill（matex-* 前缀）
 make build / make run / make bins       # 编译、运行、打二进制
 make test / make test-short             # 全量 / 快速测试（均含 sqlite DB 用例）
 make ci                                 # vet + test-short + build
+make example NAME=http                  # 跑示例（见 examples/）
 make dev / make dev-down                # 起 / 停本地依赖
 make migrate DSN=postgres://...          # 迁移（默认 postgres；DRIVER=sqlite|mysql 可切）
 make run-sqlite                          # 带 SQLite 库、零外部依赖运行

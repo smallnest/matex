@@ -19,6 +19,7 @@ internal/domain/<name>/   业务域：handler.go（HTTP 边界）+ service.go（
 pkg/core/                 基础设施：config/db/redis/memcache/kafka/httpx/obs/errs/verticle/app
 configs/config.yaml       配置（框架段 + 每服务一段，段 key = Service.Name()）
 migrations/*.sql          数据库迁移（文件名序执行，追加不修改）
+examples/<feature>/       每个能力一个可运行示例（离线可跑、带测试；见 examples/README.md）
 skills/                   AI skill（matex-add-domain、matex-setup-*）
 ```
 
@@ -50,4 +51,9 @@ make migrate DSN=postgres://...            # 默认 postgres；-driver 可切 sq
 - 接 gRPC → `matex-setup-grpc`
 - 接 rpcx → `matex-setup-rpcx`
 
-改完务必 `make ci` 通过再交付。
+## 示例
+
+`examples/<feature>/` 每个能力一个可运行示例，一律遵守上面的约定（只经 `pkg/core/*`，
+不 import 驱动库，depguard 的 `examples-no-drivers` 强制；唯一豁免是 kafka 示例测试用的
+`franz-go/pkg/kfake`）。示例要能**离线跑 + 带测试**（SQLite / miniredis / kfake / 进程内
+gRPC·rpcx），所以 `make ci` 就能验证它们。改完务必 `make ci` 通过再交付。

@@ -1,0 +1,13 @@
+# examples/http 的配置。
+# 框架段：http（必填）、log（必填）；服务专属段的 key 必须等于 Service.Name()。
+
+http:
+  addr: ":8080"
+  timeout: 10s          # 单请求预算，超时 → 504 / 50400
+  max_body: 1048576     # 请求体上限 1MB
+
+log:
+  level: info
+
+httpdemo:
+  greeting: "Hello, "

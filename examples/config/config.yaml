@@ -1,0 +1,22 @@
+# examples/config 用的配置文件。演示：
+#   - 结构体 tag 语义：default（缺省值）/ env（环境变量覆盖）/ optional（可缺省）
+#   - ${VAR} 与 ${VAR:default} 的环境变量展开
+#
+# 注意 yaml 里没有出现的 key 才走 default/optional；出现了就以文件为准。
+
+http:
+  addr: ${HTTP_ADDR:0.0.0.0:8080}   # 未设 HTTP_ADDR 时用 0.0.0.0:8080
+  timeout: 5s
+
+db:
+  dsn: ${DB_DSN:file:examples-config.db}
+  max_open_conns: 8
+  # max_idle_conns 故意不写：字段 tag 是 optional，缺省即零值
+
+# 写成 YAML 列表
+features:
+  - cache
+  - events
+
+# 写成字符串也认（见默认值 "false"）
+debug: true

@@ -24,6 +24,23 @@ linters:
               desc: use pkg/core/memcache
             - pkg: github.com/twmb/franz-go
               desc: use pkg/core/kafka
+        # 示例同样示范"业务不碰驱动"：examples/ 下也不得直接 import 驱动。
+        # 唯一豁免是 kafka 示例测试用的进程内 broker franz-go/pkg/kfake，
+        # 因此本条不 deny franz-go。
+        examples-no-drivers:
+          files:
+            - "**/examples/**"
+          deny:
+            - pkg: github.com/jackc/pgx
+              desc: use pkg/core/db
+            - pkg: github.com/go-sql-driver/mysql
+              desc: use pkg/core/db
+            - pkg: modernc.org/sqlite
+              desc: use pkg/core/db
+            - pkg: github.com/redis/go-redis
+              desc: use pkg/core/redis
+            - pkg: github.com/bradfitz/gomemcache
+              desc: use pkg/core/memcache
         # 零 Web 框架：路由用 net/http 的 ServeMux（pkg/core/httpx）。
         no-web-framework:
           files:

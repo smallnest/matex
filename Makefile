@@ -33,6 +33,10 @@ run-min: ## 零依赖运行（最小配置，不连任何外部服务）
 run-sqlite: ## 带数据库零依赖运行（纯 Go SQLite；先 make migrate DRIVER=sqlite DSN=file:matex.db）
 	go run ./cmd/$(SERVICE) -conf configs/config.sqlite.yaml
 
+.PHONY: example
+example: ## 运行某个示例（NAME=http|database|redis|...）
+	go run ./examples/$(NAME)
+
 .PHONY: migrate
 migrate: ## 应用数据库迁移（DRIVER=postgres|mysql|sqlite DSN=...）
 	go run ./cmd/migrate -driver $(DRIVER) -dsn "$(DSN)"

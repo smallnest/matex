@@ -8,14 +8,17 @@
 //
 //   - a DB handle whose query helpers carry the driver (so `?` placeholders
 //     are rewritten to $1..$n for PostgreSQL — write portable SQL once)
+//
 //   - generic scan helpers QueryAll[T]/QueryOne[T]/QueryScalar[T] (db tags)
+//
 //   - WithTx for transaction scoping with automatic rollback
+//
 //   - slow query logging and error wrapping into errs kinds
 //
-//	type UserDAO struct{ db *db.DB }
-//	func (d *UserDAO) GetByID(ctx context.Context, id int64) (*User, error) {
-//	    return d.db.QueryOne[User](ctx, `SELECT * FROM users WHERE id = ?`, id)
-//	}
+//     type UserDAO struct{ db *db.DB }
+//     func (d *UserDAO) GetByID(ctx context.Context, id int64) (*User, error) {
+//     return d.db.QueryOne[User](ctx, `SELECT * FROM users WHERE id = ?`, id)
+//     }
 //
 // Business code never imports a driver (enforced by depguard): it deals in
 // *db.DB / *db.Tx / db.Result only.
@@ -94,8 +97,8 @@ const (
 type Config struct {
 	Driver          Driver        `json:"driver" default:"postgres"`
 	DSN             string        `json:"dsn" env:"DB_DSN"`
-	MaxOpenConns    int32         `json:"max_open_conns" default:"16"`  // keep in sync with defaultMaxOpenConns
-	MaxIdleConns    int32         `json:"max_idle_conns" default:"2"`   // keep in sync with defaultMaxIdleConns
+	MaxOpenConns    int32         `json:"max_open_conns" default:"16"` // keep in sync with defaultMaxOpenConns
+	MaxIdleConns    int32         `json:"max_idle_conns" default:"2"`  // keep in sync with defaultMaxIdleConns
 	ConnMaxLifetime time.Duration `json:"conn_max_lifetime" default:"30m"`
 	ConnMaxIdleTime time.Duration `json:"conn_max_idle_time" default:"5m"`
 	ConnectTimeout  time.Duration `json:"connect_timeout" default:"5s"`   // keep in sync with defaultConnectTimeout

@@ -104,6 +104,11 @@ func (s *Server) HandleRaw(pattern string, h http.HandlerFunc) {
 // Addr returns the listen address.
 func (s *Server) Addr() string { return s.cfg.Addr }
 
+// Handler returns the http.Handler that serves these routes. It is the
+// escape hatch for mounting matex routes inside another mux, and for
+// tests (httptest.NewRecorder + Handler().ServeHTTP).
+func (s *Server) Handler() http.Handler { return s.http.Handler }
+
 // ListenAndServe starts serving (blocks).
 func (s *Server) ListenAndServe() error { return s.http.ListenAndServe() }
 

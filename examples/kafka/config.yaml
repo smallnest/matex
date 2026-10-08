@@ -1,0 +1,20 @@
+# examples/kafka 的配置。
+#
+# 需要 Kafka：先 `make dev`。kafka 段配了才会创建生产者，未配置时 env.Kafka == nil
+#（本示例会直接报错提示）。
+
+http:
+  addr: ":8080"
+  timeout: 10s
+
+log:
+  level: info
+
+kafka:
+  brokers: ${KAFKA_BROKERS:localhost:9092}   # 逗号分隔，或 YAML 列表
+  client_id: kafkademo
+
+kafkademo:
+  topic: matex.example.events
+  group: kafkademo-consumers
+  consume: true            # false 则只产不消（例如网关/写入侧）

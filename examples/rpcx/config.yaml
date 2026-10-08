@@ -1,0 +1,21 @@
+# examples/rpcx 的配置。
+#
+# rpcx 段配了才会建 server；rpcxdemo.target 填了才建 client。
+# rpcx 客户端是懒连接（第一次 Call 才拨号），所以 target 填自己也能跑通。
+
+http:
+  addr: ":8080"
+  timeout: 5s
+
+rpcx:
+  network: tcp          # tcp | quic | kcp | ws | http
+  addr: ":8972"
+
+log:
+  level: info
+
+rpcxdemo:
+  # 对端："host:port" 或 "network@host:port"。
+  # 默认指向自己：因为 rpcx 客户端懒连接，请求到达时本进程的 server 已经在 serve。
+  target: "localhost:8972"
+  prefix: "Hello, "

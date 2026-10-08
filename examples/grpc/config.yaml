@@ -1,0 +1,20 @@
+# examples/grpc 的配置。
+#
+# grpc 段配了才会建 gRPC server；grpcdemo.target 填对端地址才建 client。
+
+http:
+  addr: ":8080"
+  timeout: 5s
+
+grpc:
+  addr: ":9090"
+  dial_timeout: 3s
+
+log:
+  level: info
+
+grpcdemo:
+  # 对端地址 host:port。留空 = 只做服务端。
+  # 不要填自己（:9090）：Setup 阶段自己的 server 还没开始 serve，会 fail-fast。
+  target: ""
+  service: ""        # 健康检查的服务名；"" = 整体健康

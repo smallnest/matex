@@ -1,0 +1,11 @@
+# examples/observability 的配置。
+
+http:
+  addr: ":8080"
+  timeout: 5s
+
+log:
+  level: info          # debug | info | warn | error
+
+observe:
+  prefix: "work"       # 日志/响应里用的业务前缀

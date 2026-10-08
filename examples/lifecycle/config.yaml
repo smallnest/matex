@@ -1,0 +1,16 @@
+# examples/lifecycle 的配置。
+#
+# 热更试试：服务跑起来后改这里（比如把 greeting 换成 "Yo, "），
+# 保存后不用重启，日志里会立刻出现 "config reloaded"，接口返回值也跟着变。
+
+http:
+  addr: ":8080"
+  timeout: 5s
+
+log:
+  level: info
+
+lifecycle:
+  greeting: "Hello, "
+  heartbeat: 2s        # 后台任务日志间隔
+  ready_window: 3s     # 启动后 3s 内 /readyz 返回 503（模拟预热）

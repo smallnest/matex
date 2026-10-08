@@ -11,8 +11,9 @@
 //  1. load config.yaml (path from WithConf / CONFIG_FILE / default)
 //  2. obs.Init(name, level)            — logging comes first
 //  3. init infra (db/redis/memcache/kafka producer — only the sections
-//     that are configured; the rest stay nil)
-//  4. svc.Setup(ctx, env)              — service-specific state
+//     that are configured; the rest stay nil) plus the metrics registry
+//  4. svc.Setup(ctx, env)              — service-specific state (runs
+//     after env.Metrics exists, so services can register custom metrics)
 //  5. httpx server + /healthz /readyz /metrics
 //  6. svc.BuildRouter(srv)             — register routes
 //  7. serve; watch the config file and notify svc of service-section
@@ -265,6 +266,9 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 		RPCXCfg:  fc.RPCX,
 	}
 	env.setServiceSection(serviceRaw)
+	// Metrics exist before Setup so services can register custom
+	// collectors there (env.Metrics.Counter/Gauge/Histogram).
+	env.Metrics = obs.NewMetrics()
 
 	// Step 3: infrastructure (fail-fast; only configured sections)
 	if fc.DB.DSN != "" {
@@ -302,7 +306,6 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 	}
 
 	// Step 5/6: http server + routes
-	env.Metrics = obs.NewMetrics()
 	srv := httpx.New(fc.HTTP,
 		httpx.WithMetrics(env.Metrics),
 		httpx.WithLogger(slog.Default().With("service", svc.Name())),
