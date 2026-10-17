@@ -9,7 +9,8 @@
 //	srv.Handle("POST", "/api/v1/payments", pay)
 //
 //	// then, with a redis-backed store:
-//	srv.Use(idempotency.Middleware(idempotency.NewRedis(env.Redis), idempotency.Config{}))
+//	rc, _ := env.Redis()
+//	srv.Use(idempotency.Middleware(idempotency.NewRedis(rc), idempotency.Config{}))
 //
 // A second request that arrives while the first is still running is
 // rejected with 409 rather than being run in parallel — that is the case

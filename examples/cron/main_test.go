@@ -11,7 +11,6 @@ import (
 	"github.com/smallnest/matex/pkg/core/cron"
 	"github.com/smallnest/matex/pkg/core/httpx"
 	"github.com/smallnest/matex/pkg/core/obs"
-	"github.com/smallnest/matex/pkg/core/redis"
 	"github.com/smallnest/matex/pkg/core/redistest"
 	"github.com/smallnest/matex/pkg/core/verticle"
 )
@@ -29,11 +28,12 @@ func waitFor(t *testing.T, cond func() bool) {
 }
 
 // newService runs Setup (which applies the config defaults) and returns the
-// service plus a handler over its routes.
-func newService(t *testing.T, rc *redis.Client) (*cronService, http.Handler) {
+// service plus a handler over its routes. Infra handles are private to Env;
+// a test that needs redis sets svc.redis itself (TestLeaderElection…).
+func newService(t *testing.T) (*cronService, http.Handler) {
 	t.Helper()
 	svc := &cronService{}
-	env := &verticle.Env{Metrics: obs.NewMetrics(), Redis: rc}
+	env := &verticle.Env{Metrics: obs.NewMetrics()}
 	if err := svc.Setup(t.Context(), env); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -52,7 +52,7 @@ func fastScheduler(svc *cronService, interval time.Duration) {
 }
 
 func TestJobsRunOnTheirIntervals(t *testing.T) {
-	svc, _ := newService(t, nil)
+	svc, _ := newService(t)
 	fastScheduler(svc, 5*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -78,7 +78,7 @@ func TestJobsRunOnTheirIntervals(t *testing.T) {
 // TestRunOnStartBumpsImmediately: the heartbeat job is configured to run at
 // startup rather than after the first interval.
 func TestRunOnStartBumpsImmediately(t *testing.T) {
-	svc, _ := newService(t, nil)
+	svc, _ := newService(t)
 	svc.sched = cron.New(cron.Config{})
 	svc.sched.Add(svc.jobs(time.Hour, time.Hour)...)
 
@@ -101,7 +101,7 @@ func TestRunOnStartBumpsImmediately(t *testing.T) {
 // TestJobFailureDoesNotStopTheLoop: every third reconcile run returns an
 // error, and the schedule keeps going.
 func TestJobFailureDoesNotStopTheLoop(t *testing.T) {
-	svc, _ := newService(t, nil)
+	svc, _ := newService(t)
 	jobs := svc.jobs(time.Hour, time.Hour)
 	reconcile := jobs[1]
 
@@ -127,8 +127,10 @@ func TestJobFailureDoesNotStopTheLoop(t *testing.T) {
 func TestLeaderElectionRunsOneInstancePerInterval(t *testing.T) {
 	rc := redistest.Start(t)
 
-	replicaA, _ := newService(t, rc)
-	replicaB, _ := newService(t, rc)
+	replicaA, _ := newService(t)
+	replicaB, _ := newService(t)
+	replicaA.redis = rc
+	replicaB.redis = rc
 
 	stopA := startScheduler(t, replicaA, time.Minute)
 	defer stopA()
@@ -170,7 +172,7 @@ func startScheduler(t *testing.T, svc *cronService, interval time.Duration) func
 }
 
 func TestJobsEndpointReportsCounters(t *testing.T) {
-	svc, h := newService(t, nil)
+	svc, h := newService(t)
 	svc.stats.record("heartbeat")
 	svc.stats.record("heartbeat")
 	svc.stats.record("reconcile")
@@ -204,7 +206,7 @@ func TestJobsEndpointReportsCounters(t *testing.T) {
 }
 
 func TestConfigDefaults(t *testing.T) {
-	svc, _ := newService(t, nil)
+	svc, _ := newService(t)
 	if svc.cfg.HeartbeatInterval != 500*time.Millisecond ||
 		svc.cfg.ReconcileInterval != 2*time.Second ||
 		svc.cfg.JobTimeout != 5*time.Second {

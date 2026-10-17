@@ -54,15 +54,16 @@ func (s *cronService) Setup(ctx context.Context, env *verticle.Env) error {
 		return err
 	}
 	s.stats = newJobStats()
-	s.redis = env.Redis
+	rc, ok := env.Redis()
+	s.redis = rc
 	s.sched = cron.New(cron.Config{
 		// nil when redis is not configured: one replica, no election needed.
-		Redis:   env.Redis,
+		Redis:   rc,
 		Timeout: s.cfg.JobTimeout,
 	})
 	s.sched.Add(s.jobs(s.cfg.HeartbeatInterval, s.cfg.ReconcileInterval)...)
 	obs.Info(ctx, "cron jobs registered",
-		"jobs", len(s.sched.Jobs()), "leader_election", env.Redis != nil)
+		"jobs", len(s.sched.Jobs()), "leader_election", ok)
 
 	// verticle starts this block and cancels it on shutdown, before the
 	// infrastructure it uses is closed.

@@ -39,13 +39,20 @@ func (s *DemoService) Setup(ctx context.Context, env *verticle.Env) error {
 	if err := env.DecodeService(&s.cfg); err != nil {
 		return err
 	}
-	s.hello = helloworld.New(helloworld.Deps{
-		DB:       env.DB,
-		Redis:    env.Redis,
-		Memcache: env.Memcache,
-		Producer: env.Kafka,
-		Greeting: s.cfg.Greeting,
-	})
+	deps := helloworld.Deps{Greeting: s.cfg.Greeting}
+	if db, ok := env.DB(); ok {
+		deps.DB = db
+	}
+	if rc, ok := env.Redis(); ok {
+		deps.Redis = rc
+	}
+	if mc, ok := env.Memcache(); ok {
+		deps.Memcache = mc
+	}
+	if p, ok := env.Kafka(); ok {
+		deps.Producer = p
+	}
+	s.hello = helloworld.New(deps)
 
 	// Optional consumer: enable with `consume: true` in config.
 	if s.cfg.Consume {

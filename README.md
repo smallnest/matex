@@ -9,7 +9,7 @@
 ## 特性
 
 - **最常用布局**：`cmd/` → `internal/app/`（服务装配）→ `internal/domain/`（业务域）→ `pkg/core/`（基础设施）。
-- **基础设施一键初始化**：数据库、Kafka、Redis、Memcached、配置——`config.yaml` 里配了哪个就初始化哪个，没配的对应依赖为 `nil`（代码 `if env.X != nil` 防御）。
+- **基础设施一键初始化**：数据库、Kafka、Redis、Memcached、配置——`config.yaml` 里配了哪个就初始化哪个。句柄经 `Env` 访问器读取：`RequireDB()` 缺失即启动失败，`DB()` 逗号-ok 判可用。
 - **Verticle 服务抽象**：一个部署单元 = `Name()` + `Setup(ctx, env)` + `BuildRouter(srv)`，`verticle.Run` 统一驱动生命周期与优雅退出，配置热更可插拔。
 - **零 Web 框架**：标准库 `net/http` + Go 1.22 ServeMux（方法路由 + 路径参数），`pkg/core/httpx` 统一处理 recover / 超时 / trace id / 访问日志 / metrics / JSON 响应与错误映射。
 - **AI skills**：顶层 `skills/` 目录（`matex-` 前缀命名，`npx skills add smallnest/matex --all` 可一次全装）内置 12 个 skill：新增 domain、接数据库/缓存/redis/memcache/kafka/grpc/rpcx、加认证/链路追踪/稳定性防护/定时任务，都有规可依（`AGENTS.md` 是总入口）。

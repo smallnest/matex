@@ -25,7 +25,7 @@ skills/                   AI skill（matex-add-domain、matex-setup-*）
 
 ## 关键概念
 
-- **verticle.Service**：部署单元 = 一个 `Name()` + `Setup(ctx, env)` + `BuildRouter(srv)`。`verticle.Run` 统一驱动：加载配置 → 初始化基础设施（配了才建，没配为 nil）→ Setup → 建 HTTP server → BuildRouter → 运行 → 优雅退出。`env.DB/env.Redis/...` 为 nil 时表示未配置，代码要 `if env.X != nil` 防御。
+- **verticle.Service**：部署单元 = 一个 `Name()` + `Setup(ctx, env)` + `BuildRouter(srv)`。`verticle.Run` 统一驱动：加载配置 → 初始化基础设施（配了才建）→ Setup → 建 HTTP server → BuildRouter → 运行 → 优雅退出。基础设施句柄对业务是**私有**的，一律经 `Env` 访问器读取：`RequireDB()`（/`RequireRedis`/`RequireMemcache`/`RequireKafka`）在未配置时让启动失败，`DB()`（/`Redis`/`Memcache`/`Kafka`）逗号-ok 判可用。不写 `if env.DB != nil`。
 - **配置热更**：实现 `verticle.ConfigWatcher` 接口，`OnServiceConfigChange(raw map[string]any)` 会收到服务段新内容。
 - **测试无 Docker**：`dbtest.Start(t)`（默认纯 Go SQLite + 自动迁移，离线可用；`DB_TEST_DRIVER/DSN` 可切真库）、`redistest.Start(t)`（miniredis）。
 

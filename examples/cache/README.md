@@ -31,17 +31,18 @@ go test ./examples/cache
 ## 用法
 
 ```go
+db, _ := env.DB()
 u, err := cache.GetOrLoad(ctx, s.redis, cache.Key("user", id),
 	cache.Config{TTL: 30 * time.Second, Jitter: 5 * time.Second},
 	func(ctx context.Context) (User, error) {
-		return dao.ByID(ctx, env.DB, id)   // 回源：DB / 下游 / 计算
+		return dao.ByID(ctx, db, id)   // 回源：DB / 下游 / 计算
 	})
 ```
 
 - **`Jitter` 建议取 TTL 的 10~20%**。`Jitter >= TTL` 时会被压到 `TTL/2`（不会抖到 0 ——
   在 redis 里 0 过期等于立即删除）。
-- **nil client 不是错误**：不配 redis 就直接回源、不缓存。调用点因此不用写
-  `if env.Redis != nil`。
+- **nil client 不是错误**：不配 redis 就直接回源、不缓存。调用点因此不用做
+  可用性判断。
 - **回源失败不写缓存**：错误会被原样返回，下一次请求重新尝试。
 - **失败不是错误，只是慢**：写缓存失败只记 warn，值已经在手上，不影响正确性。
 

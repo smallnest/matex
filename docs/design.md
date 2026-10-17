@@ -87,7 +87,9 @@ config.LoadMap → 框架段(ParseMap) + 服务段(按 Name 取)
 不引入依赖注入框架，用**显式 Deps 结构**：
 
 ```go
-s.hello = helloworld.New(helloworld.Deps{DB: env.DB, Redis: env.Redis, ...})
+db, _ := env.DB()
+redis, _ := env.Redis()
+s.hello = helloworld.New(helloworld.Deps{DB: db, Redis: redis, ...})
 ```
 
 理由：编译期类型安全、无魔法、AI 易读易生成。代价是装配代码手写——但装配点集中在 `internal/app` 一处，可接受。

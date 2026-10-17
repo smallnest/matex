@@ -67,7 +67,9 @@ func (s *cacheService) Setup(_ context.Context, env *verticle.Env) error {
 	if err := env.DecodeService(&s.cfg); err != nil {
 		return err
 	}
-	s.redis = env.Redis
+	if rc, ok := env.Redis(); ok {
+		s.redis = rc
+	}
 	s.users = newUserStore()
 	return nil
 }

@@ -2,8 +2,8 @@
 // and a best-effort distributed lock.
 //
 // Redis must be running (make dev). A configured `redis:` section is
-// created by verticle.Run and handed over as env.Redis; when the section
-// is absent env.Redis is nil.
+// created by verticle.Run and read in Setup with the comma-ok accessor
+// env.Redis().
 //
 // Run:
 //
@@ -50,10 +50,11 @@ func (s *redisService) Setup(_ context.Context, env *verticle.Env) error {
 	if err := env.DecodeService(&s.cfg); err != nil {
 		return err
 	}
-	if env.Redis == nil {
+	rc, ok := env.Redis()
+	if !ok {
 		return errors.New("rediscache: the `redis:` section is required (start Redis first: make dev)")
 	}
-	s.rc = env.Redis
+	s.rc = rc
 	return nil
 }
 

@@ -7,7 +7,8 @@
 // jobs simply run — which is the right behaviour for one process and the
 // wrong one for a fleet.
 //
-//	sched := cron.New(cron.Config{Redis: env.Redis, Timeout: time.Minute})
+//	rc, _ := env.Redis()
+//	sched := cron.New(cron.Config{Redis: rc, Timeout: time.Minute})
 //	sched.Add(cron.Job{
 //		Name:     "expire-orders",
 //		Interval: 5 * time.Minute,

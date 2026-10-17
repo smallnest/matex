@@ -2,9 +2,10 @@
 // an at-least-once consumer loop, both driven by the verticle lifecycle.
 //
 // Kafka must be running (make dev). The producer is built by
-// verticle.Run from the `kafka:` section and handed over as env.Kafka; the
-// consumer is registered as a background block in Setup, so it starts with
-// the app and stops on shutdown (committing the last batch).
+// verticle.Run from the `kafka:` section and read in Setup with the
+// comma-ok accessor env.Kafka(); the consumer is registered as a background
+// block in Setup, so it starts with the app and stops on shutdown
+// (committing the last batch).
 //
 // Run:
 //
@@ -52,10 +53,11 @@ func (s *kafkaService) Setup(ctx context.Context, env *verticle.Env) error {
 	if err := env.DecodeService(&s.cfg); err != nil {
 		return err
 	}
-	if env.Kafka == nil {
+	p, ok := env.Kafka()
+	if !ok {
 		return errors.New("kafkademo: the `kafka:` section is required (start Kafka first: make dev)")
 	}
-	s.p = env.Kafka
+	s.p = p
 
 	if s.cfg.Consume {
 		// The same brokers/client id the producer used.

@@ -260,7 +260,8 @@ type conn struct {
 //		return db.QueryOne[User](ctx, q, `SELECT * FROM users WHERE id = ?`, id)
 //	}
 //
-//	u, err := dao.ByID(ctx, env.DB, 1)                      // pool
+//	db, _ := env.DB()
+//	u, err := dao.ByID(ctx, db, 1)                          // pool
 //	err = db.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
 //		_, err := dao.ByID(ctx, tx, 1)                      // same code, in a tx
 //		return err

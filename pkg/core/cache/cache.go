@@ -12,11 +12,13 @@
 // GetOrLoad closes both: concurrent misses for one key are collapsed into a
 // single load, and each stored TTL is spread across a window.
 //
-//	v, err := cache.GetOrLoad(ctx, env.Redis, key, cache.Config{TTL: time.Minute},
-//		func(ctx context.Context) (*User, error) { return dao.ByID(ctx, env.DB, id) })
+//	rc, _ := env.Redis()
+//	db, _ := env.DB()
+//	v, err := cache.GetOrLoad(ctx, rc, key, cache.Config{TTL: time.Minute},
+//		func(ctx context.Context) (*User, error) { return dao.ByID(ctx, db, id) })
 //
 // A nil client is not an error: the load runs uncached, which keeps the call
-// site free of `if env.Redis != nil` branches.
+// site free of availability checks.
 package cache
 
 import (

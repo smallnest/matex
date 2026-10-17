@@ -29,7 +29,9 @@
 //	func (s *DemoService) Setup(ctx context.Context, env *verticle.Env) error {
 //	    var cfg DemoConfig
 //	    if err := env.DecodeService(&cfg); err != nil { return err }
-//	    s.hello = helloworld.New(helloworld.Deps{DB: env.DB, Redis: env.Redis, ...})
+//	    db, _ := env.DB()
+//	    redis, _ := env.Redis()
+//	    s.hello = helloworld.New(helloworld.Deps{DB: db, Redis: redis, ...})
 //	    return nil
 //	}
 //	func (s *DemoService) BuildRouter(s *httpx.Server) error {
@@ -43,6 +45,7 @@ package verticle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -126,17 +129,21 @@ type FrameworkConfig struct {
 	Kafka    kafka.Config    `json:"kafka" optional:""`
 }
 
-// Env carries the initialized infrastructure and service utilities
-// into Setup. Fields are nil when the config section was absent —
-// code defensively (`if env.DB != nil`).
+// Env carries the initialized infrastructure and service utilities into
+// Setup. The infra handles are private: a service reads them through the
+// accessors — RequireDB/RequireRedis/RequireMemcache/RequireKafka fail the
+// boot when the config section was absent, DB()/Redis()/Memcache()/Kafka()
+// report availability with a comma-ok. The nil-check convention
+// (`if env.DB != nil`) is gone; the accessors are the seam, so a future
+// change cannot silently reintroduce it.
 type Env struct {
 	Name     string
 	ConfPath string
 
-	DB       *db.DB
-	Redis    *redis.Client
-	Memcache *memcache.Client
-	Kafka    *kafka.Producer
+	db       *db.DB
+	redis    *redis.Client
+	memcache *memcache.Client
+	kafka    *kafka.Producer
 	Auth     *auth.Verifier
 	KafkaCfg kafka.Config
 	GRPCCfg  grpcx.Config
@@ -147,6 +154,54 @@ type Env struct {
 	blocks  []block
 	closers []func()
 }
+
+// RequireDB returns the database, failing the boot when the `db:` config
+// section was absent. Call it in Setup when the service needs the DB.
+func (e *Env) RequireDB() (*db.DB, error) {
+	if e.db == nil {
+		return nil, errors.New("verticle: db is not configured (no `db:` section in config.yaml)")
+	}
+	return e.db, nil
+}
+
+// DB reports the database and whether it was configured.
+func (e *Env) DB() (*db.DB, bool) { return e.db, e.db != nil }
+
+// RequireRedis returns the redis client, failing the boot when the `redis:`
+// config section was absent.
+func (e *Env) RequireRedis() (*redis.Client, error) {
+	if e.redis == nil {
+		return nil, errors.New("verticle: redis is not configured (no `redis:` section in config.yaml)")
+	}
+	return e.redis, nil
+}
+
+// Redis reports the redis client and whether it was configured.
+func (e *Env) Redis() (*redis.Client, bool) { return e.redis, e.redis != nil }
+
+// RequireMemcache returns the memcache client, failing the boot when the
+// `memcache:` config section was absent.
+func (e *Env) RequireMemcache() (*memcache.Client, error) {
+	if e.memcache == nil {
+		return nil, errors.New("verticle: memcache is not configured (no `memcache:` section in config.yaml)")
+	}
+	return e.memcache, nil
+}
+
+// Memcache reports the memcache client and whether it was configured.
+func (e *Env) Memcache() (*memcache.Client, bool) { return e.memcache, e.memcache != nil }
+
+// RequireKafka returns the kafka producer, failing the boot when the `kafka:`
+// config section was absent.
+func (e *Env) RequireKafka() (*kafka.Producer, error) {
+	if e.kafka == nil {
+		return nil, errors.New("verticle: kafka is not configured (no `kafka:` section in config.yaml)")
+	}
+	return e.kafka, nil
+}
+
+// Kafka reports the kafka producer and whether it was configured.
+func (e *Env) Kafka() (*kafka.Producer, bool) { return e.kafka, e.kafka != nil }
 
 type block struct {
 	name string
@@ -291,7 +346,7 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 		if err != nil {
 			return fmt.Errorf("verticle: init db: %w", err)
 		}
-		env.DB = p
+		env.db = p
 		obs.Info(ctx, "db initialized")
 	}
 	if fc.Redis.Addr != "" {
@@ -299,11 +354,11 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 		if err != nil {
 			return fmt.Errorf("verticle: init redis: %w", err)
 		}
-		env.Redis = rc
+		env.redis = rc
 		obs.Info(ctx, "redis initialized", "addr", fc.Redis.Addr)
 	}
 	if len(fc.Memcache.Addrs) > 0 {
-		env.Memcache = memcache.Open(fc.Memcache)
+		env.memcache = memcache.Open(fc.Memcache)
 		obs.Info(ctx, "memcache initialized", "addrs", fc.Memcache.Addrs)
 	}
 	if len(fc.Kafka.Brokers) > 0 {
@@ -311,7 +366,7 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 		if err != nil {
 			return fmt.Errorf("verticle: init kafka: %w", err)
 		}
-		env.Kafka = p
+		env.kafka = p
 		obs.Info(ctx, "kafka producer initialized", "brokers", fc.Kafka.Brokers)
 	}
 	// Auth is built when either verification mode is configured; services
@@ -397,14 +452,14 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 	}
 	// infrastructure closers first (outermost), then service closers:
 	// shutdown unwinds in reverse, so services close before infra.
-	if env.Kafka != nil {
-		a.AddCloser(env.Kafka.Close)
+	if env.kafka != nil {
+		a.AddCloser(env.kafka.Close)
 	}
-	if env.Redis != nil {
-		a.AddCloser(func() { _ = env.Redis.Close() })
+	if env.redis != nil {
+		a.AddCloser(func() { _ = env.redis.Close() })
 	}
-	if env.DB != nil {
-		a.AddCloser(func() { _ = env.DB.Close() })
+	if env.db != nil {
+		a.AddCloser(func() { _ = env.db.Close() })
 	}
 	for _, c := range env.closers {
 		a.AddCloser(c)
@@ -431,13 +486,13 @@ func authMode(cfg auth.Config) string {
 // defers to the service's ReadyChecker if implemented.
 func makeReady(svc Service, env *Env) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
-		if env.DB != nil {
-			if err := env.DB.Ping(ctx); err != nil {
+		if env.db != nil {
+			if err := env.db.Ping(ctx); err != nil {
 				return fmt.Errorf("db: %w", err)
 			}
 		}
-		if env.Redis != nil {
-			if err := env.Redis.Ping(ctx); err != nil {
+		if env.redis != nil {
+			if err := env.redis.Ping(ctx); err != nil {
 				return fmt.Errorf("redis: %w", err)
 			}
 		}

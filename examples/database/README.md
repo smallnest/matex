@@ -74,10 +74,11 @@ func (articleDAO) bySlug(ctx context.Context, q db.Querier, slug string) (*Artic
 }
 
 // 池上调用
-a, err := dao.bySlug(ctx, env.DB, "hello-matex")
+db, _ := env.DB()
+a, err := dao.bySlug(ctx, db, "hello-matex")
 
 // 同一个方法，事务内调用：能读到本事务自己的写
-err = env.DB.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
+err = db.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
 	_, err := dao.bySlug(ctx, tx, "hello-matex")
 	return err
 })
