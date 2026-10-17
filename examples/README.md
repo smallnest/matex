@@ -20,6 +20,7 @@
 | [kafka](kafka/) | `kafka`：生产者（同步/异步）+ 消费者循环 | Kafka | `make dev && go run ./examples/kafka` |
 | [grpc](grpc/) | `grpcx`：服务注册（`GRPCRegistrar`）+ 客户端拨号（`Env.GRPCClient`） | 无 | `go run ./examples/grpc` |
 | [rpcx](rpcx/) | `rpcx`：无 IDL 服务注册（`RPCXRegistrar`）+ 客户端调用 | 无 | `go run ./examples/rpcx` |
+| [llm](llm/) | `llm`：统一 LLM 客户端——OpenAI Chat/Responses、Anthropic、Gemini 四种协议互转，流式/非流式；Jev（System One）决策问答 | 无（httptest 假上游） | `go run ./examples/llm` |
 
 也可以 `make example NAME=http`。
 
