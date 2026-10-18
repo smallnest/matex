@@ -62,6 +62,7 @@ import (
 	"github.com/smallnest/matex/pkg/core/auth"
 	"github.com/smallnest/matex/pkg/core/config"
 	"github.com/smallnest/matex/pkg/core/db"
+	"github.com/smallnest/matex/pkg/core/feature"
 	"github.com/smallnest/matex/pkg/core/grpcx"
 	"github.com/smallnest/matex/pkg/core/httpx"
 	"github.com/smallnest/matex/pkg/core/kafka"
@@ -127,6 +128,10 @@ type FrameworkConfig struct {
 	Redis    redis.Config    `json:"redis" optional:""`
 	Memcache memcache.Config `json:"memcache" optional:""`
 	Kafka    kafka.Config    `json:"kafka" optional:""`
+	// Feature is the `feature:` section: flag name -> on/off. It feeds
+	// pkg/core/feature at startup (env FEATURE_<NAME> and runtime
+	// feature.Set still take precedence).
+	Feature map[string]bool `json:"feature" optional:""`
 }
 
 // Env carries the initialized infrastructure and service utilities into
@@ -334,6 +339,12 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 	}
 	for _, key := range config.UnknownKeys(fw, &fc) {
 		obs.Warn(ctx, "unknown framework config key", "key", key)
+	}
+
+	// Feature flags, before any component can read them.
+	feature.Configure(fc.Feature)
+	if len(fc.Feature) > 0 {
+		obs.Info(ctx, "feature flags configured", "count", len(fc.Feature))
 	}
 
 	// Step 2b: tracing, before any component can produce a span

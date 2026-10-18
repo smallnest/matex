@@ -44,6 +44,7 @@ internal/app/             实现 verticle.Service（Name/Setup/BuildRouter），
 internal/domain/<name>/   业务域：handler.go（HTTP 边界）+ service.go（业务）+ dao.go（数据）
 pkg/core/                 基础设施：config / db / redis / memcache / kafka / httpx / obs / errs
                           / verticle / app / auth / ratelimit / breaker / retry / idempotency / cache / cron / llm
+                          / feature / audit
 configs/config.yaml       配置（框架段 + 每服务一段，段 key = Service.Name()）
 migrations/*.sql          数据库迁移（文件名序执行，追加不修改）
 examples/<feature>/       每个能力一个可运行示例（离线可跑、带测试）
@@ -64,15 +65,17 @@ skills/                   AI skill（matex-* 前缀）
 | `examples/http` | Web 层：路由、handler 约定、错误映射、中间件槽、`HandleRaw` | 无 |
 | `examples/auth` | 认证：Bearer 验签（HMAC/JWKS）、分级授权、`Principal` 进 ctx | 无 |
 | `examples/observability` | 日志 / 相关 id / Prometheus / OpenTelemetry 链路 | 无 |
-| `examples/resilience` | 限流 / 幂等 / 熔断 / 退避重试 | 无 |
+| `examples/resilience` | 限流 / 幂等 / 熔断（连续失败或错误率滑窗）/ 退避重试 | 无 |
 | `examples/lifecycle` | 生命周期：Block、Closer、配置热更、优雅退出 | 无 |
 | `examples/cron` | 定时任务：固定周期 / cron 表达式 / 一次性，多副本 redis 选主每槽只跑一次 | 无（选主需 Redis） |
 | `examples/redis` | 缓存读写、`TryLock` 分布式锁 | Redis |
 | `examples/memcache` | JSON 缓存、TTL、Touch | Memcached（测试离线） |
-| `examples/kafka` | 生产者（同步/异步）+ 消费者循环 | Kafka |
-| `examples/grpc` | gRPC 服务注册 + 客户端拨号 | 无 |
-| `examples/rpcx` | rpcx 服务注册 + 客户端调用（无 IDL） | 无 |
+| `examples/kafka` | 生产者（同步/异步）+ 消费者循环 + 死信队列 | Kafka |
+| `examples/grpc` | gRPC 服务注册 + 客户端拨号（链路追踪自动跨进程传播） | 无 |
+| `examples/rpcx` | rpcx 服务注册 + 客户端调用（无 IDL，追踪自动传播） | 无 |
 | `examples/llm` | 统一 LLM 客户端：四协议互转 + 流式 + Jev 决策问答 | 无（假上游，离线） |
+| `examples/feature` | 功能开关：配置 / 环境变量 / 运行时 `Set` 三层覆盖 | 无 |
+| `examples/audit` | 审计日志：谁对什么做了什么、结果如何，sink 可插拔 | 无 |
 
 ```sh
 go test ./examples/...        # 全部离线可跑（SQLite / miniredis / kfake / 进程内 gRPC·rpcx）

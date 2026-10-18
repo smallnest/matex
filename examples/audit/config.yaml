@@ -1,0 +1,9 @@
+http:
+  addr: ":8086"
+  timeout: 10s
+
+log:
+  level: info
+
+audit:
+  api_key: demo-key

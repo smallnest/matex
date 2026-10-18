@@ -1,0 +1,12 @@
+# 框架段 + feature 开关；服务专属段 key 必须等于 Service.Name()。
+http:
+  addr: ":8085"
+  timeout: 10s
+
+log:
+  level: info
+
+# 开关名 → 是否开启。Runtime feature.Set 与 FEATURE_<NAME> 环境变量优先于这里。
+feature:
+  new-checkout: true
+  beta-search: false

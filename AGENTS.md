@@ -16,7 +16,7 @@ matex 是一个**大道至简**的企业级 Go 脚手架：零 Web 框架、零 
 cmd/<service>/            一个二进制一个部署单元
 internal/app/             实现 verticle.Service（Name/Setup/BuildRouter）
 internal/domain/<name>/   业务域：handler.go（HTTP 边界）+ service.go（业务）+ dao.go（数据）
-pkg/core/                 基础设施：config/db/redis/memcache/kafka/httpx/obs/errs/verticle/app
+pkg/core/                 基础设施：config/db/redis/memcache/kafka/httpx/obs/errs/verticle/app/feature/audit
 configs/config.yaml       配置（框架段 + 每服务一段，段 key = Service.Name()）
 migrations/*.sql          数据库迁移（文件名序执行，追加不修改）
 examples/<feature>/       每个能力一个可运行示例（离线可跑、带测试；见 examples/README.md）
@@ -27,6 +27,11 @@ skills/                   AI skill（matex-add-domain、matex-setup-*）
 
 - **verticle.Service**：部署单元 = 一个 `Name()` + `Setup(ctx, env)` + `BuildRouter(srv)`。`verticle.Run` 统一驱动：加载配置 → 初始化基础设施（配了才建）→ Setup → 建 HTTP server → BuildRouter → 运行 → 优雅退出。基础设施句柄对业务是**私有**的，一律经 `Env` 访问器读取：`RequireDB()`（/`RequireRedis`/`RequireMemcache`/`RequireKafka`）在未配置时让启动失败，`DB()`（/`Redis`/`Memcache`/`Kafka`）逗号-ok 判可用。不写 `if env.DB != nil`。
 - **配置热更**：实现 `verticle.ConfigWatcher` 接口，`OnServiceConfigChange(raw map[string]any)` 会收到服务段新内容。
+- **跨进程追踪自动生效**：HTTP（obs）、gRPC（grpcx 拦截器）、rpcx（plugin + 客户端包装）都自动传播 W3C traceparent，业务零代码；关闭 tracing 时全为 no-op。
+- **功能开关**：`feature.Register(Flag{...})` 声明，`Flag.Enabled()` 在**每个请求处**读；`verticle` 把 `feature:` 配置段灌入，`FEATURE_<NAME>` 环境变量与 `feature.Set` 更高优先。
+- **审计**：业务动作成功后（含 4xx 拒绝）`audit.Record(ctx, audit.Event{...})`；默认写结构化日志，需要落库时 `audit.SetSink`。
+- **熔断两种模型**：推荐 `Ratio/Window/MinSamples`（错误率滑窗，4xx 不计失败）；不设 `Ratio` 时为旧的连续 `Failures` 计数。
+- **Kafka 毒消息**：需要留证据/可重放时用 `RunConsumerDLQ` + `kafka.dlq_topic`。
 - **测试无 Docker**：`dbtest.Start(t)`（默认纯 Go SQLite + 自动迁移，离线可用；`DB_TEST_DRIVER/DSN` 可切真库）、`redistest.Start(t)`（miniredis）。
 
 ## 常用命令
@@ -55,6 +60,8 @@ make migrate DSN=postgres://...            # 默认 postgres；-driver 可切 sq
 - 接 kafka（生产者/消费者）→ `matex-setup-kafka`
 - 接 gRPC → `matex-setup-grpc`
 - 接 rpcx → `matex-setup-rpcx`
+- 加功能开关 → `matex-setup-feature`
+- 加审计日志 → `matex-setup-audit`
 
 ## 示例
 

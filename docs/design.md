@@ -20,8 +20,10 @@ matex 取**中间偏简**：不做"全家桶"，也不做"迁移专用"，而是
 | 分布式锁 | redis `TryLock`：带 token + Lua 释放 + TTL 兜底；`Claim`：窗口式占领（选主用） |
 | HTTP 中间件链 | `httpx.Use`（封套层，可短路返回 `errs`）/ `UseOuter`（net/http 层），横切能力都挂这里 |
 | 认证与授权 | `auth`：HMAC/JWKS 验签、`Principal` 进 ctx、`RequireScope/Role`（配 `auth:` 段启用） |
-| 链路追踪 | `obs`：OpenTelemetry span + W3C 传播 + OTLP 导出（配 `trace:` 段启用） |
-| 稳定性防护 | `ratelimit`（本地令牌桶 / redis 固定窗口）、`breaker`、`retry`（全抖动退避）、`idempotency` |
+| 链路追踪 | `obs`：OpenTelemetry span + W3C 传播 + OTLP 导出（配 `trace:` 段启用）；HTTP、gRPC（unary/stream 拦截器）、rpcx（服务端 plugin + 客户端包装）三通道自动跨进程传播，关闭时全为 no-op |
+| 稳定性防护 | `ratelimit`（本地令牌桶 / redis 固定窗口）、`breaker`（连续失败或错误率滑窗，按 errs 分类计失败）、`retry`（全抖动退避）、`idempotency`（回放保留大整数原值） |
+| 消息队列 | `kafka`：生产者（同步/异步）+ at-least-once 消费循环 + 可选死信队列（`RunConsumerDLQ`，失败消息带源坐标落地后再提交） |
+| 治理 | `feature`：进程内功能开关（运行时 `Set` > `FEATURE_*` 环境变量 > `feature:` 配置 > 默认）；`audit`：审计事件（actor/action/resource/result/detail + 时间戳 + trace id），默认写结构化日志，`SetSink` 可落库 |
 | 缓存模式 | `cache`：cache-aside + 并发 miss 合并（防击穿）+ TTL 抖动（防雪崩） |
 | 定时任务 | `cron`：固定周期 / cron 表达式 / 一次性任务，多副本 redis 选主（claim 持整个槽；一次性永久占用 at-most-once） |
 | 运维端点 | `/version`（build info）、`/debug/pprof/*`（`http.pprof` 开启） |
@@ -54,6 +56,7 @@ matex 取**中间偏简**：不做"全家桶"，也不做"迁移专用"，而是
 | 链路 `obs` tracing | `trace.enabled` | 跨服务因果链，网关只覆盖入口 |
 | 缓存模式 `cache` | 调用处 | 防击穿/防雪崩是数据访问层的职责 |
 | 定时任务 `cron` | `env.Block` | 网关不跑定时任务；多副本选主要业务语义（claim 持整个槽） |
+| 功能开关 `feature` / 审计 `audit` | `feature:` 段、`feature.Set`、`audit.Record` | 开关决定**本进程**走哪条代码路径，网关只能整体路由；审计要记录业务语义（哪笔订单、哪个用户），只有服务自己知道 |
 | pprof | `http.pprof` | 排障必需，但 heap 里可能有凭证，故默认关且只该在受信网络暴露 |
 
 共同约定：**防护组件自身故障时放行**（限流器、幂等存储出错都只记 warn 不拒流量）——
@@ -74,6 +77,7 @@ type Service interface {
 ```
 config.LoadMap → 框架段(ParseMap) + 服务段(按 Name 取)
 → obs.Init（日志先行）→ obs.InitTracing（配了 trace 段才建 provider）
+→ 未知框架键告警 → feature.Configure（`feature:` 段）
 → 按配置初始化 db/redis/memcache/kafka/auth（配了才建，未配 nil）
 → svc.Setup(ctx, env)
 → httpx.New（/healthz /readyz /metrics /version，+ http.pprof 时挂 /debug/pprof/）+ svc.BuildRouter
@@ -103,6 +107,7 @@ s.hello = helloworld.New(helloworld.Deps{DB: db, Redis: redis, ...})
 
 - 配置中心接入（config.Source 抽象点已预留）。
 - 多服务模板（当前单服务 `cmd/demo`，复制改名即可）。
-- gRPC / rpcx 的链路传播（HTTP 侧与出站 `InjectHTTP` 已通，跨进程的 gRPC interceptor 未接）。
-- 对象存储、多租户、审计日志、feature flag —— 判断为按需再加，暂不进脚手架。
+- 功能开关的跨副本一致（当前开关只作用于本进程；需一致时由控制面板推 `Set` 或统一发布配置）。
+- 审计事件的不可篡改存储（包只保证字段完整与时间戳，顺序/保留/防篡改由 sink 负责）。
+- 对象存储、多租户 —— 判断为按需再加，暂不进脚手架。
 - 本地多级缓存（需要多实例失效方案，收益未经压测验证，故 `cache` 只做单层 redis）。

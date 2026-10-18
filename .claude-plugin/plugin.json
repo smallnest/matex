@@ -1,7 +1,7 @@
 {
   "name": "matex-skills",
   "version": "1.0.0",
-  "description": "matex 企业级 Go 脚手架的 AI skills：新增业务域，接入 PostgreSQL / Redis / Memcached / Kafka / gRPC / rpcx，加认证授权 / 链路追踪 / 限流熔断重试幂等 / 缓存模式 / 定时任务选主，大道至简。",
+  "description": "matex 企业级 Go 脚手架的 AI skills：新增业务域，接入 PostgreSQL / Redis / Memcached / Kafka / gRPC / rpcx，加认证授权 / 链路追踪 / 限流熔断重试幂等 / 缓存模式 / 定时任务选主 / 功能开关 / 审计日志，大道至简。",
   "author": {
     "name": "smallnest",
     "url": "https://github.com/smallnest"
@@ -25,7 +25,10 @@
     "circuit-breaker",
     "idempotency",
     "cache",
-    "cron"
+    "cron",
+    "feature-flags",
+    "audit-log",
+    "dead-letter-queue"
   ],
   "skills": [
     "./skills/matex-add-domain",
@@ -39,6 +42,8 @@
     "./skills/matex-setup-tracing",
     "./skills/matex-setup-resilience",
     "./skills/matex-setup-cache",
-    "./skills/matex-setup-cron"
+    "./skills/matex-setup-cron",
+    "./skills/matex-setup-feature",
+    "./skills/matex-setup-audit"
   ]
 }

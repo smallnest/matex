@@ -17,9 +17,11 @@
 | [cron](cron/) | `cron`：定时任务——固定周期 / cron 表达式 / 一次性，多副本下 redis 选主保证每槽只跑一次 | 无（选主需 Redis） | `go run ./examples/cron` |
 | [redis](redis/) | `redis`：缓存读写、`TryLock` 分布式锁 | Redis | `make dev && go run ./examples/redis` |
 | [memcache](memcache/) | `memcache`：JSON 缓存、TTL、`Touch` | Memcached（`go test` 用进程内假服务，离线） | `make dev && go run ./examples/memcache` |
-| [kafka](kafka/) | `kafka`：生产者（同步/异步）+ 消费者循环 | Kafka | `make dev && go run ./examples/kafka` |
+| [kafka](kafka/) | `kafka`：生产者（同步/异步）+ 消费者循环 + 死信队列（`RunConsumerDLQ`） | Kafka | `make dev && go run ./examples/kafka` |
 | [grpc](grpc/) | `grpcx`：服务注册（`GRPCRegistrar`）+ 客户端拨号（`Env.GRPCClient`） | 无 | `go run ./examples/grpc` |
 | [rpcx](rpcx/) | `rpcx`：无 IDL 服务注册（`RPCXRegistrar`）+ 客户端调用 | 无 | `go run ./examples/rpcx` |
+| [feature](feature/) | `feature`：功能开关——配置 / 环境变量 / 运行时 `Set` 三层覆盖 | 无 | `go run ./examples/feature` |
+| [audit](audit/) | `audit`：审计日志——actor/action/resource/result，默认结构化日志，sink 可插拔 | 无 | `go run ./examples/audit` |
 | [llm](llm/) | `llm`：统一 LLM 客户端——OpenAI Chat/Responses、Anthropic、Gemini 四种协议互转，流式/非流式；Jev（System One）决策问答 | 无（httptest 假上游） | `go run ./examples/llm` |
 
 也可以 `make example NAME=http`。

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/smallnest/matex/pkg/core/feature"
 	"github.com/smallnest/matex/pkg/core/httpx"
 )
 
@@ -21,6 +22,7 @@ type fakeService struct {
 	setup    atomic.Int32
 	router   atomic.Int32
 	buildErr error
+	sawFlag  func() bool // evaluated inside Setup, nil to skip
 }
 
 func (f *fakeService) Name() string { return f.name }
@@ -28,6 +30,9 @@ func (f *fakeService) Name() string { return f.name }
 func (f *fakeService) Setup(_ context.Context, env *Env) error {
 	if f.buildErr != nil {
 		return f.buildErr
+	}
+	if f.sawFlag != nil && !f.sawFlag() {
+		return errors.New("Setup ran before the feature flags were configured")
 	}
 	f.setup.Add(1)
 	// Env is fully wired before Setup: metrics exist for custom collectors.
@@ -119,6 +124,36 @@ func TestRunServesUntilCancelled(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("Run did not return after the context was cancelled")
+	}
+}
+
+// TestRunConfiguresFeatureFlags: the `feature:` section reaches
+// pkg/core/feature before Setup runs, so a service can branch on a flag in
+// its very first line.
+func TestRunConfiguresFeatureFlags(t *testing.T) {
+	prevLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	conf := writeConf(t, "http:\n  addr: \""+freeAddr(t)+"\"\nlog:\n  level: warn\n"+
+		"feature:\n  run-test-flag: true\nsvc:\n  greeting: hi\n")
+	svc := &fakeService{name: "svc", sawFlag: func() bool { return feature.Enabled("run-test-flag") }}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- Run(ctx, svc, WithConf(conf), WithoutConfigWatch()) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for svc.router.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Run never built the router")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !svc.sawFlag() {
+		t.Fatal("the feature section was not applied before Setup")
+	}
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Run = %v", err)
 	}
 }
 
