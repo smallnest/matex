@@ -70,7 +70,7 @@ out, err := jc.Decide(ctx, llm.DecideRequest{
 		"intent": {Type: "choice", Instructions: "Which kind of request fits it best?",
 			Criteria: map[string]string{"greeting": "", "bug fix": "an ordinary fix"}},
 		"effort": {Type: "score", Instructions: "How much reasoning?",
-			Criteria: map[string]string{"low": "a one-line change", "medium": "an ordinary fix"}},
+			Bands: []string{"a one-line change", "an ordinary fix", "a change across files"}},
 	},
 })
 // out.Answers["intent"].Choice / .Confidence / .Probabilities

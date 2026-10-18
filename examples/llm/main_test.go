@@ -70,7 +70,7 @@ func TestJevDecide(t *testing.T) {
 		State: map[string]any{"message": "这个查询接口偶尔超时，帮我修一下。"},
 		Questions: map[string]llm.Question{
 			"intent": {Type: "choice", Criteria: map[string]string{"bug fix": ""}},
-			"effort": {Type: "score", Criteria: map[string]string{"low": "", "medium": "", "high": ""}},
+			"effort": {Type: "score", Bands: []string{"little", "medium", "much"}},
 		},
 	})
 	if err != nil {

@@ -99,7 +99,7 @@ func main() {
 			"intent": {Type: "choice", Instructions: "Which kind of request fits it best?",
 				Criteria: map[string]string{"greeting": "", "bug fix": "an ordinary fix", "feature": "a small feature"}},
 			"effort": {Type: "score", Instructions: "How much reasoning does a coding assistant need?",
-				Criteria: map[string]string{"low": "a one-line change", "medium": "an ordinary fix", "high": "a change across files"}},
+				Bands: []string{"a one-line change", "an ordinary fix", "a change across files"}},
 		},
 	})
 	if err != nil {

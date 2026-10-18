@@ -20,7 +20,7 @@ func TestToJev(t *testing.T) {
 			"intent": {Type: "choice", Instructions: "Which kind of request fits it best?",
 				Criteria: map[string]string{"greeting": "", "bug fix": "an ordinary fix"}},
 			"effort": {Type: "score", Instructions: "How much reasoning?",
-				Criteria: map[string]string{"low": "a one-line change", "high": ""}},
+				Bands: []string{"a one-line change", "a long plan"}},
 		},
 	}
 	m := decode(t, conv(t, r.ToJev))
@@ -40,8 +40,9 @@ func TestToJev(t *testing.T) {
 		t.Fatalf("intent criteria = %v (unnamed option must be null)", crit)
 	}
 	effort := qs["effort"].(map[string]any)
-	if effort["type"] != "score" || effort["criteria"].(map[string]any)["high"] != nil {
-		t.Fatalf("effort = %v", effort)
+	bands, _ := effort["criteria"].([]any)
+	if effort["type"] != "score" || len(bands) != 2 || bands[0] != "a one-line change" {
+		t.Fatalf("effort = %v (score criteria must be an ordered list of bands)", effort)
 	}
 }
 
@@ -102,7 +103,7 @@ func TestJevHappyPath(t *testing.T) {
 		State: map[string]any{"message": "hi"},
 		Questions: map[string]Question{
 			"intent": {Type: "choice", Criteria: map[string]string{"bug fix": ""}},
-			"effort": {Type: "score", Criteria: map[string]string{"low": ""}},
+			"effort": {Type: "score", Bands: []string{"little", "much"}},
 		},
 	})
 	if err != nil {

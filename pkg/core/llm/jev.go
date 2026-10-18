@@ -20,14 +20,20 @@ import (
 
 // Question is one typed question Jev answers. Type is "noul" (yes/no, how
 // much yes as 0..1), "boolean" (Vercel's name for noul), "probability"
-// (likelihoods over options), "score" (a level on the criteria's scale) or
-// "choice" (pick one of the criteria).
+// (likelihoods over options), "score" (a level on Bands' scale) or "choice"
+// (pick one of the Criteria).
 type Question struct {
 	Type         string
 	Instructions string
-	// Criteria are the options of a choice or score, each with what it is
-	// for; "" leaves the option unnamed on the wire (null).
+	// Criteria are the options of a choice, each with what it is for; ""
+	// leaves the option unnamed on the wire (null). A score question does
+	// not use this field.
 	Criteria map[string]string
+	// Bands are the ordered levels of a score, low to high; Jev rates the
+	// state at one of them, and the answer's Score is its index. On the wire
+	// they become an ordered list — the System One schema asks for a list
+	// for score but a map for choice, so the two can not share a field.
+	Bands []string
 }
 
 // DecideRequest is one System One call.
@@ -62,8 +68,10 @@ type DecideResponse struct {
 	Usage   Usage
 }
 
-// ToJev renders r as a System One request body. Criteria values are left as
-// null on the wire when unnamed ("").
+// ToJev renders r as a System One request body. Choice options and score
+// bands are both called "criteria" on the wire, but as different kinds: a
+// map for choice, an ordered list for score. Unnamed choice options ("")
+// stay null.
 func (r DecideRequest) ToJev() ([]byte, error) {
 	out := map[string]any{"model": r.Model}
 	if len(r.State) > 0 {
@@ -76,7 +84,11 @@ func (r DecideRequest) ToJev() ([]byte, error) {
 			if q.Instructions != "" {
 				m["instructions"] = q.Instructions
 			}
-			if len(q.Criteria) > 0 {
+			if q.Type == "score" {
+				if len(q.Bands) > 0 {
+					m["criteria"] = q.Bands
+				}
+			} else if len(q.Criteria) > 0 {
 				c := make(map[string]any, len(q.Criteria))
 				for opt, what := range q.Criteria {
 					if what == "" {
