@@ -5,7 +5,7 @@ description: 在 matex 中接入 Kafka：配置 kafka 段、生产者发送、�
 
 # 接入 Kafka
 
-Kafka 经 `pkg/core/kafka` 使用（franz-go 封装），业务不 import franz-go。生产者由 verticle 按配置自动建（`env.Kafka`），消费者在 `Setup` 里用 `env.Block` 注册。
+Kafka 经 `pkg/core/kafka` 使用（franz-go 封装），业务不 import franz-go。生产者由 verticle 按配置自动建，业务经 `env.Kafka()`（逗号-ok）/ `env.RequireKafka()` 取；消费者在 `Setup` 里用 `env.Block` 注册。
 
 ## 步骤
 
@@ -16,15 +16,19 @@ kafka:
   brokers: ${KAFKA_BROKERS:localhost:9092}   # 逗号分隔也可
 ```
 
-留空/删除 `kafka:` 段即禁用（`env.Kafka` 为 nil）。本地 `make dev` 起 kafka（bitnami KRaft 单节点）。消费者的开关属于**服务段**配置（见步骤 3 的 `<name>.consume`），不放 kafka 段。
+留空/删除 `kafka:` 段即禁用（`env.Kafka()` 返回 `ok=false`）。本地 `make dev` 起 kafka（bitnami KRaft 单节点）。消费者的开关属于**服务段**配置（见步骤 3 的 `<name>.consume`），不放 kafka 段。
 
 ### 2. 生产者
 
-`Setup` 里 verticle 已经建好 `env.Kafka`，直接注入 domain：
+`Setup` 里 verticle 已经建好生产者，用逗号-ok 取到后注入 domain：
 
 ```go
-s.foo = foo.New(foo.Deps{Producer: env.Kafka})
+if p, ok := env.Kafka(); ok {
+	s.foo.Producer = p
+}
 ```
+
+消费者需要生产者时可改用 `env.RequireKafka()`：未配置 `kafka:` 段时直接让启动失败。
 
 发送：
 
@@ -45,8 +49,9 @@ if err := s.deps.Producer.SendJSON(ctx, "topic", "key", payload); err != nil { .
 
 ```go
 if s.cfg.Consume {
+	cfg := env.KafkaCfg // 与生产者同 brokers/client_id
 	env.Block("my-consumer", func(ctx context.Context) error {
-		return kafka.RunConsumer(ctx, env.KafkaCfg, "my-group", []string{"topic"}, s.foo.Handle)
+		return kafka.RunConsumer(ctx, cfg, "my-group", []string{"topic"}, s.foo.Handle)
 	})
 }
 ```

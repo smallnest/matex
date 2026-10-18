@@ -90,7 +90,8 @@ func (s *resilienceService) BuildRouter(srv *httpx.Server) error {
 	srv.Handle("POST", "/api/v1/login", s.login)
 
 	// Payments get the rate limit above plus idempotency. The memory store
-	// suits a single instance; a fleet needs idempotency.NewRedis(env.Redis).
+	// suits a single instance; a fleet needs idempotency.NewRedis(rc) with
+	// rc from env.Redis().
 	srv.Use(idempotency.Middleware(idempotency.NewMemory(), idempotency.Config{}))
 	srv.Handle("POST", "/api/v1/payments", s.pay)
 	srv.Handle("GET", "/api/v1/flaky/{id}", s.flaky)

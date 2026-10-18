@@ -208,16 +208,15 @@ func (k jwk) publicKey() (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Reject off-curve points: a bad point can leak the private key
-		// when verification is attempted.
-		if !curve.IsOnCurve(new(big.Int).SetBytes(x), new(big.Int).SetBytes(y)) {
-			return nil, errors.New("auth: EC point is not on the curve")
+		// ParseUncompressedPublicKey validates the point is on the curve
+		// (and on the right curve), so an attacker-chosen point never
+		// reaches verification. Handles P-256/P-384/P-521 only.
+		pub, err := ecdsa.ParseUncompressedPublicKey(
+			curve, append([]byte{4}, append(x, y...)...))
+		if err != nil {
+			return nil, fmt.Errorf("auth: EC point is not on the curve: %w", err)
 		}
-		return &ecdsa.PublicKey{
-			Curve: curve,
-			X:     new(big.Int).SetBytes(x),
-			Y:     new(big.Int).SetBytes(y),
-		}, nil
+		return pub, nil
 	default:
 		return nil, fmt.Errorf("auth: unsupported key type %q", k.Kty)
 	}

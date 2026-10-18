@@ -22,7 +22,7 @@ srv.Handle("POST", "/api/v1/login", s.login)
 ```
 
 - 单实例用 `NewLocal(rate, burst)`；要全集群共享额度用
-  `NewRedis(env.Redis, limit, window)`（固定窗口，边界最多 2×limit）。
+  `NewRedis(rc, limit, window)`（固定窗口，边界最多 2×limit；`rc` 用 `env.Redis()` 在 `Setup` 里取好）。
 - key：`ByIP` / `ByHeader("X-API-Key")` / `ByRoute`，或自己写一个；返回 `""` 不限流。
 - 注意 `ByIP` 用 `RemoteAddr`，在 LB 后面是代理地址。要信 `X-Forwarded-For` 就显式写
   `ByHeader("X-Forwarded-For")`。
@@ -31,7 +31,8 @@ srv.Handle("POST", "/api/v1/login", s.login)
 ## 2. 幂等
 
 ```go
-srv.Use(idempotency.Middleware(idempotency.NewRedis(env.Redis), idempotency.Config{}))
+rc, _ := env.Redis() // 在 Setup 里取；未配 redis 时用 NewMemory()（仅单实例）
+srv.Use(idempotency.Middleware(idempotency.NewRedis(rc), idempotency.Config{}))
 srv.Handle("POST", "/api/v1/payments", s.pay)
 ```
 

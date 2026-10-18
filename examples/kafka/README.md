@@ -27,8 +27,8 @@ p.Send(ctx, topic, key, value)             // fire-and-forget；失败只记日�
 err = p.SendJSON(ctx, topic, key, obj)     // 同步 + JSON
 ```
 
-`verticle.Run` 按 `kafka:` 段创建**一个** `env.Kafka` 生产者给你复用
-（`if env.Kafka != nil`），不需要自己 new，也不需要自己 Close。
+`verticle.Run` 按 `kafka:` 段创建**一个**生产者给你复用（`p, ok := env.Kafka()`；
+需要它时用 `env.RequireKafka()`），不需要自己 new，也不需要自己 Close。
 
 ## 消费者
 

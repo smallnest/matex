@@ -367,7 +367,7 @@ func TestChatHappyPath(t *testing.T) {
 	var gotPath, gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
-		fmt.Fprint(w, `{"id":"r1","model":"m","choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
+		_, _ = fmt.Fprint(w, `{"id":"r1","model":"m","choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
 	}))
 	defer srv.Close()
 
@@ -389,7 +389,7 @@ func TestChatHappyPath(t *testing.T) {
 
 func TestChatToolCall(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"id":"r1","model":"m","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"beijing\"}"}}]},"finish_reason":"tool_calls"}],"usage":{}}`)
+		_, _ = fmt.Fprint(w, `{"id":"r1","model":"m","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"beijing\"}"}}]},"finish_reason":"tool_calls"}],"usage":{}}`)
 	}))
 	defer srv.Close()
 
@@ -418,7 +418,7 @@ func TestChatHTTPErrorMapping(t *testing.T) {
 	for _, c := range cases {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(c.status)
-			fmt.Fprint(w, c.body)
+			_, _ = fmt.Fprint(w, c.body)
 		}))
 		cl := New(WithBaseURL(srv.URL), WithModel("m"))
 		_, err := cl.Chat(context.Background(), Request{})
@@ -620,7 +620,7 @@ func TestGeminiStreamUsesStreamEndpoint(t *testing.T) {
 		gotPath = r.URL.Path
 		// stream until the client aborts, then stop
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.Write([]byte(sseData(`{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}`)))
+		_, _ = w.Write([]byte(sseData(`{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}`)))
 		fl, _ := w.(http.Flusher)
 		fl.Flush()
 		<-r.Context().Done()
@@ -649,7 +649,7 @@ func sseServer(t *testing.T, events string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, events)
+		_, _ = fmt.Fprint(w, events)
 	}))
 }
 

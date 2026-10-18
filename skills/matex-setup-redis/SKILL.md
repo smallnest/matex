@@ -18,7 +18,7 @@ redis:
   db: 0
 ```
 
-留空/删除 `redis:` 段即禁用（`env.Redis` 为 nil）。本地 `make dev` 起 redis。
+留空/删除 `redis:` 段即禁用（`env.Redis()` 返回 `ok=false`；业务必需时用 `env.RequireRedis()` 让启动失败）。本地 `make dev` 起 redis。
 
 ### 2. 缓存读写（cache-aside）
 

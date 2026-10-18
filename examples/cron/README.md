@@ -37,8 +37,8 @@ curl -s localhost:8084/api/v1/jobs   # 计数按 interval 增长，而不是两�
 
 ```go
 sched := cron.New(cron.Config{
-	Redis:   env.Redis,      // nil = 单副本，不做选主
-	Timeout: time.Minute,    // 单次运行的上限
+	Redis:   rc,            // nil = 单副本，不做选主（rc 来自 env.Redis()）
+	Timeout: time.Minute,   // 单次运行的上限
 })
 sched.Add(
 	cron.Job{Name: "heartbeat", Interval: time.Second, RunOnStart: true, Run: s.heartbeat},
@@ -95,7 +95,7 @@ t=5/15/25… tick，interval 都是 10ms。如果 A 在 t=0 拿到锁、跑完�
 - **interval / cron job 失败不会停循环**：示例里 `reconcile` 每第三次返回 error，下一轮照跑。
   一次性任务失败也不会再跑（claim 已永久占用）。
 - **redis 不可用时跳过这个周期**，而不是每个副本都跑 —— 宁可漏一轮，也不要惊群。
-- **不用写 `if env.Redis != nil`**：`Config.Redis` 为 nil 就是单副本模式。
+- **调用点不用判空**：`Setup` 里 `rc, _ := env.Redis()`，`Config.Redis` 为 nil 就是单副本模式。
 - 参数非法（缺 `Name`/`Run`、调度没恰好设一个、坏 cron 表达式、`RunOnStart` 配在非
   interval 上）在 `Add` 时 **panic**：配错的定时任务应该在启动时报错，而不是几周后才发现
   它从没跑过。

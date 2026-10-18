@@ -97,7 +97,7 @@ s.hello = helloworld.New(helloworld.Deps{DB: db, Redis: redis, ...})
 ## 5. 一致性由工具保证（而非纪律）
 
 - `.golangci.yml` depguard：业务不 import 驱动库（单一基础设施入口），不 import Web 框架（单一 HTTP 入口）。
-- `make ci`：vet + test-short + build；`make check` 预留生成物校验位。
+- `make ci`：vet + test-short（含 `-race`）+ build；GitHub Actions 跑同一套并加 golangci-lint。
 
 ## 6. 演进方向（预留、未做）
 

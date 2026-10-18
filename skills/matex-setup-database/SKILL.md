@@ -30,7 +30,7 @@ db:
   slow_threshold: 250ms
 ```
 
-删掉 `db:` 段即禁用（`env.DB` 为 nil；sqlite 也无需外部服务，可直接 `driver: sqlite` + `dsn: file:matex.db` 跑起来）。
+删掉 `db:` 段即禁用（`env.DB()` 返回 `ok=false`；业务需要 DB 时用 `env.RequireDB()`，未配置则启动失败；sqlite 也无需外部服务，可直接 `driver: sqlite` + `dsn: file:matex.db` 跑起来）。
 
 ### 2. 写迁移 migrations/NNN_<name>.sql
 
@@ -101,14 +101,20 @@ func (d *DAO) ByID(ctx context.Context, q db.Querier, id int64) (*Row, error) {
 `*db.DB` 和 `*db.Tx` 都实现 `db.Querier`，所以同一个方法两处都能用：
 
 ```go
-row, err := dao.ByID(ctx, env.DB, 1)                      // 池上
+pool, err := env.RequireDB()                              // 未配 db 段 → 启动失败
+if err != nil {
+	return err
+}
+s.dao = NewDAO(pool)
 
-err = env.DB.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
-	row, err := dao.ByID(ctx, tx, 1)                      // 事务内，同一份代码
+row, err := s.dao.ByID(ctx, pool, 1)                      // 池上
+
+err = pool.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
+	row, err := s.dao.ByID(ctx, tx, 1)                    // 事务内，同一份代码
 	if err != nil {
 		return err
 	}
-	_, err = dao.AddScore(ctx, tx, row.Name, 10)          // 复用，不重复写 SQL
+	_, err = s.dao.AddScore(ctx, tx, row.Name, 10)        // 复用，不重复写 SQL
 	return err
 })
 ```

@@ -15,8 +15,9 @@ description: 在 matex 中加定时任务：固定周期 / cron 表达式 / 一�
 
 ```go
 func (s *Svc) Setup(ctx context.Context, env *verticle.Env) error {
+	rc, _ := env.Redis()    // 未配 redis 段时 rc 为 nil = 单副本，不做选主
 	sched := cron.New(cron.Config{
-		Redis:   env.Redis,     // nil = 单副本，不做选主
+		Redis:   rc,
 		Timeout: time.Minute,   // 单次运行上限
 	})
 	sched.Add(

@@ -50,7 +50,8 @@ srv.Handle("POST", "/api/v1/login", s.login)
 ## 幂等
 
 ```go
-srv.Use(idempotency.Middleware(idempotency.NewRedis(env.Redis), idempotency.Config{}))
+rc, _ := env.Redis() // 在 Setup 里取
+srv.Use(idempotency.Middleware(idempotency.NewRedis(rc), idempotency.Config{}))
 srv.Handle("POST", "/api/v1/payments", s.pay)   // 客户端带 Idempotency-Key
 ```
 

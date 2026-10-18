@@ -270,7 +270,7 @@ func (c *Client) Chat(ctx context.Context, req Request) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
 		return nil, errs.Wrap(errs.KindUnavailable, 0, err, "llm: read reply")
@@ -307,7 +307,7 @@ func (c *Client) ChatStream(ctx context.Context, req Request) (<-chan Event, err
 	ch := make(chan Event, 16)
 	go func() {
 		defer close(ch)
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		a.stream(ctx, newSSE(resp.Body), ch)
 	}()
 	return ch, nil
@@ -352,7 +352,7 @@ func (c *Client) post(ctx context.Context, path string, headers http.Header, bod
 	}
 	if resp.StatusCode >= 400 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, upstreamErr(resp.StatusCode, msg)
 	}
 	return resp, nil

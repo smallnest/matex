@@ -8,7 +8,7 @@ log:
   level: info
 
 # 留空/删掉 redis 段也能跑：cache.GetOrLoad 在 client 为 nil 时直接回源，
-# 调用点不用写 `if env.Redis != nil`。
+# 调用点不用写 `if env.Redis != nil`（Setup 里用 env.Redis() 逗号-ok 取，nil 即不缓存）。
 redis:
   addr: ${REDIS_ADDR:localhost:6379}
 

@@ -41,6 +41,17 @@ linters:
               desc: use pkg/core/redis
             - pkg: github.com/bradfitz/gomemcache
               desc: use pkg/core/memcache
+        # kafka 包自身的测试用 franz-go/pkg/kfake 跑进程内 broker；只豁免这一个文件，
+        # 其他代码（包括 kafka 的非测试代码）仍不得 import franz-go。
+        kafka-test-fake-broker:
+          files:
+            - "$all"
+            - "!$test"
+            - "!**/examples/**"
+            - "!**/pkg/core/kafka/**"
+          deny:
+            - pkg: github.com/twmb/franz-go
+              desc: use pkg/core/kafka
         # 零 Web 框架：路由用 net/http 的 ServeMux（pkg/core/httpx）。
         no-web-framework:
           files:

@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -91,6 +93,99 @@ func jwksDoc(t *testing.T, pub *rsa.PublicKey, kid string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// ecJWKS renders a JWKS document for an ECDSA public key, splitting the
+// uncompressed point into its 32-byte P-256 coordinates.
+func ecJWKS(t *testing.T, kid string, pub *ecdsa.PublicKey) string {
+	t.Helper()
+	point, err := pub.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := base64.RawURLEncoding
+	b, err := json.Marshal(map[string]any{"keys": []map[string]string{{
+		"kty": "EC",
+		"kid": kid,
+		"crv": "P-256",
+		"alg": "ES256",
+		"x":   enc.EncodeToString(point[1:33]),
+		"y":   enc.EncodeToString(point[33:]),
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// offCurveJWKS is a P-256 / P-384 JWK whose point (1, 1) is not on the
+// curve, built from literal coordinates so no ecdsa.PublicKey is made.
+func offCurveJWKS(kid string) string { return offCurveJWKSWithCurve(kid, "P-256") }
+
+func offCurveJWKSWithCurve(kid, crv string) string {
+	enc := base64.RawURLEncoding
+	b, _ := json.Marshal(map[string]any{"keys": []map[string]string{{
+		"kty": "EC", "kid": kid, "crv": crv, "alg": "ES256",
+		"x": enc.EncodeToString(big.NewInt(1).FillBytes(make([]byte, 32))),
+		"y": enc.EncodeToString(big.NewInt(1).FillBytes(make([]byte, 32))),
+	}}})
+	return string(b)
+}
+
+func signES256(t *testing.T, priv *ecdsa.PrivateKey, kid string, claims jwt.MapClaims) string {
+	t.Helper()
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	tok.Header["kid"] = kid
+	s, err := tok.SignedString(priv)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return s
+}
+
+// TestVerifyJWKSEC: ES256 tokens verify against EC keys, and a point that
+// is not on the curve is rejected instead of reaching verification.
+func TestVerifyJWKSEC(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := &jwksServer{}
+	upstream.set(ecJWKS(t, "ec-1", &priv.PublicKey))
+	srv := httptest.NewServer(upstream)
+	defer srv.Close()
+
+	v, err := New(Config{JWKSURL: srv.URL, JWKSTTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := hmacClaims()
+	raw, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := v.Verify(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("ES256 verify: %v", err)
+	}
+	if p.Subject != "alice" {
+		t.Fatalf("subject = %q", p.Subject)
+	}
+
+	upstream.set(offCurveJWKS("ec-2"))
+	claims["exp"] = time.Now().Add(time.Hour).Unix()
+	raw2 := signES256(t, priv, "ec-2", claims)
+	if _, err := v.Verify(context.Background(), raw2); err == nil {
+		t.Fatal("a token whose kid points at an off-curve key must be rejected")
+	}
+
+	// A curve we do not parse must not fall back to something weaker.
+	upstream.set(offCurveJWKSWithCurve("ec-3", "secp256k1"))
+	raw3 := signES256(t, priv, "ec-3", claims)
+	if _, err := v.Verify(context.Background(), raw3); err == nil {
+		t.Fatal("an unsupported curve must be rejected")
+	}
 }
 
 // jwksServer serves a mutable JWKS document, so tests can simulate key

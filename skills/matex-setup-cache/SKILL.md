@@ -22,7 +22,7 @@ u, err := cache.GetOrLoad(ctx, s.redis, cache.Key("user", id),
 回源结果按**抖动后的 TTL** 写入。
 
 - `Jitter` 取 TTL 的 10~20%；`Jitter >= TTL` 会被压到 `TTL/2`（不会抖成 0）。
-- `s.redis` 为 nil 时直接回源不缓存 —— **不用写 `if env.Redis != nil`**。
+- `s.redis` 在 `Setup` 里用 `if rc, ok := env.Redis(); ok { s.redis = rc }` 取；为 nil 时直接回源不缓存 —— 调用点**不写** `if env.Redis != nil`。
 - 回源报错不写缓存；写缓存失败只记 warn（值已在手上）。
 
 **回源跑在第一个调用者的 ctx 下**：别挂在一个随时取消的短 ctx 上，否则一组请求会一起挂。
@@ -30,7 +30,8 @@ u, err := cache.GetOrLoad(ctx, s.redis, cache.Key("user", id),
 ## 2. 写：Invalidate
 
 ```go
-if _, err := s.dao.Update(ctx, env.DB, id, in); err != nil {
+// db 句柄在 Setup 里用 env.RequireDB()（或 env.DB() 逗号-ok）取好，存到 s.db / s.dao。
+if _, err := s.dao.Update(ctx, s.db, id, in); err != nil {
 	return nil, err
 }
 if err := cache.Invalidate(ctx, s.redis, cache.Key("user", id)); err != nil {

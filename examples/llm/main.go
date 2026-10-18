@@ -154,7 +154,7 @@ func newFakeJevServer() *httptest.Server {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"model":"jev-latest","answers":{
+		_, _ = fmt.Fprint(w, `{"model":"jev-latest","answers":{
 			"intent":{"type":"choice","choice":"bug fix","confidence":0.9,"probabilities":{"greeting":0.02,"bug fix":0.9,"feature":0.08}},
 			"effort":{"type":"score","score":1.0}
 		},"usage":{"input_tokens":40,"output_tokens":12}}`)
@@ -180,16 +180,16 @@ func newFakeChatServer() *httptest.Server {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.Stream {
 			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprint(w, "data: "+`{"choices":[{"delta":{"content":"北京今天"}}]}`+"\n\n")
-			fmt.Fprint(w, "data: "+`{"choices":[{"delta":{"content":"晴，21°C，"}}]}`+"\n\n")
-			fmt.Fprint(w, "data: "+`{"choices":[{"delta":{"content":"适合散步。"}}]}`+"\n\n")
-			fmt.Fprint(w, "data: "+`{"choices":[{"delta":{},"finish_reason":"stop"}]}`+"\n\n")
-			fmt.Fprint(w, "data: "+`{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}`+"\n\n")
-			fmt.Fprint(w, "data: [DONE]\n\n")
+			_, _ = fmt.Fprint(w, "data: "+`{"choices":[{"delta":{"content":"北京今天"}}]}`+"\n\n")
+			_, _ = fmt.Fprint(w, "data: "+`{"choices":[{"delta":{"content":"晴，21°C，"}}]}`+"\n\n")
+			_, _ = fmt.Fprint(w, "data: "+`{"choices":[{"delta":{"content":"适合散步。"}}]}`+"\n\n")
+			_, _ = fmt.Fprint(w, "data: "+`{"choices":[{"delta":{},"finish_reason":"stop"}]}`+"\n\n")
+			_, _ = fmt.Fprint(w, "data: "+`{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}`+"\n\n")
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"chatcmpl-1","model":"demo-model","choices":[{"message":{"role":"assistant","content":"北京今天晴，21°C，适合散步。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}`)
+		_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","model":"demo-model","choices":[{"message":{"role":"assistant","content":"北京今天晴，21°C，适合散步。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}`)
 	}))
 }
 

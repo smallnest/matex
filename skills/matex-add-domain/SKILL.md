@@ -70,7 +70,18 @@ func (d *DAO) ByID(ctx context.Context, id int64) (*Row, error) {
 ### 2. 在 `internal/app/service.go` 里装配
 
 ```go
-s.<name> = <name>.New(<name>.Deps{DB: env.DB, Redis: env.Redis, Producer: env.Kafka})
+// 逗号-ok 取基础设施；需要它时用 env.RequireDB() / env.RequireKafka() 让启动失败。
+deps := <name>.Deps{}
+if db, ok := env.DB(); ok {
+	deps.DB = db
+}
+if rc, ok := env.Redis(); ok {
+	deps.Redis = rc
+}
+if p, ok := env.Kafka(); ok {
+	deps.Producer = p
+}
+s.<name> = <name>.New(deps)
 
 // BuildRouter 里注册路由：
 srv.Handle("GET", "/api/v1/<name>/{id}", <name>.NewHandler(s.<name>).Do)

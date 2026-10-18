@@ -1,7 +1,7 @@
 # examples/redis 的配置。
 #
 # 需要 Redis：先 `make dev`（或指向任意 redis）。redis 段配了才会初始化，
-# 未配置时 env.Redis == nil（本示例会直接报错提示）。
+# 未配置时 env.Redis() 返回 ok=false（本示例会直接报错提示）。
 
 http:
   addr: ":8080"

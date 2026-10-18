@@ -66,7 +66,7 @@ func TestStartHTTPSpan(t *testing.T) {
 	}
 	attrs := map[string]string{}
 	for _, kv := range got.Attributes() {
-		attrs[string(kv.Key)] = kv.Value.Emit()
+		attrs[string(kv.Key)] = kv.Value.String()
 	}
 	// The route attribute carries the path without the method.
 	if attrs["http.request.method"] != "GET" || attrs["http.route"] != "/api/v1/echo/{name}" {

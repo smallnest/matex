@@ -18,7 +18,7 @@ memcache:
   max_idle: 16
 ```
 
-留空/删除 `memcache:` 段即禁用（`env.Memcache` 为 nil）。本地 `make dev` 起 memcached。
+留空/删除 `memcache:` 段即禁用（`env.Memcache()` 返回 `ok=false`；业务必需时用 `env.RequireMemcache()` 让启动失败）。本地 `make dev` 起 memcached。
 
 ### 2. 读写
 

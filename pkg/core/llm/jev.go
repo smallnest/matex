@@ -161,7 +161,7 @@ func (c *Client) Decide(ctx context.Context, req DecideRequest) (*DecideResponse
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
 		return nil, errs.Wrap(errs.KindUnavailable, 0, err, "llm: read decide reply")
