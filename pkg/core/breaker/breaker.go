@@ -14,6 +14,14 @@
 //		return nil, errs.Unavailable(50302, "payment service is unavailable")
 //	}
 //
+// Two trip models are available. The default (Ratio set) is an error-ratio
+// window: when at least MinSamples calls happened in the last Window and
+// Ratio of them failed, the breaker opens — a handful of 5xx inside steady
+// traffic trips it while a few blips in low traffic do not. Leaving Ratio at
+// zero keeps the older model: Failures consecutive errors. With either model,
+// what counts as a failure defaults to server-side errors (errs kinds with an
+// HTTP status >= 500) and can be changed with IsFailure.
+//
 // Failing fast is the point: without it, every request in the fleet waits
 // out its own timeout against a service that cannot answer, and the
 // timeout queue becomes the outage.
@@ -24,6 +32,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/smallnest/matex/pkg/core/errs"
 )
 
 // State is the breaker's state.
@@ -58,13 +68,32 @@ var ErrOpen = errors.New("breaker: circuit is open")
 
 // Config configures a Breaker. Zero values take the documented defaults.
 type Config struct {
-	// Failures is how many consecutive failures trip the breaker open.
+	// Failures is how many consecutive failures trip the breaker open. It
+	// is used only when Ratio is zero.
 	Failures int
 	// Successes is how many consecutive probe successes close it again.
 	Successes int
 	// Cooldown is how long the breaker stays open before probing.
 	Cooldown time.Duration
+	// Window is the look-back period of the error-ratio model. Enabling it
+	// (Ratio != 0) sets this to 60s when zero.
+	Window time.Duration
+	// Ratio is the error ratio (0..1] that trips the breaker open when at
+	// least MinSamples calls happened in Window. Zero keeps the
+	// consecutive-Failures model.
+	Ratio float64
+	// MinSamples is how many calls must be in the window before Ratio is
+	// evaluated, so one failure in a quiet period does not open it. It is
+	// used only with Ratio; zero means 20.
+	MinSamples int
+	// IsFailure classifies a call's error as a failure. Nil means: errors
+	// whose errs kind has an HTTP status >= 500, and non-matex errors
+	// (plain Go errors are treated as 5xx by errs). Client errors such as
+	// 400/404 are the caller's fault and do not count.
+	IsFailure func(error) bool
 	// OnStateChange is called on every transition, for logs and metrics.
+	// Report state changes from here (a breaker_state gauge etc.); the
+	// breaker itself has no metrics dependency.
 	// It runs while the breaker's lock is held: keep it short and do not
 	// call back into the Breaker.
 	OnStateChange func(from, to State)
@@ -73,6 +102,23 @@ type Config struct {
 func (c Config) withDefaults() Config {
 	if c.Failures <= 0 {
 		c.Failures = 5
+	}
+	if c.Ratio < 0 {
+		c.Ratio = 0
+	}
+	if c.Ratio > 0 {
+		if c.Ratio > 1 {
+			c.Ratio = 1
+		}
+		if c.Window <= 0 {
+			c.Window = 60 * time.Second
+		}
+		if c.MinSamples <= 0 {
+			c.MinSamples = 20
+		}
+	}
+	if c.IsFailure == nil {
+		c.IsFailure = defaultIsFailure
 	}
 	if c.Successes <= 0 {
 		c.Successes = 2
@@ -94,11 +140,27 @@ type Breaker struct {
 	successes int
 	openedAt  time.Time
 	probing   bool // a half-open probe is in flight
+	window    *ratioWindow
+}
+
+// defaultIsFailure counts server-side errors as failures. errs maps any
+// non-matex error to 500, so a plain error counts too.
+func defaultIsFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	status, _, _ := errs.Status(err)
+	return status >= 500
 }
 
 // New creates a breaker.
 func New(cfg Config) *Breaker {
-	return &Breaker{cfg: cfg.withDefaults(), now: time.Now}
+	cfg = cfg.withDefaults()
+	b := &Breaker{cfg: cfg, now: time.Now}
+	if cfg.Ratio > 0 {
+		b.window = newWindow(cfg.Window)
+	}
+	return b
 }
 
 // Do runs fn under the breaker's protection. It returns ErrOpen without
@@ -109,7 +171,7 @@ func (b *Breaker) Do(ctx context.Context, fn func(context.Context) error) error 
 		return ErrOpen
 	}
 	err := fn(ctx)
-	b.record(err != nil)
+	b.record(err)
 	return err
 }
 
@@ -120,7 +182,7 @@ func DoValue[T any](ctx context.Context, b *Breaker, fn func(context.Context) (T
 		return zero, ErrOpen
 	}
 	v, err := fn(ctx)
-	b.record(err != nil)
+	b.record(err)
 	return v, err
 }
 
@@ -158,13 +220,26 @@ func (b *Breaker) allow() bool {
 }
 
 // record folds one call's outcome into the state machine.
-func (b *Breaker) record(failed bool) {
+func (b *Breaker) record(err error) {
+	failed := b.cfg.IsFailure(err)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.probing = false
 
 	switch b.state {
 	case StateClosed:
+		if b.window != nil {
+			b.window.add(b.now(), !failed)
+			// Clearing on open makes recovery start from fresh traffic:
+			// stale failures from before the open must not re-trip the
+			// breaker the moment it closes.
+			if over, _ := b.window.tripped(b.cfg.Ratio, b.cfg.MinSamples); over {
+				b.openedAt = b.now()
+				b.window.clear()
+				b.transition(StateOpen)
+			}
+			return
+		}
 		if !failed {
 			b.failures = 0
 			return
@@ -184,6 +259,9 @@ func (b *Breaker) record(failed bool) {
 		b.successes++
 		if b.successes >= b.cfg.Successes {
 			b.failures, b.successes = 0, 0
+			if b.window != nil {
+				b.window.clear()
+			}
 			b.transition(StateClosed)
 		}
 	case StateOpen:

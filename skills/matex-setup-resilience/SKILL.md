@@ -74,6 +74,27 @@ if errors.Is(err, breaker.ErrOpen) {
 `retry` 默认全抖动（把延迟摊到 `[0, d)`），不要关掉：同一瞬间失败的一批客户端若无抖动
 会在同一瞬间重试。
 
+### 熔断的两种触发模型
+
+| 模型 | 配置 | 什么时候打开 |
+|---|---|---|
+| 错误率滑窗（推荐，线上用） | `Ratio: 0.5, Window: 60s, MinSamples: 20` | 窗口内 ≥ MinSamples 次调用且失败率 ≥ Ratio |
+| 连续失败 | `Failures: 5`（不设 Ratio） | 连续 Failures 次失败 |
+
+```go
+breaker.New(breaker.Config{
+    Ratio: 0.5, Window: 60 * time.Second, MinSamples: 20,
+    Successes: 2, Cooldown: 10 * time.Second,
+    OnStateChange: func(from, to breaker.State) { /* 打日志 + 上报 gauge */ },
+})
+```
+
+- **什么算失败**：默认只计服务端错误（`errs` 中 HTTP ≥ 500，以及非 matex 的普通 error）；
+  400/404 之类的客户端错误不打开熔断。需要别的口径时传 `IsFailure`。
+- 低流量下 `MinSamples` 防止"一次失败就熔断"；高流量下几个 5xx 不会误触发。
+- 断路器本身不依赖 obs：指标在 `OnStateChange` 里上报（例如 `breaker_state{name}` gauge）。
+- 错误率模型打开/关闭时窗口会清空，恢复后的流量从零开始统计。
+
 ## 5. 数据库约束冲突
 
 唯一键冲突（postgres 23505 / mysql 1062 / sqlite 2067）由 `pkg/core/db` 映射成
