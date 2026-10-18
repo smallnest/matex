@@ -18,7 +18,7 @@ matex 取**中间偏简**：不做"全家桶"，也不做"迁移专用"，而是
 | 观测 | slog JSON + prometheus（`http_server_*` 指标） |
 | 生命周期 | `app`：信号 → http 排空 → block 等待 → closer 逆序 |
 | 分布式锁 | redis `TryLock`：带 token + Lua 释放 + TTL 兜底；`Claim`：窗口式占领（选主用） |
-| HTTP 中间件链 | `httpx.Use`（封套层，可短路返回 `errs`）/ `UseOuter`（net/http 层），横切能力都挂这里 |
+| HTTP 中间件链 | `httpx.Use`（封套层，可短路返回 `errs`）/ `UseOuter`（net/http 层），横切能力都挂这里；链首固定 `SecureHeaders`（安全响应头默认开），CORS 需显式 `CORSPolicy` |
 | 认证与授权 | `auth`：HMAC/JWKS 验签、`Principal` 进 ctx、`RequireScope/Role`（配 `auth:` 段启用） |
 | 链路追踪 | `obs`：OpenTelemetry span + W3C 传播 + OTLP 导出（配 `trace:` 段启用）；HTTP、gRPC（unary/stream 拦截器）、rpcx（服务端 plugin + 客户端包装）三通道自动跨进程传播，关闭时全为 no-op |
 | 稳定性防护 | `ratelimit`（本地令牌桶 / redis 固定窗口）、`breaker`（连续失败或错误率滑窗，按 errs 分类计失败）、`retry`（全抖动退避）、`idempotency`（回放保留大整数原值） |

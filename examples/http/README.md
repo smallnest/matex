@@ -88,6 +88,21 @@ srv.Handle("GET", "/api/v1/orders", listOrders) // 受保护
 顺序即书写顺序：**先注册的在最外层**（先执行，最后收尾）。中间件可以往 ctx 里塞东西
 （当前主体、租户、trace），下游 handler 直接读 —— 见示例里的 `withTag` / `whoami`。
 
+### 默认安全响应头与 CORS
+
+`httpx.New` 在链首装 `SecureHeaders`，**不用你写**：`X-Content-Type-Options: nosniff`、
+`X-Frame-Options: DENY`、`Content-Security-Policy: default-src 'none'`（接口只回 JSON）、
+`Referrer-Policy: no-referrer`、`Cross-Origin-*-Policy: same-origin`、`Permissions-Policy`，
+以及**仅在 https**（直连 TLS 或 `X-Forwarded-Proto: https`）时的 HSTS。
+
+CORS **默认不发**：同源接口不邀请外部页面。要开就显式给白名单（`UseOuter` 追加在
+`SecureHeaders` 之后，所以放弃的是白名单之外的部分，不是安全头本身）：
+
+```go
+srv.UseOuter(httpx.CORSPolicy("https://app.example"))   // 精确来源；OPTIONS 预检自动应答
+srv.UseOuter(httpx.CORSPolicy("*"))                     // 任意来源，且不带 credentials
+```
+
 **`UseOuter` 覆盖整个 mux**，所以 `/healthz`、`/readyz`、`/metrics` 和 `HandleRaw` 路由都在
 它范围内（这些 `Use` 不管）。它在最外层 `guard`（panic 恢复 + `max_body`）的内侧，所以
 中间件自己 panic 也会被兜成 500。

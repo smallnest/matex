@@ -96,6 +96,9 @@ func New(cfg Config, opts ...Option) *Server {
 	for _, o := range opts {
 		o(s)
 	}
+	// Secure by default, and first in the chain: UseOuter appends behind it,
+	// so a later CORSPolicy can still decide what an allowed origin sees.
+	s.outers = []OuterMiddleware{SecureHeaders}
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
