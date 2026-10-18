@@ -323,6 +323,19 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 		return fmt.Errorf("verticle: init logging: %w", err)
 	}
 
+	// Unknown framework keys are typos that would otherwise be silently
+	// ignored while the deployment believes it changed something. Warn
+	// (not fail): a newer key in front of an older binary must not break it.
+	fw := make(map[string]any, len(raw))
+	for k, v := range raw {
+		if k != strings.ToLower(svc.Name()) {
+			fw[k] = v
+		}
+	}
+	for _, key := range config.UnknownKeys(fw, &fc) {
+		obs.Warn(ctx, "unknown framework config key", "key", key)
+	}
+
 	// Step 2b: tracing, before any component can produce a span
 	shutdownTrace, err := obs.InitTracing(ctx, svc.Name(), fc.Trace)
 	if err != nil {

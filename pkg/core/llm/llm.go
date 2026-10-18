@@ -53,6 +53,11 @@ const (
 	ProtocolJev Protocol = "jev"
 )
 
+// maxReplyBytes caps a non-streamed reply. Exceeding it is an error rather
+// than a silent truncation: a truncated JSON reply parses wrong, so fail
+// loudly instead of returning a plausible-looking wrong answer.
+const maxReplyBytes = 16 << 20
+
 // JevVia is how a decision API is asked: TypeSafe's System One shape, Vercel's
 // AI Gateway evaluation models, or Cloudflare's Workers AI envelope.
 type JevVia string
@@ -285,9 +290,12 @@ func (c *Client) Chat(ctx context.Context, req Request) (*Response, error) {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxReplyBytes+1))
 	if err != nil {
 		return nil, errs.Wrap(errs.KindUnavailable, 0, err, "llm: read reply")
+	}
+	if len(respBody) > maxReplyBytes {
+		return nil, errs.Internal(0, "llm: reply exceeds 16MiB")
 	}
 	out, err := a.parse(respBody)
 	if err != nil {

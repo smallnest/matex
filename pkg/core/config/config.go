@@ -145,7 +145,7 @@ func decodeMap(m map[string]any, v reflect.Value, path string) error {
 		// env override wins over the file value
 		if envName, ok := f.Tag.Lookup("env"); ok {
 			if s, present := os.LookupEnv(envName); present {
-				if err := setString(fv, s, fpath); err != nil {
+				if err := setStringField(fv, s, fpath); err != nil {
 					return err
 				}
 				continue
@@ -155,7 +155,7 @@ func decodeMap(m map[string]any, v reflect.Value, path string) error {
 		raw, ok := m[key]
 		if !ok || raw == nil {
 			if d, has := f.Tag.Lookup("default"); has {
-				if err := setString(fv, d, fpath); err != nil {
+				if err := setStringField(fv, d, fpath); err != nil {
 					return err
 				}
 			} else if _, has := f.Tag.Lookup("optional"); !has {
@@ -348,6 +348,20 @@ func setDuration(v reflect.Value, raw any, path string) error {
 	return nil
 }
 
+// setStringField sets a struct field from a string (env value or default
+// tag). For a *T field it allocates the pointer first and decodes into the
+// element — without this, an env/default on a pointer field would hit
+// setString's "cannot set *T from string" error.
+func setStringField(v reflect.Value, s string, path string) error {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
+		}
+		return setString(v.Elem(), s, path)
+	}
+	return setString(v, s, path)
+}
+
 // setString sets v from a string (env value or default tag).
 func setString(v reflect.Value, s string, path string) error {
 	if v.Type() == durationType {
@@ -425,6 +439,48 @@ func toString(raw any) string {
 		return strconv.FormatBool(rv.Bool())
 	}
 	return fmt.Sprint(raw)
+}
+
+// UnknownKeys returns the dot-paths of keys in m that no field of the struct
+// v accepts. It recurses into nested struct fields, so both top-level and
+// nested typos surface. map[string]T fields are treated as fully known — the
+// keys are data, not a fixed schema. m must be key-lowercased, as LoadMap
+// returns it.
+func UnknownKeys(m map[string]any, v any) []string {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() || rv.Elem().Kind() != reflect.Struct {
+		return nil
+	}
+	var out []string
+	collectUnknown(m, rv.Elem().Type(), "", &out)
+	return out
+}
+
+func collectUnknown(m map[string]any, t reflect.Type, path string, out *[]string) {
+	known := make(map[string]reflect.Type, t.NumField())
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		ft := f.Type
+		for ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		known[fieldKey(f)] = ft
+	}
+	for k, raw := range m {
+		ft, ok := known[strings.ToLower(k)]
+		if !ok {
+			*out = append(*out, join(path, k))
+			continue
+		}
+		if ft.Kind() == reflect.Struct {
+			if sub, isMap := raw.(map[string]any); isMap {
+				collectUnknown(sub, ft, join(path, k), out)
+			}
+		}
+	}
 }
 
 func join(path, key string) string {

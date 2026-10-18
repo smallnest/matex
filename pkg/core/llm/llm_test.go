@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -385,6 +386,22 @@ func TestChatHappyPath(t *testing.T) {
 	}
 	if resp.Content != "hi" || resp.FinishReason != "stop" || resp.Usage.TotalTokens != 3 {
 		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+// TestChatReplyOverLimit: a reply just past the cap must fail loudly with an
+// explicit error, not come back silently truncated into a plausible wrong
+// answer.
+func TestChatReplyOverLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(bytes.Repeat([]byte("x"), maxReplyBytes+1))
+	}))
+	defer srv.Close()
+
+	c := New(WithBaseURL(srv.URL), WithModel("m"), WithTimeout(0))
+	_, err := c.Chat(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err == nil || !strings.Contains(err.Error(), "exceeds 16MiB") {
+		t.Fatalf("err = %v, want an explicit reply-too-large error", err)
 	}
 }
 

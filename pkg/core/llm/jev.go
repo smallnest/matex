@@ -162,9 +162,12 @@ func (c *Client) Decide(ctx context.Context, req DecideRequest) (*DecideResponse
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxReplyBytes+1))
 	if err != nil {
 		return nil, errs.Wrap(errs.KindUnavailable, 0, err, "llm: read decide reply")
+	}
+	if len(respBody) > maxReplyBytes {
+		return nil, errs.Internal(0, "llm: reply exceeds 16MiB")
 	}
 	respBody, err = jevAnswer(c.jevVia, respBody)
 	if err != nil {

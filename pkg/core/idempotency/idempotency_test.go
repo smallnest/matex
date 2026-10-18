@@ -369,8 +369,51 @@ func TestOutcomeValue(t *testing.T) {
 	}
 	if v, err := (Outcome{Data: json.RawMessage(`[1,2]`)}).value(); err != nil {
 		t.Fatalf("array data: %v", err)
-	} else if arr, ok := v.([]any); !ok || len(arr) != 2 {
+	} else {
+		arr, ok := v.([]any)
+		if !ok || len(arr) != 2 {
+			t.Fatalf("v = %#v, want []any of two json.Numbers", v)
+		}
+		if num, ok := arr[0].(json.Number); !ok || num.String() != "1" {
+			t.Fatalf("arr[0] = %#v, want json.Number(1)", arr[0])
+		}
+	}
+}
+
+// TestOutcomeValuePreservesBigIntegers pins the uint64-id fix: ids beyond
+// 2^53 must survive a replay as exact digits, not as a rounded float64.
+func TestOutcomeValuePreservesBigIntegers(t *testing.T) {
+	v, err := (Outcome{Data: json.RawMessage(`{"id":9007199254740993}`)}).value()
+	if err != nil {
+		t.Fatalf("value: %v", err)
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
 		t.Fatalf("v = %#v", v)
+	}
+	num, ok := m["id"].(json.Number)
+	if !ok {
+		t.Fatalf("id = %#v, want json.Number", m["id"])
+	}
+	if num.String() != "9007199254740993" {
+		t.Fatalf("id = %s, want the exact digits 9007199254740993", num.String())
+	}
+}
+
+// TestReplayPreservesBigIntegers drives the middleware end-to-end: the
+// second request's body must carry the exact integer, not a rounded one.
+func TestReplayPreservesBigIntegers(t *testing.T) {
+	h := newHarness(t, NewMemory(), Config{}, func(_ context.Context, r *http.Request) (any, error) {
+		return map[string]any{"id": 9007199254740993}, nil
+	})
+
+	h.do(http.MethodPost, "big")
+	second := h.do(http.MethodPost, "big")
+	if second.Code != http.StatusOK {
+		t.Fatalf("code %d body %s", second.Code, second.Body.String())
+	}
+	if !strings.Contains(second.Body.String(), "9007199254740993") {
+		t.Fatalf("body = %s, want the exact integer 9007199254740993", second.Body.String())
 	}
 }
 

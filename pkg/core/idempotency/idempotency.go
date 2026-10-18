@@ -21,6 +21,7 @@
 package idempotency
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -171,7 +172,12 @@ func (o Outcome) value() (any, error) {
 		return nil, nil // the first request answered 204
 	}
 	var v any
-	if err := json.Unmarshal(o.Data, &v); err != nil {
+	// UseNumber keeps integers larger than 2^53 (uint64 ids and the like)
+	// intact; a plain Unmarshal would silently round them to the nearest
+	// float64 and reply with a corrupted value.
+	dec := json.NewDecoder(bytes.NewReader(o.Data))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
 		return nil, errs.Internal(CodeCorrupt, "stored idempotent result is corrupt")
 	}
 	return v, nil

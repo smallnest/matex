@@ -131,6 +131,58 @@ func TestStringSlicesFromEnv(t *testing.T) {
 	}
 }
 
+func TestPointerFieldFromEnv(t *testing.T) {
+	t.Setenv("MATEX_TEST_MAX", "42")
+	var c struct {
+		Max *int `json:"max" optional:"" env:"MATEX_TEST_MAX"`
+	}
+	// The file value is present, but env wins — and must still allocate the
+	// pointer instead of failing with "cannot set *int from string".
+	if err := Parse([]byte("max: 1\n"), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Max == nil || *c.Max != 42 {
+		t.Fatalf("max = %v, want 42", c.Max)
+	}
+}
+
+func TestPointerFieldFromDefault(t *testing.T) {
+	var c struct {
+		Max *int `json:"max" optional:"" default:"7" env:"MATEX_TEST_MAX_UNSET"`
+	}
+	if err := Parse([]byte("other: x\n"), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Max == nil || *c.Max != 7 {
+		t.Fatalf("max = %v, want 7", c.Max)
+	}
+}
+
+func TestUnknownKeys(t *testing.T) {
+	type nested struct {
+		Host string `json:"host"`
+	}
+	type cfg struct {
+		HTTP   nested            `json:"http"`
+		Labels map[string]string `json:"labels" optional:""`
+	}
+	got := UnknownKeys(map[string]any{
+		"http":   map[string]any{"host": "x", "adres": "typo"},
+		"labels": map[string]any{"a": "b"},
+		"grpc":   "typo",
+		"redis":  "typo",
+	}, &cfg{})
+	want := map[string]bool{"grpc": true, "redis": true, "http.adres": true}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want exactly %d keys", got, len(want))
+	}
+	for _, k := range got {
+		if !want[k] {
+			t.Fatalf("unexpected key %q in %v", k, got)
+		}
+	}
+}
+
 func TestLoadMapCaseInsensitive(t *testing.T) {
 	f, err := os.CreateTemp(t.TempDir(), "cfg*.yaml")
 	if err != nil {
