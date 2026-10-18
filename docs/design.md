@@ -81,6 +81,7 @@ config.LoadMap → 框架段(ParseMap) + 服务段(按 Name 取)
 → 按配置初始化 db/redis/memcache/kafka/auth（配了才建，未配 nil）
 → svc.Setup(ctx, env)
 → httpx.New（/healthz /readyz /metrics /version，+ http.pprof 时挂 /debug/pprof/）+ svc.BuildRouter
+→ gRPC/rpcx 仅在服务实现了对应 Registrar 时才监听（只配了地址但没实现接口 → 告警、不监听）
 → 运行（信号 → 优雅退出：先停 Block 里的定时任务，再 flush trace，最后关基础设施）；配置文件 watch → ConfigWatcher 回调
 ```
 

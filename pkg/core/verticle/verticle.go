@@ -428,32 +428,31 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 	}
 
 	// Step 6b: gRPC server + registration (optional)
+	// A service that registers nothing gets no listener: a port with no
+	// services only invites misrouted traffic and a false sense of health.
 	var grpcSrv *grpcx.Server
-	if fc.GRPC.Addr != "" {
+	if r, ok := svc.(GRPCRegistrar); ok && fc.GRPC.Addr != "" {
 		grpcSrv, err = grpcx.New(fc.GRPC)
 		if err != nil {
 			return fmt.Errorf("verticle: init grpc: %w", err)
 		}
-		if r, ok := svc.(GRPCRegistrar); ok {
-			r.RegisterGRPC(grpcSrv.GRPC())
-			obs.Info(ctx, "grpc services registered", "addr", fc.GRPC.Addr)
-		} else {
-			obs.Warn(ctx, "grpc server configured but service does not implement GRPCRegistrar", "addr", fc.GRPC.Addr)
-		}
+		r.RegisterGRPC(grpcSrv.GRPC())
+		obs.Info(ctx, "grpc services registered", "addr", fc.GRPC.Addr)
+	} else if fc.GRPC.Addr != "" {
+		obs.Warn(ctx, "grpc section configured but service does not implement GRPCRegistrar; not listening", "addr", fc.GRPC.Addr)
 	}
 
 	// Step 6c: rpcx server + registration (optional)
+	// Same rule as gRPC: no registrar, no listener.
 	var rpcxSrv *rpcx.Server
-	if fc.RPCX.Addr != "" {
+	if r, ok := svc.(RPCXRegistrar); ok && fc.RPCX.Addr != "" {
 		rpcxSrv = rpcx.New(fc.RPCX)
-		if r, ok := svc.(RPCXRegistrar); ok {
-			if err := r.RegisterRPCX(rpcxSrv.RPCX()); err != nil {
-				return fmt.Errorf("verticle: register rpcx %s: %w", svc.Name(), err)
-			}
-			obs.Info(ctx, "rpcx services registered", "addr", rpcxSrv.Addr())
-		} else {
-			obs.Warn(ctx, "rpcx server configured but service does not implement RPCXRegistrar", "addr", fc.RPCX.Addr)
+		if err := r.RegisterRPCX(rpcxSrv.RPCX()); err != nil {
+			return fmt.Errorf("verticle: register rpcx %s: %w", svc.Name(), err)
 		}
+		obs.Info(ctx, "rpcx services registered", "addr", rpcxSrv.Addr())
+	} else if fc.RPCX.Addr != "" {
+		obs.Warn(ctx, "rpcx section configured but service does not implement RPCXRegistrar; not listening", "addr", fc.RPCX.Addr)
 	}
 
 	// Step 7: run

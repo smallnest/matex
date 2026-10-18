@@ -174,3 +174,38 @@ func TestRunFailsWhenSetupFails(t *testing.T) {
 		t.Fatal("BuildRouter ran although Setup failed")
 	}
 }
+
+// TestRunDoesNotListenOnRPCAddressesWithoutARegistrar: a service without
+// GRPCRegistrar/RPCXRegistrar must not open those ports — an empty listener
+// looks healthy to a probe while serving nothing.
+func TestRunDoesNotListenOnRPCAddressesWithoutARegistrar(t *testing.T) {
+	prevLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	grpcAddr, rpcxAddr := freeAddr(t), freeAddr(t)
+	conf := writeConf(t, "http:\n  addr: \""+freeAddr(t)+"\"\nlog:\n  level: error\n"+
+		"grpc:\n  addr: \""+grpcAddr+"\"\nrpcx:\n  addr: \""+rpcxAddr+"\"\nsvc:\n  greeting: hi\n")
+	svc := &fakeService{name: "svc"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- Run(ctx, svc, WithConf(conf), WithoutConfigWatch()) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for svc.router.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Run never built the router")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, addr := range []string{grpcAddr, rpcxAddr} {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			t.Fatalf("%s is listening although the service registers no RPC services", addr)
+		}
+	}
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
