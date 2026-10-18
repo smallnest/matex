@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>resilience 示例 — matex</title>
+		<meta name="description" content="examples/resilience：限流、幂等、熔断、退避重试四个工具，两个作用点——入站挂 httpx 中间件，出站包住具体那次调用。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/resilience">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>resilience — 稳定性防护</h1>
+			<p class="lede">
+				四个工具，两个作用点：<b>限流</b>与<b>幂等</b>挂在 <code>httpx</code> 的中间件槽上保护入站流量，
+				<b>熔断</b>与<b>重试</b>包住具体的出站调用。这个示例把它们全部接在一条真实的请求路径上，
+				你会看到第三个快速请求如何被 429 挡掉、重复的付款请求如何被重放而不是重复创建，
+				以及熔断打开后重试为什么不继续徒劳地补刀。
+			</p>
+
+			<h2>运行</h2>
+			<pre><code class="language-bash">go run ./examples/resilience
+
+# 限流：第三个快速请求被 429 挡掉
+for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code} ' \
+  -X POST localhost:8082/api/v1/login -d '{"user":"alice"}'; done; echo
+
+# 幂等：两个请求返回同一个 payment id，只创建一次
+curl -s -X POST localhost:8082/api/v1/payments -H 'Idempotency-Key: k-1' -d '{"amount":10}'
+curl -s -X POST localhost:8082/api/v1/payments -H 'Idempotency-Key: k-1' -d '{"amount":10}'
+
+# 重试 + 熔断：第一次请求耗尽重试预算，之后立即失败
+curl -s localhost:8082/api/v1/flaky/1
+curl -s localhost:8082/api/v1/flaky/2</code></pre>
+			<p>
+				没有外部依赖，不需要 <code>make dev</code>。监听 <code>:8082</code>
+				（避开默认的 8080），<code>-conf</code> 默认指向
+				<code>examples/resilience/config.yaml</code>。
+			</p>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>限流</b>：<code>ratelimit.NewLocal(rate, burst)</code> 进程内按 key 的令牌桶，<code>ratelimit.ByIP</code> 决定 key。</li>
+				<li><b>幂等</b>：<code>idempotency.Middleware(store, cfg)</code>，客户端带 <code>Idempotency-Key</code>，重复请求重放首次结果而不是重跑。</li>
+				<li><b>熔断</b>：<code>breaker.New(breaker.Config{…})</code>，连续失败到阈值后快速失败，冷却后放探测请求。</li>
+				<li><b>退避重试</b>：<code>retry.DoValue(ctx, cfg, fn)</code>，默认全抖动。</li>
+				<li><b>顺序很关键</b>：retry 在外、breaker 在内，且熔断阈值不得小于重试次数。</li>
+				<li><b>降级优先</b>：限流器与幂等存储自身故障时<b>放行</b>，只记日志。</li>
+			</ul>
+
+			<h2>装配：限流与幂等挂在中间件槽上</h2>
+			<p>
+				这段来自 <code>examples/resilience/main.go</code> 的 <code>BuildRouter</code>。
+				因为 <code>Use</code> 有累积语义，<code>payments</code> 与 <code>flaky</code>
+				同时受限流与幂等保护，而 <code>login</code> 只受限流。
+			</p>
+			<pre><code class="language-go">func (s *resilienceService) BuildRouter(srv *httpx.Server) error {
+	// Use applies to every route registered after it, so the protections
+	// stack in the order they are declared.
+	srv.Use(ratelimit.Middleware(
+		ratelimit.NewLocal(s.cfg.LoginRate, s.cfg.LoginBurst),
+		ratelimit.ByIP,
+	))
+	srv.Handle("POST", "/api/v1/login", s.login)
+
+	// Payments get the rate limit above plus idempotency. The memory store
+	// suits a single instance; a fleet needs idempotency.NewRedis(rc) with
+	// rc from env.Redis().
+	srv.Use(idempotency.Middleware(idempotency.NewMemory(), idempotency.Config{}))
+	srv.Handle("POST", "/api/v1/payments", s.pay)
+	srv.Handle("GET", "/api/v1/flaky/{id}", s.flaky)
+
+	return nil
+}</code></pre>
+
+			<h2>出站调用：retry 包住 breaker，breaker 包住下游</h2>
+			<p>
+				同样来自 <code>examples/resilience/main.go</code>。这段是整个示例的核心：
+				<code>Retryable</code> 明确把 <code>breaker.ErrOpen</code> 判为不可重试——
+				熔断已经打开时，再补三次注定失败的调用毫无意义。
+			</p>
+			<pre><code class="language-go">// flaky calls a dependency that is having a bad time. Retry sits outside
+// the breaker: each attempt passes through the circuit, and once the
+// circuit is open the retry loop stops instead of hammering.
+func (s *resilienceService) flaky(ctx context.Context, r *http.Request) (any, error) {
+	payload, err := retry.DoValue(ctx, retry.Config{
+		Attempts:  3,
+		BaseDelay: 5 * time.Millisecond,
+		Retryable: func(err error) bool {
+			// An open circuit will not close inside a retry loop.
+			return !errors.Is(err, breaker.ErrOpen)
+		},
+	}, func(ctx context.Context) (string, error) {
+		return breaker.DoValue(ctx, s.circuit, func(context.Context) (string, error) {
+			return s.downstream.call()
+		})
+	})
+
+	switch {
+	case errors.Is(err, breaker.ErrOpen):
+		return nil, errs.Unavailable(50302, "downstream circuit is open")
+	case err != nil:
+		return nil, errs.Internal(50010, "downstream failed: %v", err)
+	}</code></pre>
+			<p>
+				熔断器本身在 <code>Setup</code> 里构造，注释点明了一条容易踩的约束：
+				阈值必须至少等于重试预算，否则熔断器会在重试循环中间打开，最后一次尝试连机会都没有。
+			</p>
+			<pre><code class="language-go">	s.circuit = breaker.New(breaker.Config{
+		// The trip threshold has to be at least the retry budget, or the
+		// breaker opens in the middle of a retry loop and the last attempt
+		// never gets a chance to succeed.
+		Failures:  3,
+		Successes: 1,
+		Cooldown:  5 * time.Second,
+		OnStateChange: func(from, to breaker.State) {
+			obs.Info(context.Background(), "circuit state changed", "from", from.String(), "to", to.String())
+		},
+	})</code></pre>
+
+			<h2>包裹关系</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    REQ([请求 /api/v1/flaky/1]) --> RL["ratelimit 中间件<br/>ByIP · 令牌桶"]
+    RL --> ID["idempotency 中间件<br/>POST/PATCH/DELETE"]
+    ID --> H["handler"]
+    H --> R["retry.DoValue<br/>Attempts=3 · 全抖动"]
+    R --> B["breaker.DoValue"]
+    B --> D["下游调用"]
+    D -- 失败 --> A{"还有尝试次数吗？"}
+    A -- 有 --> R
+    A -- "没有 / ErrOpen" --> O["熔断打开<br/>→ 503 code 50302"]
+    classDef guard fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    classDef bad fill:#fdf0f0,stroke:#a33,color:#2b2722
+    class RL,ID guard
+    class O bad
+				</pre>
+				<figcaption>
+					入站两件在 <code>Use</code> 槽里按注册顺序叠加；出站两件包在具体那次调用外面，
+					包裹范围刻意收窄——包住整个 handler 会让熔断器统计到一堆无关的失败。
+				</figcaption>
+			</figure>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash"># 默认 config.yaml：login_rate: 2、login_burst: 2
+for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code} ' \
+  -X POST localhost:8082/api/v1/login -d '{"user":"alice"}'; done; echo
+# 200 200 429        ← 第三个被限流拒绝
+
+# 幂等：两次调用返回同一个 id
+curl -s -X POST localhost:8082/api/v1/payments -H 'Idempotency-Key: k-1' -d '{"amount":10}'
+# {"code":0,"msg":"ok","data":{"amount":10,"id":"pay-1"}}
+curl -s -X POST localhost:8082/api/v1/payments -H 'Idempotency-Key: k-1' -d '{"amount":10}'
+# {"code":0,"msg":"ok","data":{"amount":10,"id":"pay-1"}}   ← 还是 pay-1，没有创建第二个
+
+# 不带 key 就是两次真实写入：会拿到 pay-2 这样的新 id
+
+# 重试 + 熔断（默认 downstream_failures: 10，失败数量超过重试预算）
+curl -s localhost:8082/api/v1/flaky/1
+# 500，"downstream failed" —— 三次尝试全部失败，熔断器此时已打开
+curl -s localhost:8082/api/v1/flaky/2
+# 503 {"code":50302,"msg":"downstream circuit is open"} —— 快速失败，没有再去打下游</code></pre>
+			<p>
+				把 <code>config.yaml</code> 的 <code>downstream_failures</code> 调成 <code>2</code>
+				能看到另一种现象：重试把瞬时故障吃掉，请求正常返回 200，响应体里的
+				<code>downstream_calls</code> 是 3（两次失败 + 一次成功），
+				<code>circuit</code> 是 <code>"closed"</code>。
+			</p>
+
+			<h2>测试</h2>
+			<p><code>main_test.go</code> 断言的是这些具体事实：</p>
+			<ul>
+				<li><code>TestRateLimitRejectsBurst</code>：同一客户端连打三次，状态码依次是
+					<code>200, 200, 429</code>。测试把 <code>RemoteAddr</code> 固定成
+					<code>10.0.0.1:1234</code>，因为 <code>ByIP</code> 看的是它。</li>
+				<li><code>TestRateLimitIsPerClient</code>：同一个 IP 打到第三次是 429 之后，
+					换一个 IP 仍然是 200——限额是按 key 算的。</li>
+				<li><code>TestIdempotentPayments</code>：两个同 key 请求返回<b>同一个 id</b>，
+					且 <code>svc.payments.next == 1</code>（重复请求没到达存储层）；
+					换 key 后 <code>next == 2</code>。</li>
+				<li><code>TestPaymentWithoutKeyIsNotDeduplicated</code>：不带
+					<code>Idempotency-Key</code> 的两次请求会创建两笔付款。</li>
+				<li><code>TestRetryAbsorbsATransientFailure</code>：下游失败两次，
+					<code>downstream_calls == 3</code>、<code>circuit == "closed"</code>，状态 200。</li>
+				<li><code>TestBreakerOpensAfterRetriesAreExhausted</code>：第一次请求 500，
+					且下游恰好被调 <b>3</b> 次（用满整个重试预算）；第二次请求 503 且响应体含
+					<code>"code":50302</code>，同时下游调用次数<b>没有增加</b>——熔断期间真的没打。</li>
+				<li><code>TestValidationStillApplies</code>：<code>amount: 0</code> 返回 400；
+					确定性拒绝可以被安全重放，第二次同样是 400。</li>
+				<li><code>TestConfigDefaults</code>：默认值是 <code>login_rate=2</code>、
+					<code>login_burst=2</code>、<code>downstream_failures=10</code>。</li>
+			</ul>
+			<pre><code class="language-bash">go test ./examples/resilience</code></pre>
+
+			<h2>相关</h2>
+			<div class="cards">
+				<a class="card" href="../guide/concepts/resilience.html">
+					<span class="card__title">稳定性防护概念页</span>
+					<span class="card__desc">四件工具的规则、失败语义与组合顺序。</span>
+				</a>
+				<a class="card" href="../guide/reference/skills.html">
+					<span class="card__title">matex-setup-resilience</span>
+					<span class="card__desc">让 AI 按规范把限流/幂等/熔断/重试接进你的项目。</span>
+				</a>
+				<a class="card" href="index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">全部 19 个可运行示例。</span>
+				</a>
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="http.html">examples/http</a>：<code>Use</code> 槽与封套的基础。</li>
+				<li><a href="errors.html">examples/errors</a>：幂等按 4xx/5xx 分流依据的 Kind。</li>
+				<li><a href="observability.html">examples/observability</a>：熔断状态变化打进了日志。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

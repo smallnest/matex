@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>文档总览 — matex</title>
+		<meta
+			name="description"
+			content="matex 文档：介绍、快速开始、架构总览，以及按分类组织的核心概念与参考。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="guide/index">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>matex 文档</h1>
+			<p class="lede">
+				matex 是一套约定：一个部署单元长什么样、基础设施怎么进来、错误怎么表达、日志怎么带
+				trace id。文档分四段——先理解它为什么这样设计，再跑起来，然后按能力读，最后查参考。
+			</p>
+
+			<div class="cards">
+				<a class="card" href="introduction.html">
+					<span class="card__title">介绍</span>
+					<span class="card__desc"
+						>定位与取舍：为什么不引 ORM、不引路由库、不做服务发现，以及"配了才建"到底意味着什么。</span
+					>
+					<span class="card__meta">5 分钟</span>
+				</a>
+				<a class="card" href="quickstart.html">
+					<span class="card__title">快速开始</span>
+					<span class="card__desc"
+						>三条命令：零依赖起步、带 SQLite 库起步、带真依赖起步。每条都能立刻 curl 验证。</span
+					>
+					<span class="card__meta">3 分钟</span>
+				</a>
+				<a class="card" href="architecture.html">
+					<span class="card__title">架构总览</span>
+					<span class="card__desc"
+						>verticle.Run 的启动序列、分层依赖方向、以及由 depguard 强制的一致性守卫。</span
+					>
+					<span class="card__meta">10 分钟</span>
+				</a>
+			</div>
+
+			<h2>核心概念</h2>
+			<p>写业务代码前该知道的五件事。</p>
+			<div class="cards">
+				<a class="card" href="concepts/service.html">
+					<span class="card__title">服务与生命周期</span>
+					<span class="card__desc"><code>verticle.Service</code> / <code>Env</code> / 后台任务 / 优雅退出 / 配置热更。</span>
+				</a>
+				<a class="card" href="concepts/config.html">
+					<span class="card__title">配置</span>
+					<span class="card__desc">tag 语义、<code>${VAR}</code> 展开、未知键告警、热更回调。</span>
+				</a>
+				<a class="card" href="concepts/http.html">
+					<span class="card__title">HTTP 与路由</span>
+					<span class="card__desc">handler 约定、响应封套、中间件两个槽、默认安全头与 CORS。</span>
+				</a>
+				<a class="card" href="concepts/errors.html">
+					<span class="card__title">错误模型</span>
+					<span class="card__desc"><code>errs.Kind</code> → HTTP 状态、业务 code、Wrap 不泄露内部细节。</span>
+				</a>
+				<a class="card" href="concepts/observability.html">
+					<span class="card__title">可观测性</span>
+					<span class="card__desc">结构化日志、trace id、指标、跨进程链路追踪。</span>
+				</a>
+			</div>
+
+			<h2>数据与集成</h2>
+			<div class="cards">
+				<a class="card" href="concepts/database.html">
+					<span class="card__title">数据库</span>
+					<span class="card__desc">三驱动统一入口、占位符重写、泛型扫描、事务、<code>Querier</code>、迁移。</span>
+				</a>
+				<a class="card" href="concepts/cache.html">
+					<span class="card__title">缓存模式</span>
+					<span class="card__desc">cache-aside、并发 miss 合并（防击穿）、TTL 抖动（防雪崩）。</span>
+				</a>
+				<a class="card" href="concepts/messaging.html">
+					<span class="card__title">Kafka 消息</span>
+					<span class="card__desc">同步/异步生产、at-least-once 消费、死信队列与提交顺序。</span>
+				</a>
+				<a class="card" href="concepts/rpc.html">
+					<span class="card__title">gRPC 与 rpcx</span>
+					<span class="card__desc">注册接口、内置健康服务、reflection、追踪自动传播。</span>
+				</a>
+			</div>
+
+			<h2>生产治理</h2>
+			<div class="cards">
+				<a class="card" href="concepts/resilience.html">
+					<span class="card__title">稳定性防护</span>
+					<span class="card__desc">限流、幂等、熔断（两种模型）、退避重试，以及"防护故障时放行"。</span>
+				</a>
+				<a class="card" href="concepts/security.html">
+					<span class="card__title">认证与安全</span>
+					<span class="card__desc">HMAC/JWKS 验签、分级授权、默认安全响应头与 CORS 策略。</span>
+				</a>
+				<a class="card" href="concepts/governance.html">
+					<span class="card__title">开关与审计</span>
+					<span class="card__desc">功能开关的四层优先级；审计事件的字段与可插拔 sink。</span>
+				</a>
+				<a class="card" href="concepts/scheduling.html">
+					<span class="card__title">定时任务</span>
+					<span class="card__desc">固定周期 / cron 表达式 / 一次性，多副本下的 redis 选主。</span>
+				</a>
+				<a class="card" href="concepts/llm.html">
+					<span class="card__title">LLM 客户端</span>
+					<span class="card__desc">四种协议互转、流式事件、可选重试、Jev 决策问答。</span>
+				</a>
+			</div>
+
+			<h2>参考</h2>
+			<div class="cards">
+				<a class="card" href="concepts/testing.html">
+					<span class="card__title">离线测试</span>
+					<span class="card__desc">dbtest / redistest / kfake / 进程内 gRPC·rpcx：不装 Docker 也能跑全量。</span>
+				</a>
+				<a class="card" href="reference/packages.html">
+					<span class="card__title">pkg/core 速查</span>
+					<span class="card__desc">25 个包的一页表：用途、是否 opt-in、关键 API。</span>
+				</a>
+				<a class="card" href="reference/layout.html">
+					<span class="card__title">目录与约定</span>
+					<span class="card__desc">每个目录的职责，以及四条被工具强制的约定。</span>
+				</a>
+				<a class="card" href="reference/commands.html">
+					<span class="card__title">命令与部署</span>
+					<span class="card__desc">Makefile 目标、CI 门禁、Docker 镜像与配置挂载。</span>
+				</a>
+				<a class="card" href="reference/skills.html">
+					<span class="card__title">AI Skills</span>
+					<span class="card__desc">14 个 skill 的用途与触发语，以及与 AGENTS.md 的关系。</span>
+				</a>
+				<a class="card" href="../examples/index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">19 个可离线运行的示例，每个都有测试。</span>
+				</a>
+			</div>
+
+			<h2>另一条路：直接读代码</h2>
+			<p>
+				文档是导览，事实源始终是代码。<code>examples/</code> 下每个能力都有可运行示例，
+				<code>docs/design.md</code> 记录了完整的设计取舍，
+				<a href="https://github.com/smallnest/matex/blob/master/AGENTS.md" target="_blank" rel="noopener">AGENTS.md</a>
+				是给 AI 与新人看的规范入口。
+			</p>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

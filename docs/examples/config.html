@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>config 示例 — matex</title>
+		<meta name="description" content="examples/config：用 struct tag 加载 YAML——default / env / optional 三段语义、${VAR} 展开与环境变量覆盖。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/config">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>config — 配置加载</h1>
+			<p class="lede">
+				这个示例把 <code>pkg/core/config</code> 的全部规则压在一个可运行的程序里：
+				结构体 tag 提供默认值、环境变量覆盖与可选键，YAML 里的 <code>${VAR}</code> 在解析前展开。
+				看完你会知道一个配置段该怎么写，以及缺键时程序会在什么时候、以什么方式失败。
+			</p>
+
+			<h2>运行</h2>
+			<pre><code class="language-bash">go run ./examples/config
+
+# 环境变量优先于文件：
+DB_DSN='postgres://localhost/overridden' go run ./examples/config</code></pre>
+			<p>
+				没有外部依赖，不需要 <code>make dev</code>，也不监听端口——它是纯库演示。
+				<code>-conf</code> 默认指向 <code>examples/config/config.yaml</code>，
+				所以从仓库根目录直接跑就能读到那份文件。
+			</p>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>tag 三段语义</b>：<code>default:"…"</code> 给缺省值，<code>env:"VAR"</code> 让环境变量覆盖文件值，<code>optional:""</code> 标记可以缺省的键。</li>
+				<li><b>什么都没有的键就是必填</b>：key 缺失即报错，不是悄悄留零值。</li>
+				<li><b><code>${VAR}</code> 与 <code>${VAR:default}</code> 展开</b>：解析前先在 YAML 文本里做变量替换。</li>
+				<li><b>字段名解析规则</b>：优先 <code>json</code> tag，退回小写字段名，key 大小写不敏感。</li>
+				<li><b>不落盘解析</b>：<code>config.Parse</code> 直接吃一段 <code>[]byte</code>，测试里最常用。</li>
+				<li><b>支持的类型</b>：<code>time.Duration</code>（<code>"5s"</code>）、<code>[]string</code>（<code>"a,b"</code> 或 YAML 列表）、<code>[]int</code>、<code>map[string]T</code>、嵌套结构体。</li>
+			</ul>
+
+			<h2>tag 是怎么写的</h2>
+			<p>
+				下面这段来自 <code>examples/config/main.go</code> 的 <code>Config</code> 定义。
+				注意 <code>MaxIdleConns</code> 是 <code>optional</code>——文件里故意没有这个键，
+				读出来就是零值；而 <code>DSN</code> 没有默认值，只能靠文件或 <code>DB_DSN</code> 提供。
+			</p>
+			<pre><code class="language-go">type Config struct {
+	HTTP struct {
+		Addr    string        `json:"addr" default:":8080"`
+		Timeout time.Duration `json:"timeout" default:"10s"`
+	} `json:"http"`
+
+	DB struct {
+		DSN          string `json:"dsn" env:"DB_DSN"` // env 优先于文件
+		MaxOpenConns int    `json:"max_open_conns" default:"16"`
+		MaxIdleConns int    `json:"max_idle_conns" optional:""` // 可缺省 → 零值
+	} `json:"db"`
+
+	Features []string `json:"features" default:"a,b"` // "a,b" 或 YAML 列表
+	Debug    bool     `json:"debug" default:"false"`
+}</code></pre>
+
+			<h2>缺键就该在启动时炸</h2>
+			<p>
+				示例最后用一段最小的结构体证明这件事：没有 <code>default</code> 也没有
+				<code>optional</code> 的 key 缺失时，<code>config.Parse</code> 直接返回错误。
+				这来自 <code>examples/config/main.go</code> 的末尾几行。
+			</p>
+			<pre><code class="language-go">// 没有 default 也没有 optional 的 key 缺失时会报错——配置错误在启动
+// 时就该炸，而不是等到运行时才 nil panic。
+var strict struct {
+	Required string `json:"required"`
+}
+err := config.Parse([]byte("other: 1"), &amp;strict)
+fmt.Printf("\n缺少必填 key：%v\n", err)</code></pre>
+
+			<h2>验证</h2>
+			<p>程序不提供 HTTP 接口，直接看标准输出。默认跑（读 <code>config.yaml</code>）：</p>
+			<pre><code class="language-bash">go run ./examples/config</code></pre>
+			<pre><code class="language-text">conf      = examples/config/config.yaml
+http      = 0.0.0.0:8080 (timeout 5s)
+db        = file:examples-config.db (max_open=8 max_idle=0)
+features  = [cache events]
+debug     = true
+
+缺少必填 key：config: missing key "required"
+inline    = from-bytes</code></pre>
+			<p>
+				其中 <code>timeout 5s</code>、<code>max_open=8</code>、<code>[cache events]</code>、
+				<code>debug = true</code> 全部来自 <code>config.yaml</code>；
+				<code>max_idle=0</code> 是因为文件里没有该键而字段标了 <code>optional</code>。
+				加环境变量后 <code>db</code> 行会换掉：
+			</p>
+			<pre><code class="language-bash">DB_DSN='postgres://localhost/overridden' go run ./examples/config
+# db        = postgres://localhost/overridden (max_open=8 max_idle=0)</code></pre>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    A["YAML 文本<br/>${VAR} / ${VAR:default}"] --> B["环境变量展开"]
+    B --> C["按 json tag<br/>定位结构体字段"]
+    C --> D{"key 在文件里吗？"}
+    D -- 在 --> E["用文件值"]
+    D -- 不在 --> F{"有 env: tag？"}
+    F -- "环境变量存在" --> G["用环境变量值"]
+    F -- "否则" --> H{"有 default: tag？"}
+    H -- 有 --> I["用默认值"]
+    H -- 无 --> J{"optional？"}
+    J -- "是" --> K["留零值"]
+    J -- "否" --> L["返回错误<br/>启动失败"]
+    classDef bad fill:#fdf0f0,stroke:#a33,color:#2b2722
+    class L bad
+				</pre>
+				<figcaption>
+					一个键的取值路径。唯一会中止启动的分支是最后一格：既没有值可选，
+					也没被标记为可缺省。
+				</figcaption>
+			</figure>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 把 tag 语义当成接口来钉。它断言的具体事实：
+			</p>
+			<ul>
+				<li><code>TestLoadFromExampleFile</code>：读真实的 <code>config.yaml</code> 后
+					<code>timeout == 5s</code>、<code>max_open_conns == 8</code>、
+					<code>Features[0] == "cache"</code>、<code>Debug == true</code>，
+					而 <code>optional</code> 的 <code>MaxIdleConns</code> 是 0。</li>
+				<li><code>TestEnvOverridesFile</code>：<code>t.Setenv("DB_DSN", …)</code> 之后，
+					DSN 是环境变量的值。</li>
+				<li><code>TestDefaultsAndExpansionWithoutFile</code>：只给
+					<code>http: {}</code> 与 <code>db: {dsn: x}</code> 时，
+					<code>Timeout</code> 是 <code>10s</code>、<code>MaxOpenConns</code> 是 16、
+					<code>features</code> 是 <code>a,b</code>、<code>Debug</code> 为 false。</li>
+				<li><code>TestVarExpansionInYAML</code>：设了 <code>HTTP_ADDR</code> 就用它，
+					取消后回落到 <code>${HTTP_ADDR:0.0.0.0:1}</code> 给出的默认值。</li>
+				<li><code>TestMissingRequiredKeyFails</code>：<code>Parse</code> 必须返回错误。</li>
+			</ul>
+			<pre><code class="language-bash">go test ./examples/config</code></pre>
+
+			<h2>相关</h2>
+			<div class="cards">
+				<a class="card" href="../guide/concepts/config.html">
+					<span class="card__title">配置概念页</span>
+					<span class="card__desc">tag 语义、必需段与热更的完整规则。</span>
+				</a>
+				<a class="card" href="../guide/reference/skills.html">
+					<span class="card__title">AI Skills</span>
+					<span class="card__desc">让 AI 按规范把配置接进你的项目。</span>
+				</a>
+				<a class="card" href="index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">全部 19 个可运行示例。</span>
+				</a>
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="lifecycle.html">examples/lifecycle</a>：服务专属段怎么热更。</li>
+				<li><a href="feature.html">examples/feature</a>：<code>feature:</code> 段的取值优先级。</li>
+				<li><a href="http.html">examples/http</a>：一份真实服务的 <code>config.yaml</code> 长什么样。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

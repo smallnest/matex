@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>memcache — JSON 缓存、TTL 与 Touch — matex</title>
+		<meta
+			name="description"
+			content="examples/memcache：用 pkg/core/memcache 做 JSON 读写、miss 不报错、Touch 只续期不改值。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/memcache">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>memcache — JSON 缓存、TTL 与 Touch</h1>
+			<p class="lede">
+				<code>pkg/core/memcache</code> 包住 gomemcache，提供 JSON 读写、TTL 与
+				<code>Touch</code>。它是一个命令行程序，不是 HTTP 服务：没有端口，没有
+				<code>config.yaml</code>，参数走 flag。测试用进程内假服务，离线可跑。
+			</p>
+
+			<h2>运行</h2>
+			<p>
+				默认连 <code>localhost:11211</code>，需要一个真实 memcached，用
+				<code>make dev</code> 起。全部参数：
+			</p>
+			<pre><code class="language-bash">make dev                      # 起 memcached（以及其它中间件）
+go run ./examples/memcache    # 等价于 make example NAME=memcache
+go run ./examples/memcache -addrs '10.0.0.1:11211,10.0.0.2:11211' -key other -ttl 5s</code></pre>
+			<div class="callout callout--warn">
+				<span class="callout__label">memcached 没有 ping</span>
+				协议本身没有连通性探测，所以 <code>Open</code> <b>永远不会在启动时失败</b>——
+				第一条命令才会失败，和 redis 的 <code>Open</code>（先 ping）不同。
+				失败时程序打印 <code>fatal:</code> 与一行 <code>hint</code>（提示 <code>make dev</code>）后退出。
+			</div>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>写入</b>：<code>SetJSON(key, v, ttl)</code>，JSON 序列化后带 TTL 存入。</li>
+				<li><b>读回</b>：<code>memcache.GetJSON[session](c, key)</code>，包级泛型函数。</li>
+				<li><b>miss 不是错误</b>：未命中返回 <code>(zero, false, nil)</code>，
+					只有网络错误或内容损坏才返回 <code>err</code>。</li>
+				<li><b>只续期不改值</b>：<code>Touch(key, ttl)</code> 延长存活时间，不重写内容。</li>
+				<li><b>删除幂等</b>：<code>Delete</code> 删一个不存在的 key 也不报错。</li>
+			</ul>
+
+			<h2>五步流程</h2>
+			<p>
+				下面这段来自 <code>examples/memcache/main.go</code> 的主体。
+				每一步都打印一行结果，所以直接看 stdout 就知道每步的语义。
+			</p>
+			<pre><code class="language-go">// 1. Write.
+if err := c.SetJSON(*key, want, *ttl); err != nil {
+	fail(err)
+}
+fmt.Printf("set      %s (ttl=%s)\n", *key, *ttl)
+
+// 2. Read back.
+got, ok, err := memcache.GetJSON[session](c, *key)
+if err != nil {
+	fail(err)
+}
+if !ok {
+	fail(fmt.Errorf("expected a hit for %s", *key))
+}
+
+// 3. A miss is (zero, false, nil), never an error.
+if _, ok, err := memcache.GetJSON[session](c, *key+":absent"); err != nil || ok {
+	fail(fmt.Errorf("expected a miss, got ok=%v err=%v", ok, err))
+}</code></pre>
+			<p>
+				<code>Touch</code> 只续期，读到的值不变；键的 TTL 精度是<b>秒</b>，
+				所以不要传小于 <code>1s</code> 的 TTL。
+			</p>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    A["SetJSON key ttl"] --> B{"GetJSON"}
+    B -- hit --> C["返回值 + ok=true"]
+    B -- miss --> D["零值 + ok=false + err=nil"]
+    C --> E["Touch 延长 TTL"]
+    E --> F["Delete"]
+    F --> G["再读 = miss"]
+    D --> F
+    classDef hit fill:#eef7f0,stroke:#2f7d4f,color:#22372a
+    classDef miss fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class C hit
+    class D miss
+				</pre>
+				<figcaption>
+					示例的五步。miss 走橙色分支：它是 <code>ok=false</code> 加 <code>err=nil</code>，
+					调用方靠 <code>ok</code> 判断，不靠错误。
+				</figcaption>
+			</figure>
+
+			<h2>验证</h2>
+			<p>用默认参数跑一遍，stdout 大致如下：</p>
+			<pre><code class="language-bash">$ go run ./examples/memcache
+set      example:session:42 (ttl=1m0s)
+get      hit  → user_id=42 token=tk-42 at=2026-10-18T09:12:00Z
+get      miss → ok=false err=nil（miss 不报错）
+touch    example:session:42 (ttl=2m0s)
+delete   → 再读是 miss（Delete 删不存在的 key 也不报错）</code></pre>
+			<p>
+				换 key 或 TTL 重跑：<code>go run ./examples/memcache -key other:key -ttl 5s</code>。
+			</p>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> <b>不用真的 memcached</b>：它用一个进程内的假服务
+				（<code>fakeMemcached</code>），在临时端口上跑一个只实现文本协议的 TCP server，
+				支持 <code>gets</code>/<code>set</code>/<code>touch</code>/<code>delete</code>——
+				正好是示例会调用的那几个命令，所以测试完全离线。
+				测试钉住：写入后读回字段一致；miss 是 <code>(zero, false, nil)</code>；
+				<code>Touch</code> 后仍可读；删除后再读是 miss；<b>删除一个不存在的 key 不报错</b>。
+			</p>
+			<pre><code class="language-bash">go test ./examples/memcache</code></pre>
+
+			<h2>相关</h2>
+			<ul>
+				<li><a href="../guide/concepts/cache.html">缓存模式</a>：缓存读写的通用约定。</li>
+				<li><a href="redis.html">examples/redis</a>：带 ping、分布式锁与 Lua 的 redis 后端。</li>
+				<li><a href="cache.html">examples/cache</a>：在 redis 上做并发合并与 TTL 抖动。</li>
+				<li>Skill：<code>skills/matex-setup-memcache/SKILL.md</code>。</li>
+				<li><a href="index.html">示例索引</a>。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

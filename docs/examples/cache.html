@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>cache — 防击穿与防雪崩 — matex</title>
+		<meta
+			name="description"
+			content="examples/cache：GetOrLoad 把并发 miss 合并成一次回源，TTL 抖动防同时过期，写后失效。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/cache">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>cache — 防击穿与防雪崩</h1>
+			<p class="lede">
+				<code>pkg/core/cache</code> 补的是 redis 客户端<b>给不了</b>的两个模式，它们只在压力下
+				才暴露：一个热 key 到期时所有在途请求同时回源（击穿），以及一批一起写入的 key
+				一起到期（雪崩）。<code>GetOrLoad</code> 把并发 miss 合并成一次回源，并给每条 TTL
+				加随机抖动。
+			</p>
+
+			<h2>运行</h2>
+			<p>
+				需要 Redis，先 <code>make dev</code>。HTTP 默认监听 <code>:8083</code>
+				（避开多数示例用的 <code>:8080</code>），配置文件是目录里的
+				<code>config.yaml</code>，<code>-conf</code> 默认指向它。
+			</p>
+			<pre><code class="language-bash">make dev                      # 起 redis
+go run ./examples/cache       # 等价于 make example NAME=cache</code></pre>
+			<div class="callout callout--note">
+				<span class="callout__label">删掉 redis 段也能跑</span>
+				<code>Setup</code> 用 <code>env.Redis()</code> 逗号-ok 取，取不到就让
+				<code>s.redis</code> 保持 nil。<code>GetOrLoad</code> 遇到 nil client 直接回源、
+				不缓存，<b>调用点不用写 <code>if client != nil</code></b>。
+			</div>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>cache-aside 命中/未命中</b>：第一次读回源（假查询故意慢 50ms），
+					第二次读直接命中。</li>
+				<li><b>并发 miss 合并（防击穿）</b>：同一 key 的 N 个并发请求只产生
+					<b>一次</b>回源。</li>
+				<li><b>TTL 抖动（防雪崩）</b>：每条 TTL 再随机减掉最多 <code>jitter</code>
+					（示例 5s，配置项 <code>cache.jitter</code>）。</li>
+				<li><b>写后失效</b>：<code>PUT</code> 删缓存而非更新缓存，下一次读必然回源拿到新值。</li>
+				<li><b>回源失败不写缓存</b>：错误原样返回，下一次请求重新尝试。</li>
+				<li><b>可观测的回源次数</b>：<code>/api/v1/stats</code> 暴露
+					<code>source_reads</code>，让"合并生效"看得见。</li>
+			</ul>
+
+			<h2>调用点</h2>
+			<p>
+				来自 <code>examples/cache/main.go</code> 的 <code>getUser</code>。
+				回源函数只包住<b>那一次查询</b>，不是整个 handler；<code>errNotFound</code>
+				被映射成 <code>404</code> 而不是 <code>500</code>。
+			</p>
+			<pre><code class="language-go">u, err := cache.GetOrLoad(ctx, s.redis, cache.Key("user", id),
+	cache.Config{TTL: s.cfg.TTL, Jitter: s.cfg.Jitter},
+	func(ctx context.Context) (User, error) {
+		return s.users.load(ctx, id)
+	})
+switch {
+case errors.Is(err, errNotFound):
+	return nil, errs.NotFound(40401, "user %s not found", id)
+case err != nil:
+	return nil, errs.Internal(50001, "load user: %v", err)
+}
+return map[string]any{"user": u, "source_reads": s.users.reads()}, nil</code></pre>
+
+			<h2>写后失效</h2>
+			<p>
+				来自 <code>putUser</code>。<b>删除而不是更新</b>：并发写者下先写 DB 再写缓存有窗口
+				会被旧值覆盖，先写 DB 再删缓存则任何顺序都安全。失效失败只记 warn，不让写请求失败。
+			</p>
+			<pre><code class="language-go">u, err := s.users.save(id, req.Name)
+if err != nil {
+	return nil, err
+}
+// Invalidate rather than update: the next read reloads, and a concurrent
+// writer cannot leave a stale value behind.
+if err := cache.Invalidate(ctx, s.redis, cache.Key("user", id)); err != nil {
+	obs.Warn(ctx, "invalidating the cache failed", "id", id, "err", err)
+}
+return map[string]any{"user": u, "invalidated": true}, nil</code></pre>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    participant R1 as 请求 1
+    participant R2 as 请求 2..N
+    participant SF as singleflight（按 key 合并）
+    participant DB as 回源（userStore.load）
+    R1->>SF: GetOrLoad(key)
+    R2->>SF: GetOrLoad(key)
+    Note over SF: 同一 key 只跑一个 load
+    SF->>DB: load(ctx)  ← 只有一次
+    DB-->>SF: User
+    SF-->>R1: 值
+    SF-->>R2: 同一个值
+				</pre>
+				<figcaption>
+					击穿合并。N 个并发 miss 落到同一个 key 上，只有第一个真正回源，
+					其余等它的结果。回源跑在<b>第一个调用者的 ctx</b> 下。
+				</figcaption>
+			</figure>
+			<div class="callout callout--warn">
+				<span class="callout__label">别把回源挂在随时会取消的短 ctx 上</span>
+				回源跑在第一个调用者的 ctx 下，它放弃时这一组请求会一起失败——这是刻意的取舍：
+				另一种做法是让一个调用者早就跑掉的请求继续占着数据库连接。
+			</div>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash">curl -s localhost:8083/api/v1/users/1        # miss：~50ms，回源一次
+curl -s localhost:8083/api/v1/users/1        # hit：很快，不回源
+curl -s localhost:8083/api/v1/stats          # 看回源了多少次
+
+# 并发 miss 合并成一次回源
+for i in $(seq 1 20); do curl -s -o /dev/null localhost:8083/api/v1/users/2 &amp; done; wait
+curl -s localhost:8083/api/v1/stats          # source_reads 只 +1
+
+# 写后失效：下一次读重新回源
+curl -s -X PUT localhost:8083/api/v1/users/1 -d '{"name":"alice v2"}'</code></pre>
+			<p>
+				<code>GET /api/v1/users/{id}</code> 返回
+				<code>{"code":0,"msg":"ok","data":{"source_reads":1,"user":{"id":"1","name":"alice"}}}</code>；
+				<code>PUT</code> 返回 <code>{"user":{"id":"1","name":"alice v2"},"invalidated":true}</code>。
+				<code>GET /api/v1/stats</code> 返回 <code>{"source_reads":N}</code>。
+			</p>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 用 <code>redistest.Start(t)</code>（miniredis）
+				加 <code>httptest</code> 走真实路由，完全离线。它钉住五件事：
+				<b>命中不产生第二次回源</b>、<b>8 个并发请求只回源一次</b>（击穿合并）、
+				<b>写后失效迫使重新回源并读到新值</b>、<b>不存在的用户回 <code>404</code> 且
+				结果不被缓存</b>（连续两次都是 <code>40401</code>，回源计数为 2）、
+				<b>没有 redis 时每个请求都回源</b>（无 client 分支）；另外还覆盖空 name / 坏 body
+				回 <code>400</code>，以及配置默认值 <code>TTL=30s</code> / <code>Jitter=5s</code>。
+			</p>
+			<pre><code class="language-bash">go test ./examples/cache</code></pre>
+
+			<h2>相关</h2>
+			<ul>
+				<li><a href="../guide/concepts/cache.html">缓存模式</a>：击穿、雪崩与失效策略。</li>
+				<li><a href="redis.html">examples/redis</a>：底层的 redis JSON 读写与分布式锁。</li>
+				<li><a href="database.html">examples/database</a>：真实的回源来源（DAO 与事务）。</li>
+				<li>Skill：<code>skills/matex-setup-cache/SKILL.md</code>。</li>
+				<li><a href="index.html">示例索引</a>。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

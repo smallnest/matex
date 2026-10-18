@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>架构总览 — matex</title>
+		<meta name="description" content="matex 的启动序列、分层依赖方向，以及由 depguard 强制的一致性守卫。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="guide/architecture">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>架构总览</h1>
+			<p class="lede">
+				两条主线：<b>纵向</b>是 <code>verticle.Run</code> 的启动序列，<b>横向</b>是
+				<code>cmd → internal → pkg/core</code> 的依赖方向。前者决定服务怎么活起来，
+				后者决定代码往哪放。
+			</p>
+
+			<h2>分层与依赖方向</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    subgraph bin["可执行文件"]
+        CMD["cmd/&lt;service&gt;<br/>main 只做一件事：verticle.Run"]
+    end
+    subgraph internal["internal/ — 业务代码"]
+        APP["app/<br/>实现 verticle.Service<br/>装配 domain"]
+        DOM["domain/&lt;name&gt;/<br/>handler.go · service.go · dao.go"]
+    end
+    subgraph core["pkg/core/ — 基础设施（唯一入口）"]
+        V["verticle · app"]
+        H["httpx · errs · obs · config"]
+        D["db · redis · memcache · kafka"]
+        R["auth · ratelimit · breaker · retry<br/>idempotency · cache · cron"]
+    end
+    DEPS["第三方驱动<br/>pgx · go-redis · franz-go<br/>rpcx · grpc"]
+    CMD --> APP
+    APP --> DOM
+    APP --> V
+    DOM --> H
+    DOM --> D
+    DOM --> R
+    D -.-> DEPS
+    classDef guard fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class core guard
+				</pre>
+				<figcaption>
+					业务代码（<code>internal/</code>）只能经 <code>pkg/core/*</code> 触碰第三方驱动：
+					实线是允许的调用方向，虚线只存在于 <code>pkg/core</code> 内部。
+					这条规则由 depguard 强制，不靠 review 提醒。
+				</figcaption>
+			</figure>
+
+			<h3>每个目录的职责</h3>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>路径</th>
+							<th>职责</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>cmd/&lt;service&gt;/</code></td>
+							<td>一个二进制一个部署单元；<code>main</code> 只调 <code>verticle.Run</code>。</td>
+						</tr>
+						<tr>
+							<td><code>internal/app/</code></td>
+							<td>实现 <code>verticle.Service</code>，把基础设施句柄装配进 domain。</td>
+						</tr>
+						<tr>
+							<td><code>internal/domain/&lt;name&gt;/</code></td>
+							<td>
+								一个业务域三件套：<code>handler.go</code>（HTTP 边界）、
+								<code>service.go</code>（业务）、<code>dao.go</code>（数据）。
+							</td>
+						</tr>
+						<tr>
+							<td><code>pkg/core/*</code></td>
+							<td>基础设施。业务只准从这里进（depguard 强制），第三方驱动被关在里面。</td>
+						</tr>
+						<tr>
+							<td><code>configs/</code></td>
+							<td>框架段 + 每服务一段，段 key 等于 <code>Service.Name()</code>。</td>
+						</tr>
+						<tr>
+							<td><code>migrations/</code></td>
+							<td>按文件名序执行，只追加不修改已有文件。</td>
+						</tr>
+						<tr>
+							<td><code>examples/&lt;feature&gt;/</code></td>
+							<td>每个能力一个可运行示例，离线可跑、带测试——所以 CI 能验证它们。</td>
+						</tr>
+						<tr>
+							<td><code>skills/</code></td>
+							<td>给 AI 的接入规范，与 <code>AGENTS.md</code> 一起充当"生成器"。</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>启动序列</h2>
+			<p>
+				<code>verticle.Run</code> 的每一步都是 fail-fast：任何一步返回错误，启动就停在那里，
+				不会带着半初始化状态开始服务。
+			</p>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    A["config.LoadMap(path)"] --> B["框架段 ParseMap + 服务段<br/>按 Service.Name() 取"]
+    B --> C["obs.Init<br/>日志先行，后面每步都有日志"]
+    C --> D{"trace 段配了吗"}
+    D -->|配了| D1["obs.InitTracing<br/>OTLP exporter"]
+    D -->|没配| D2["no-op，零开销"]
+    D1 --> E["未知框架键告警<br/>typo 不再静默"]
+    D2 --> E
+    E --> F["feature.Configure<br/>灌入 feature: 段"]
+    F --> G{"各基础设施段"}
+    G --> G1["db · redis · memcache · kafka · auth<br/>配了才建，未配为 nil"]
+    G1 --> H["svc.Setup(ctx, env)<br/>解码服务段、装配 domain"]
+    H --> I["httpx.New + svc.BuildRouter<br/>/healthz /readyz /metrics /version"]
+    I --> J{"实现了 Registrar 吗"}
+    J -->|GRPCRegistrar| J1["监听 grpc.addr"]
+    J -->|RPCXRegistrar| J2["监听 rpcx.addr"]
+    J -->|都没有| J3["告警且不监听<br/>避免空端口被探活误判"]
+    J1 --> K["运行"]
+    J2 --> K
+    J3 --> K
+    K --> L["信号 / ctx 取消"]
+    L --> M["优雅退出：停 Block → 停 HTTP 排空<br/>→ flush trace → 关基础设施"]
+    classDef decision fill:#f5f2ee,stroke:#8a8378,color:#2b2722
+    class D,G,J decision
+				</pre>
+				<figcaption>
+					注意第 3 步：日志在一切之前初始化，所以后面任何一步失败都有结构化日志可看。
+					另一个容易忽略的是 gRPC/rpcx 的监听条件——只配了地址但服务没实现对应接口时，
+					它不会监听端口，因为一个空端口会让 K8s 探活误判为健康。
+				</figcaption>
+			</figure>
+
+			<h3>优雅退出的顺序</h3>
+			<pre><code class="language-go">// 顺序（app 包保证）：
+// 1. 停止 Block 里注册的后台任务（定时任务、消费者循环）
+// 2. 关闭 HTTP server，排空在途请求
+// 3. flush 链路追踪的 span
+// 4. 逆序执行 AddCloser 注册的清理函数，最后关基础设施连接
+
+env.Block("cron", s.sched.Run)                    // 随 ctx 取消而停
+env.AddCloser(func() { flushMetrics() })          // 逆序执行，后注册的先跑
+</code></pre>
+			<p>
+				顺序是有理由的：后台任务先停，才不会在 HTTP 排空期间继续产生新工作；
+				基础设施最后关，才能在排空前把请求真正做完。
+			</p>
+
+			<h2>请求的生命周期</h2>
+			<p>
+				HTTP 侧的每一层也是显式的。两个中间件槽的区别值得记住：
+				<code>Use</code> 走封套（能返回 <code>errs</code> 短路，不碰
+				<code>ResponseWriter</code>），<code>UseOuter</code> 在 mux 外层
+				（能改响应头、覆盖 <code>/healthz</code> 与 <code>HandleRaw</code>）。
+			</p>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as 客户端
+    participant G as guard<br/>panic 恢复 · 体积限制
+    participant S as SecureHeaders<br/>默认安全响应头
+    participant O as UseOuter 中间件<br/>CORS · gzip · RealIP
+    participant M as mux
+    participant W as wrap<br/>trace id · 超时 · 封套
+    participant MW as Use 中间件<br/>认证 · 限流 · 幂等
+    participant H as Handler
+    C->>G: 请求
+    G->>S: 放行
+    S->>O: 安全头已就位
+    O->>M: 路由匹配
+    M->>W: 命中注册的 handler
+    W->>W: 开 server span，定 X-Request-ID
+    W->>MW: ctx（带 trace id + 超时）
+    MW->>H: ctx + *http.Request
+    H-->>MW: (any, error)
+    MW-->>W: 结果
+    W->>W: 渲染封套 · 记访问日志与指标
+    W-->>C: 响应
+				</pre>
+				<figcaption>
+					超时的 ctx 与连接的 ctx 是<b>分离</b>的：handler 的 ctx 由
+					<code>context.WithoutCancel</code> 派生。这样客户端断连不会被报成服务端超时，
+					而 handler 还能把副作用（以及幂等结果）完整写下去。
+				</figcaption>
+			</figure>
+
+			<h2>一致性契约</h2>
+			<p>四条约定，前两条被 lint 强制，后两条被测试与例子的存在形态保证。</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>约定</th>
+							<th>强制方式</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>业务代码不 import 驱动库</td>
+							<td>depguard <code>internal-no-drivers</code> / <code>examples-no-drivers</code></td>
+						</tr>
+						<tr>
+							<td>业务代码不 import Web 框架</td>
+							<td>depguard <code>no-web-frameworks</code></td>
+						</tr>
+						<tr>
+							<td>handler 签名统一</td>
+							<td>类型系统——<code>srv.Handle</code> 只接受 <code>HandlerFunc</code></td>
+						</tr>
+						<tr>
+							<td>每个能力有可运行的离线示例 + 测试</td>
+							<td><code>make ci</code> 会跑 <code>./examples/...</code>，示例坏了 CI 就红</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>下一步</h2>
+			<ul>
+				<li><a href="concepts/service.html">服务与生命周期</a>：<code>Env</code> 访问器与后台任务的细节。</li>
+				<li><a href="concepts/http.html">HTTP 与路由</a>：写第一个 handler。</li>
+				<li><a href="reference/layout.html">目录与约定</a>：一页速查。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

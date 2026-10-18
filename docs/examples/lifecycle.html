@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>lifecycle 示例 — matex</title>
+		<meta name="description" content="examples/lifecycle：verticle.Service 的三个方法、env.Block 后台任务、AddCloser 清理栈、配置热更、自定义就绪门与优雅退出。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/lifecycle">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>lifecycle — 服务生命周期</h1>
+			<p class="lede">
+				一个部署单元就是一个实现了 <code>verticle.Service</code> 的类型：<code>Name()</code>、
+				<code>Setup(ctx, env)</code>、<code>BuildRouter(srv)</code>，剩下的启动、后台任务、
+				热更、优雅退出都由 <code>verticle.Run</code> 驱动。这个示例把四个可选钩子
+				（<code>Block</code>、<code>AddCloser</code>、<code>ConfigWatcher</code>、<code>ReadyChecker</code>）
+				全部接上，改一次配置文件就能看到热更生效。
+			</p>
+
+			<h2>运行</h2>
+			<pre><code class="language-bash">go run ./examples/lifecycle
+
+curl -i localhost:8080/readyz                        # 前 3s 是 503（ready_window 预热）
+sleep 4; curl -i localhost:8080/readyz               # 之后 200
+curl -i localhost:8080/api/v1/greeting/world
+
+# 热更：改 examples/lifecycle/config.yaml 里的 greeting，保存
+# 日志立刻出现 "config reloaded"，接口返回值跟着变，不用重启
+
+# Ctrl-C：观察优雅退出的顺序</code></pre>
+			<p>
+				没有外部依赖，不需要 <code>make dev</code>。监听 <code>:8080</code>；
+				<code>-conf</code> 默认指向 <code>examples/lifecycle/config.yaml</code>。
+				配置文件里 <code>ready_window</code> 是 <code>3s</code>，所以刚启动的三秒内
+				<code>/readyz</code> 会返回 503。
+			</p>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>Service 的三个方法</b>：<code>Name()</code> 同时是配置段 key、日志前缀与 metrics label。</li>
+				<li><b>后台任务</b>：<code>env.Block("heartbeat", fn)</code> 随应用启动，ctx 取消时必须返回。</li>
+				<li><b>清理栈</b>：<code>env.AddCloser(fn)</code> 注册的清理函数<b>逆序</b>执行。</li>
+				<li><b>配置热更</b>：实现 <code>OnServiceConfigChange(raw map[string]any)</code>，只有服务专属段会热更。</li>
+				<li><b>就绪门</b>：实现 <code>Ready(ctx) error</code>，叠加在默认的就绪检查之上（默认已会 ping 已配置的基础设施）。</li>
+				<li><b>退出顺序</b>：SIGINT/SIGTERM 之后是 http drain → blocks → closers → infra close。</li>
+			</ul>
+
+			<h2>后台任务与清理栈</h2>
+			<p>
+				这段来自 <code>examples/lifecycle/main.go</code> 的 <code>Setup</code>。
+				注意 <code>Block</code> 里的循环在 <code>ctx.Done()</code> 时必须返回；
+				注释也点明了失败语义：返回非 nil 的 error 会中止整个应用。
+			</p>
+			<pre><code class="language-go">// A background task: it starts with the app and must return when ctx
+// is done (returning a non-nil error aborts the whole app).
+env.Block("heartbeat", func(ctx context.Context) error {
+	t := time.NewTicker(s.heartbeat())
+	defer t.Stop()
+	for {
+		select {
+		case &lt;-ctx.Done():
+			obs.Info(ctx, "heartbeat stopped")
+			return nil
+		case &lt;-t.C:
+			obs.Info(ctx, "heartbeat", "greeting", s.greeting())
+		}
+	}
+})
+
+// Cleanup. Closers run in reverse order, and infrastructure closers
+// registered by Run are further out, so: http drain → blocks →
+// your closers → infra close.
+env.AddCloser(func() {
+	obs.Info(context.Background(), "service closer: flushing in-flight work")
+})</code></pre>
+
+			<h2>热更与就绪门</h2>
+			<p>
+				同一份文件里的另外两个钩子。热更时的关键细节是：解析失败就保持旧值，
+				并且因为 watcher 与 handler 并发，配置的读写要加锁。
+			</p>
+			<pre><code class="language-go">// OnServiceConfigChange is the hot-reload hook: the watcher calls it with
+// the new service section after config.yaml changed (debounced).
+func (s *lifecycleService) OnServiceConfigChange(raw map[string]any) {
+	var cfg lifecycleConfig
+	if err := config.ParseMap(raw, &amp;cfg); err != nil {
+		obs.Warn(context.Background(), "reload rejected", "err", err)
+		return
+	}
+	s.mu.Lock()
+	before := s.cfg
+	s.cfg = cfg
+	s.mu.Unlock()
+	obs.Info(context.Background(), "config reloaded",
+		"greeting_before", before.Greeting, "greeting_after", cfg.Greeting,
+		"heartbeat", cfg.Heartbeat)
+}</code></pre>
+
+			<h2>退出时的先后顺序</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    S["启动<br/>加载 config → obs.Init → metrics"] --> I["初始化配了的基础设施<br/>db / redis / memcache / kafka"]
+    I --> SU["svc.Setup(ctx, env)<br/>Block 注册 · AddCloser 注册"]
+    SU --> H["httpx server<br/>/healthz /readyz /metrics"]
+    H --> BR["svc.BuildRouter(srv)"]
+    BR --> RUN["开始服务 + 监听配置变化"]
+    RUN --> SIG["SIGINT / SIGTERM"]
+    SIG --> D["1. http drain（10s）"]
+    D --> B["2. 等 blocks 退出（10s）"]
+    B --> C["3. closers（逆序）"]
+    C --> INF["4. infra close"]
+    classDef rev fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class C rev
+				</pre>
+				<figcaption>
+					退出阶段是严格的反向拆解：先停入口流量，再停后台任务，再跑你的清理，
+					最后才关基础设施——否则区块可能在一个已经关掉的数据库上继续跑。
+					<code>closers</code> 内部本身也是逆序的。
+				</figcaption>
+			</figure>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash">curl -i localhost:8080/readyz
+# 启动后 3s 内：503（Ready 返回 errs.Unavailable(50301, "warming up")）
+# 3s 之后：200
+
+curl -i localhost:8080/api/v1/greeting/world
+# 200 {"code":0,"msg":"ok","data":{"greeting":"Hello, world!"}}
+
+curl -i localhost:8080/api/v1/uptime
+# 200 data 里有 "uptime":"12s" 这类值（四舍五入到秒）</code></pre>
+			<p>热更验证：把 <code>config.yaml</code> 里的 <code>greeting</code> 改成 <code>"Yo, "</code> 保存，标准输出会立刻出现一行</p>
+			<pre><code class="language-text">{"level":"INFO","msg":"config reloaded","greeting_before":"Hello, ","greeting_after":"Yo, ",…}</code></pre>
+			<p>
+				再请求 <code>/api/v1/greeting/world</code> 就得到 <code>"Yo, world!"</code>。
+				Ctrl-C 之后，日志会依次显示 <code>heartbeat stopped</code> 与
+				<code>service closer: flushing in-flight work</code>——顺序正是上面那张图。
+			</p>
+
+			<h2>测试</h2>
+			<p><code>main_test.go</code> 针对热更与就绪门断言：</p>
+			<ul>
+				<li><code>TestConfigReloadSwapsTheGreeting</code>：喂进
+					<code>{"greeting":"Yo, ","heartbeat":"1s"}</code> 后，
+					<code>greeting()</code> 是 <code>"Yo, "</code>，<code>heartbeat()</code> 是 <code>1s</code>。</li>
+				<li><code>TestConfigReloadRejectsBadValues</code>：<code>heartbeat</code> 给一个非法时长
+					（<code>"not-a-duration"</code>）会让 <code>ParseMap</code> 失败，
+					此时配置必须原封不动——<code>greeting</code> 仍是 <code>"keep me"</code>，
+					<code>heartbeat</code> 仍是 <code>1m</code>。</li>
+				<li><code>TestReadyWindow</code>：<code>ReadyWindow</code> 为 <code>time.Minute</code>
+					且刚启动时 <code>Ready</code> 必须返回错误；改成 0 之后返回 nil。</li>
+				<li><code>TestGreetHandler</code>：直接调用 <code>greet</code>，返回的
+					<code>greeting</code> 是 <code>"Hi world!"</code>。</li>
+			</ul>
+			<pre><code class="language-bash">go test ./examples/lifecycle</code></pre>
+
+			<h2>相关</h2>
+			<div class="cards">
+				<a class="card" href="../guide/concepts/service.html">
+					<span class="card__title">服务与生命周期概念页</span>
+					<span class="card__desc">Service 接口、Env 访问器、可选钩子与退出顺序。</span>
+				</a>
+				<a class="card" href="../guide/concepts/config.html">
+					<span class="card__title">配置</span>
+					<span class="card__desc">只有服务专属段热更，框架段要重启。</span>
+				</a>
+				<a class="card" href="index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">全部 19 个可运行示例。</span>
+				</a>
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="config.html">examples/config</a>：<code>ParseMap</code> 与 tag 语义。</li>
+				<li><a href="cron.html">examples/cron</a>：把 scheduler 挂到 <code>env.Block</code> 上。</li>
+				<li><a href="observability.html">examples/observability</a>：日志、相关 id 与指标。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

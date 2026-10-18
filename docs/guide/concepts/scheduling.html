@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>定时任务 — matex</title>
+		<meta name="description" content="matex 的 cron：三种调度形态、env.Block 注册、redis claim 持有整个时间槽的多副本选主，以及 redis 不可用时的行为。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/scheduling">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>定时任务</h1>
+			<p class="lede">
+				<code>pkg/core/cron</code> 解决的是一个很具体的问题：多副本部署下，
+				一个定时任务每个周期只跑一次，而不是每个副本各跑一次。
+				做法是每个副本都起自己的定时器，到点抢一个以 job 命名的 redis 认领。
+			</p>
+
+			<h2>三种调度形态</h2>
+			<p>
+				一个 <code>cron.Job</code> 必须<b>恰好</b>设置 <code>Interval</code> /
+				<code>Schedule</code> / <code>At</code> / <code>Delay</code> 中的一个，
+				多设或全不设在 <code>Add</code> 时 panic。
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>形态</th>
+							<th>字段</th>
+							<th>语义</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>固定周期</td>
+							<td><code>Interval time.Duration</code></td>
+							<td>每 N 时间跑一次。它<b>同时是认领的 TTL</b>，所以一次运行必须远快于它</td>
+						</tr>
+						<tr>
+							<td>cron 表达式</td>
+							<td><code>Schedule string</code></td>
+							<td>标准 5 段（<code>"0 9 * * *"</code>）加 <code>@every 5m</code> / <code>@daily</code> 这类描述符，按调度器本地时区。表达式在 <code>Add</code> 时解析，非法即启动失败</td>
+						</tr>
+						<tr>
+							<td>一次性（绝对时刻）</td>
+							<td><code>At time.Time</code></td>
+							<td>到点跑一次。时间已过则在启动时立刻跑</td>
+						</tr>
+						<tr>
+							<td>一次性（相对延迟）</td>
+							<td><code>Delay time.Duration</code></td>
+							<td>调度器启动后 N 时间跑一次，与 <code>At</code> 互斥</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				其余两个字段：<code>Name</code> 是 job 的标识，同时也是锁 key 与日志字段；
+				<code>Run func(ctx context.Context) error</code> 干活，ctx 在调度器关闭时取消。
+				<code>RunOnStart</code> 让 interval job 在启动时立刻跑一次、不等第一个周期，
+				它<b>只对 interval job 有效</b>，配在别的形态上 <code>Add</code> 会 panic。
+			</p>
+			<pre><code class="language-go">sched := cron.New(cron.Config{
+    Redis:   rc,               // nil = 单副本，不做选主（rc 来自 env.Redis()）
+    Timeout: s.cfg.JobTimeout, // 单次运行的上限
+})
+sched.Add(
+    cron.Job{Name: "heartbeat", Interval: heartbeat, RunOnStart: true, Run: s.heartbeat},
+    cron.Job{Name: "reconcile", Interval: reconcile, Run: s.reconcile},
+    cron.Job{Name: "report", Schedule: report, Run: s.report},
+    cron.Job{Name: "notify", Delay: notify, Run: s.notify},
+)</code></pre>
+			<p>
+				参数非法（缺 <code>Name</code>、缺 <code>Run</code>、调度没恰好设一个、坏 cron 表达式、
+				<code>RunOnStart</code> 配在非 interval job 上）一律在 <code>Add</code> 时 panic：
+				配错的定时任务应该在启动时报错，而不是几周后才发现它从没跑过。
+			</p>
+
+			<h2>用 env.Block 注册</h2>
+			<pre><code class="language-go">func (s *cronService) Setup(ctx context.Context, env *verticle.Env) error {
+    if err := env.DecodeService(&s.cfg); err != nil {
+        return err
+    }
+    rc, ok := env.Redis()
+    s.sched = cron.New(cron.Config{Redis: rc, Timeout: s.cfg.JobTimeout})
+    s.sched.Add(s.jobs(...)...)
+
+    // verticle 启动它、退出时取消它——在关掉基础设施之前
+    env.Block("cron", s.sched.Run)
+    return nil
+}</code></pre>
+			<p>
+				<code>Scheduler.Run(ctx)</code> 阻塞到 ctx 取消，然后等正在跑的 job 返回。
+				交给 <code>env.Block</code> 而不是自己 <code>go sched.Run(ctx)</code>，
+				是因为 <code>verticle</code> 保证关闭顺序：<b>先停 job，再关 DB / redis</b>。
+				反过来 job 会在已经关掉的连接上跑。
+			</p>
+			<p>配置侧不需要额外开关，配了 <code>redis:</code> 段就自动选主：</p>
+			<pre><code class="language-yaml"># 配了 → 多副本之间选主，每个周期只跑一个
+# 没配 → 每副本都跑（适合单副本）
+redis:
+  addr: ${REDIS_ADDR:localhost:6379}</code></pre>
+
+			<h2>关键设计：认领持有整个时间槽</h2>
+			<p>
+				这是这个包唯一必须记住的实现细节：<b>认领不在 job 跑完后释放</b>，
+				而是让它自然过期。原因是各副本的定时器<b>不同步</b>——每个进程的启动时刻不同。
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant A as 副本 A（t=0,10,20…）
+    participant R as redis
+    participant B as 副本 B（t=5,15,25…）
+    Note over A,B: interval = 10ms，两台机器的定时器错开 5ms
+    A->>R: Claim("cron:job", ttl=10ms)
+    R-->>A: true，A 拿到这个槽
+    A->>A: Run 执行，1ms 后返回
+    Note over A,R: 认领不释放，继续占用到 t=10
+    B->>R: Claim("cron:job") 在 t=5
+    R-->>B: false —— 这个槽已被占用
+    Note over B: 跳过本次 tick
+    Note over R: t=10 认领自然过期
+    A->>R: 重新 Claim 下一个槽
+    R-->>A: true
+				</pre>
+				<figcaption>
+					若认领在 run 结束时就释放，B 在自己的 t=5 tick 上会抢到一个空的 claim，
+					于是每个周期执行两次，选主形同虚设。让 claim 活满一整个 interval，
+					语义就变成"这个周期已被占用"。
+				</figcaption>
+			</figure>
+			<p>三种形态的槽长度：</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>形态</th>
+							<th>认领 TTL</th>
+							<th>后果</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>Interval</code></td>
+							<td><code>Job.Interval</code> 本身</td>
+							<td>run 必须远小于 interval。interval 5s 却跑了 8s，另一个副本会在它还没结束时接下同一个逻辑周期——用 <code>Config.Timeout</code> 兜底</td>
+						</tr>
+						<tr>
+							<td><code>Schedule</code></td>
+							<td>本 cron 槽的长度（下一次触发 − 本次触发）</td>
+							<td>错峰副本在同一槽内抢不到 claim，所以每槽只跑一次。错过不补跑，和主机 cron 一致</td>
+						</tr>
+						<tr>
+							<td><code>At</code> / <code>Delay</code></td>
+							<td><b>永不</b>过期（<code>SetNX</code> 不带 TTL）</td>
+							<td>抢到一次就永久占用，跨副本<b>最多执行一次</b>：哪怕某次运行失败也不会自动重试</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				一次性任务的承诺是 at-most-once——宁可漏，不可双跑。一次失败就是一个 error 日志，
+				剩下的交给人工。单副本（不配 redis）则无条件跑一次。
+			</p>
+
+			<h2>Name 就是锁 key</h2>
+			<ul>
+				<li>多副本必须用<b>同一个</b> job 名——这正是选主的前提。</li>
+				<li>不同 job 必须用<b>不同</b>名字，否则会互相吞掉对方的周期。</li>
+			</ul>
+			<p>
+				key 由 <code>Config.Prefix</code>（默认 <code>"cron:"</code>）加 job 名组成，
+				底层是 <code>redis.Client.Claim(ctx, key, ttl)</code>——一次 <code>SetNX</code>。
+				它与 <code>TryLock</code> 的区别就在返回值里的那个决定：<code>Claim</code> 的调用方
+				<b>从不释放</b>，键交给 TTL 自然过期；<code>TryLock</code> 返回一个释放函数，
+				适合"做完就交还"的场景。
+			</p>
+
+			<h2>运行失败与依赖不可用</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>情况</th>
+							<th>行为</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>interval / cron job 返回 error</td>
+							<td>记 error 日志，<b>下一轮照常跑</b>——一次坏运行不会停掉循环</td>
+						</tr>
+						<tr>
+							<td>一次性 job 返回 error</td>
+							<td>记 error 日志，<b>不再重试</b>（认领已永久占用）</td>
+						</tr>
+						<tr>
+							<td>redis 不可用</td>
+							<td><b>跳过这个周期</b>，记一条 warn。宁可漏一轮，也不让所有副本一起跑——那是一次惊群</td>
+						</tr>
+						<tr>
+							<td>抢不到认领</td>
+							<td>静默返回（另一个副本持有这个槽），这不是错误</td>
+						</tr>
+						<tr>
+							<td>run 超过 <code>Config.Timeout</code></td>
+							<td>ctx 被取消，job 自己决定怎么收尾（<code>Timeout</code> 为零则由调度器的 ctx 唯一约束）</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>每次运行结束都有一条日志：成功的记 <code>dur_ms</code>，失败的额外带 <code>err</code>。</p>
+
+			<h2>测试</h2>
+			<p>
+				不需要 Docker：<code>redistest.Start(t)</code> 起进程内的 miniredis，
+				claim 就能工作。验证选主时<b>不要</b>去调未导出的 <code>runOnce</code>，
+				用两个各自跑起来的 scheduler 让它们真的抢一次 claim——
+				参考 <code>examples/cron</code> 的
+				<code>TestLeaderElectionRunsOneInstancePerInterval</code> 与
+				<code>TestOneShotLeaderElection</code>。
+				cron 表达式 job 在测试里用 <code>@every 1s</code>（robfig 的真实时钟最快一秒一档，
+				亚秒会被向上取整）。
+			</p>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/cron.html">examples/cron</a>：四种 job 各一，<code>/api/v1/jobs</code> 读回每 job 的运行次数。</li>
+				<li><a href="service.html">服务与生命周期</a>：<code>env.Block</code> 与关闭顺序。</li>
+				<li><a href="cache.html">缓存模式</a>：另一处用到 redis 原子操作的地方。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

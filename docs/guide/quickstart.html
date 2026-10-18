@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>快速开始 — matex</title>
+		<meta name="description" content="三步把 matex 服务跑起来：零依赖、带 SQLite、带真实依赖。每一步都能立刻验证。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="guide/quickstart">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>快速开始</h1>
+			<p class="lede">
+				从零到能 curl 的服务只要一条命令；加数据库不需要装 Docker；要真依赖时再
+				<code>make dev</code>。三步可以停在任意一步。
+			</p>
+
+			<h2>前置条件</h2>
+			<ul>
+				<li>Go 1.27 或更新（<code>go.mod</code> 声明 <code>go 1.27.1</code>）。</li>
+				<li>可选：Docker（只在第三步需要）。</li>
+			</ul>
+			<pre><code class="language-bash">git clone https://github.com/smallnest/matex.git &amp;&amp; cd matex
+go mod download</code></pre>
+
+			<h2>第一步：零依赖起步</h2>
+			<p>
+				<code>configs/config.min.yaml</code> 里只有 <code>http</code>、<code>log</code> 与
+				服务自己的段。启动不连接任何外部服务：
+			</p>
+			<pre><code class="language-bash">make run-min
+
+# 另开一个终端
+curl -i localhost:8080/healthz
+curl -i localhost:8080/api/v1/hello/world</code></pre>
+			<p>预期看到：</p>
+			<pre><code class="language-bash">$ curl -s localhost:8080/api/v1/hello/world
+{"code":0,"msg":"ok","data":{"greeting":"hello, world"}}</code></pre>
+			<div class="callout callout--note">
+				<span class="callout__label">响应封套是固定的</span>
+				成功是 <code>{code:0,msg:"ok",data:…}</code>，失败是
+				<code>{code:业务码,msg:"…",data:null}</code> 加对应 HTTP 状态。
+				handler 返回 <code>nil, nil</code> 时为 <code>204</code>，没有响应体。
+			</div>
+
+			<h2>第二步：带数据库，但依然零外部依赖</h2>
+			<p>
+				默认驱动是纯 Go SQLite（<code>modernc.org/sqlite</code>）：不需要 cgo、不需要 Docker、
+				不需要网络。迁移按文件名顺序执行，追加不修改。
+			</p>
+			<pre><code class="language-bash">make migrate DRIVER=sqlite DSN=file:matex.db
+make run-sqlite
+
+curl -i localhost:8080/api/v1/hello/world
+curl -i localhost:8080/api/v1/hello/stats/world   # 计数来自数据库</code></pre>
+
+			<h2>第三步：接真实依赖</h2>
+			<p>
+				<code>make dev</code> 用 docker compose 起 postgres / mysql / redis / memcache / kafka，
+				然后换成完整配置：
+			</p>
+			<pre><code class="language-bash">make dev
+make migrate DSN=postgres://matex:matex@localhost:5432/matex?sslmode=disable
+make run
+
+# 用完停掉
+make dev-down</code></pre>
+			<div class="callout callout--warn">
+				<span class="callout__label">只挂环境变量是不够的</span>
+				基础设施是"配了才建"——要让 db / redis / kafka 生效，配置里必须有对应的段。
+				只给 <code>DB_DSN</code> 环境变量但没有 <code>db:</code> 段，服务不会去连数据库。
+				Docker 镜像默认拷的是 <code>config.min.yaml</code>，需要这些能力时挂载完整配置。
+			</div>
+
+			<h2>三份配置的关系</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>文件</th>
+							<th>内容</th>
+							<th>用途</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>configs/config.min.yaml</code></td>
+							<td><code>http</code> + <code>log</code> + 服务段</td>
+							<td>零依赖启动，也是镜像默认配置</td>
+						</tr>
+						<tr>
+							<td><code>configs/config.sqlite.yaml</code></td>
+							<td>加 <code>db: driver: sqlite</code></td>
+							<td>带库但零外部依赖</td>
+						</tr>
+						<tr>
+							<td><code>configs/config.yaml</code></td>
+							<td>含 db / redis / memcache / kafka 段</td>
+							<td>本地全量、真实部署</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>跑测试与示例</h2>
+			<p>全部测试与全部例子都不需要 Docker，因此可以在 CI 里一次跑完：</p>
+			<pre><code class="language-bash">make test-short      # 快速测试（含 sqlite DB 用例，带 -race）
+make test            # 全量测试
+make ci              # vet + test-short + build（提交前跑这个）
+go test ./examples/...   # 19 个示例的测试，全部离线
+
+make example NAME=http   # 跑某个示例，等价于 go run ./examples/http</code></pre>
+
+			<h2>看到日志，就对了</h2>
+			<p>
+				服务启动后每个请求都有一行结构化日志，带 trace id。这条 trace id 也会回写到响应头
+				<code>X-Request-ID</code>，所以不接链路后端也能把一次调用串起来：
+			</p>
+			<pre><code class="language-bash">$ curl -si localhost:8080/api/v1/hello/world | grep -i x-request-id
+X-Request-ID: 4f2a9c1e8b7d3a05
+
+$ # 服务端日志
+{"time":"…","level":"INFO","msg":"http","trace_id":"4f2a9c1e8b7d3a05",
+ "method":"GET","path":"/api/v1/hello/world","code":200,"dur_ms":0}</code></pre>
+
+			<h2>下一步读什么</h2>
+			<div class="cards">
+				<a class="card" href="architecture.html">
+					<span class="card__title">架构总览</span>
+					<span class="card__desc">搞清楚启动时每一步做了什么，以及为什么是这个顺序。</span>
+				</a>
+				<a class="card" href="../examples/index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">19 个能力各一个可运行示例，挑你正在做的那个看。</span>
+				</a>
+				<a class="card" href="concepts/http.html">
+					<span class="card__title">写第一个接口</span>
+					<span class="card__desc">handler 约定、路由注册、错误怎么变成状态码。</span>
+				</a>
+			</div>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

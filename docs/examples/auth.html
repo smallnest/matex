@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>auth 示例 — matex</title>
+		<meta name="description" content="examples/auth：Bearer 验签（HMAC 或 JWKS）、用 Use 的累积语义做分级授权、Principal 进 ctx，以及 401/403/503 的失败语义。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/auth">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>auth — 认证与授权</h1>
+			<p class="lede">
+				<code>pkg/core/auth</code> 把 Bearer token 验签落到 <code>httpx</code> 的中间件槽上：
+				handler 不解析 <code>Authorization</code> 头，也不手写 401——中间件验完把
+				<code>Principal</code> 放进 ctx，handler 直接读。这个示例用三条路由演示
+				「公开 → 登录态 → 更高权限」的阶梯是如何用书写顺序表达的。
+			</p>
+
+			<h2>运行</h2>
+			<pre><code class="language-bash">go run ./examples/auth
+
+TOKEN=$(curl -s -X POST localhost:8081/api/v1/login \
+  -d '{"username":"bob","password":"bob-pw"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
+
+curl -i localhost:8081/api/v1/profile                                        # 401，无 token
+curl -i localhost:8081/api/v1/profile     -H "Authorization: Bearer $TOKEN"   # 200
+curl -i localhost:8081/api/v1/admin/audit -H "Authorization: Bearer $TOKEN"   # 200，bob 是 admin
+# 换 alice 的 token 调 /admin/audit → 403，她没有 admin 角色</code></pre>
+			<p>
+				没有外部依赖，不需要 <code>make dev</code>。监听 <code>:8081</code>，
+				<code>-conf</code> 默认指向 <code>examples/auth/config.yaml</code>；
+				那份配置必须包含 <code>auth</code> 段，否则 <code>Setup</code>
+				会以 <code>authdemo: the `auth` section must be configured</code> 失败退出。
+			</p>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>两种验签模式</b>：<code>auth.secret</code>（HS256/384/512）或 <code>auth.jwks_url</code>（RS/ES 系列），配置二选一。</li>
+				<li><b>分级保护</b>：靠 <code>Use</code> 只护其后注册的路由这一条规则表达层级。</li>
+				<li><b>三个开箱守卫</b>：<code>RequireScope</code>、<code>RequireRole</code>、<code>RequireAnyRole</code>。</li>
+				<li><b>Principal 进 ctx</b>：<code>auth.FromContext(ctx)</code> 拿到 <code>Subject</code>、<code>Scopes</code>、<code>Roles</code> 等。</li>
+				<li><b>签发</b>：<code>verifier.Issue(auth.IssueRequest{…}, ttl)</code>，HMAC 模式下服务内部/测试不必自己 import JWT 库。</li>
+				<li><b>防用户枚举</b>：「用户不存在」与「密码错」返回同一条消息。</li>
+			</ul>
+
+			<h2>三条路由，两个 tier</h2>
+			<p>
+				这段来自 <code>examples/auth/main.go</code> 的 <code>BuildRouter</code>。
+				整个授权模型就藏在这几行的顺序里：<code>/login</code> 在第一个
+				<code>Use</code> 之前注册，所以公开；<code>/profile</code> 在验签中间件之后；
+				<code>/admin/audit</code> 又在 <code>RequireRole("admin")</code> 之后。
+			</p>
+			<pre><code class="language-go">func (s *authDemo) BuildRouter(srv *httpx.Server) error {
+	// Public: the one route that hands out tokens.
+	srv.Handle("POST", "/api/v1/login", s.login)
+
+	// Everything below this line needs a valid token.
+	srv.Use(s.verifier.Middleware())
+	srv.Handle("GET", "/api/v1/profile", profile)
+
+	// Middleware accumulates, so this route needs the token *and* the
+	// admin role. That is the whole authorization model: register public
+	// routes, then Use, then the next tier.
+	srv.Use(auth.RequireRole("admin"))
+	srv.Handle("GET", "/api/v1/admin/audit", audit)
+
+	return nil
+}</code></pre>
+
+			<h2>登录与读取主体</h2>
+			<p>
+				同一份文件里的两个 handler。登录那侧演示了签发，注意它给了
+				<code>Scopes</code> 与 <code>Roles</code> 两项 claim；
+				<code>profile</code> 那侧演示了读取——它完全不知道 token 是怎么来的。
+			</p>
+			<pre><code class="language-go">	u, ok := demoUsers[req.Username]
+	if !ok || u.password != req.Password {
+		// Same message for "no such user" and "wrong password": telling
+		// them apart hands an attacker a user-enumeration oracle.
+		return nil, errs.Unauthorized(40101, "invalid credentials")
+	}
+	token, err := s.verifier.Issue(auth.IssueRequest{
+		Subject: req.Username,
+		Scopes:  u.scopes,
+		Roles:   u.roles,
+	}, time.Hour)
+	if err != nil {
+		return nil, errs.Internal(50001, "issue token: %v", err)
+	}
+	return map[string]any{"token": token, "token_type": "Bearer", "expires_in": 3600}, nil</code></pre>
+			<pre><code class="language-go">// profile reads the principal the middleware put on the context.
+func profile(ctx context.Context, _ *http.Request) (any, error) {
+	p, _ := auth.FromContext(ctx)
+	return map[string]any{"subject": p.Subject, "scopes": p.Scopes, "roles": p.Roles}, nil
+}</code></pre>
+
+			<h2>阶梯与失败语义</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    L["POST /api/v1/login<br/>公开 · 换 token"] --> T["verifier.Issue<br/>→ Bearer token"]
+    T --> M["srv.Use(verifier.Middleware())"]
+    M --> P["GET /api/v1/profile<br/>需要有效 token"]
+    P --> R["srv.Use(auth.RequireRole('admin'))"]
+    R --> A["GET /api/v1/admin/audit<br/>需要 token + admin 角色"]
+    M -.->|"缺 / 格式错 / 签名错 / 过期"| E401["401 code 40101"]
+    R -.->|"token 有效但角色不够"| E403["403 code 40301"]
+    J["JWKS 端点不可达"] -.->|"从未成功拉取过"| E503["503 code 50301"]
+    classDef bad fill:#fdf0f0,stroke:#a33,color:#2b2722
+    classDef guard fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class E401,E403 bad
+    class E503 guard
+				</pre>
+				<figcaption>
+					每一行 <code>Use</code> 都往下累积一层要求，所以 tier 就是书写顺序。
+					三条失败出口刻意分开：凭证问题给 401/403，身份提供方故障给 503——
+					让客户端知道该换 token 还是该重试。
+				</figcaption>
+			</figure>
+			<p>
+				表格里的第三种情况值得单独记：<b>JWKS 端点不可达返回 503</b>，
+				因为身份提供方短暂不可用不该让客户端以为自己的 token 坏了。
+				拉取失败时会继续用上一次的公钥（可用性优先），只有从未成功拉取过才对外报 503。
+			</p>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash"># 1. 拿 token
+curl -s -X POST localhost:8081/api/v1/login -d '{"username":"bob","password":"bob-pw"}'
+# {"code":0,"msg":"ok","data":{"expires_in":3600,"token":"eyJ…","token_type":"Bearer"}}
+
+# 2. 无 token
+curl -i localhost:8081/api/v1/profile
+# 401 {"code":40101,"msg":"…","data":null}
+
+# 3. 带 token
+TOKEN=$(curl -s -X POST localhost:8081/api/v1/login -d '{"username":"bob","password":"bob-pw"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
+curl -s localhost:8081/api/v1/profile -H "Authorization: Bearer $TOKEN"
+# {"code":0,"msg":"ok","data":{"roles":["admin"],"scopes":["profile:read","audit:read"],"subject":"bob"}}
+
+# 4. admin 路由：bob 可以
+curl -s localhost:8081/api/v1/admin/audit -H "Authorization: Bearer $TOKEN"
+# {"code":0,"msg":"ok","data":{"entries":["alice logged in","bob rotated the signing key"],"requested_by":"bob"}}
+
+# 5. admin 路由：alice 是普通用户，403
+ALICE=$(curl -s -X POST localhost:8081/api/v1/login -d '{"username":"alice","password":"alice-pw"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
+curl -i localhost:8081/api/v1/admin/audit -H "Authorization: Bearer $ALICE"
+# 403 {"code":40301,"msg":"…","data":null}
+
+# 6. 凭证错误一律同一条消息
+curl -i -X POST localhost:8081/api/v1/login -d '{"username":"nobody","password":"x"}'
+# 401 {"code":40101,"msg":"invalid credentials","data":null}</code></pre>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 用真实 verifier（<code>auth.New(auth.Config{Issuer:"matex-authdemo", Secret:testSecret})</code>）
+				搭起完整链路，断言的是：
+			</p>
+			<ul>
+				<li><code>TestLogin</code>：正确凭证能拿到 token；密码错是 401；
+					<b>不存在的用户与密码错看起来完全一样</b>——状态 401 且 body 含
+					<code>"invalid credentials"</code>。</li>
+				<li><code>TestProtectedRoutes</code> 五个用例：<code>/profile</code> 无 token →
+					<code>401 "code":40101</code>；alice 的 token 访问 <code>/profile</code> →
+					200 且 <code>"subject":"alice"</code>；alice 访问 <code>/admin/audit</code> →
+					<b>403 <code>"code":40301</code></b>；bob 访问 → 200 且
+					<code>"requested_by":"bob"</code>；<b>被篡改的 token</b>（末尾加一个字符）
+					→ <code>401 "code":40101</code>。</li>
+				<li><code>TestPublicRouteStaysOpen</code>：<code>/login</code> 在任何
+					<code>Use</code> 之前注册，所以不带 token 也是 200。</li>
+				<li><code>TestProfileExposesScopes</code>：bob 的 <code>/profile</code> 响应体里
+					同时含 <code>"audit:read"</code> 与 <code>"admin"</code>——claim 完整地走完了往返。</li>
+			</ul>
+			<pre><code class="language-bash">go test ./examples/auth</code></pre>
+
+			<h2>相关</h2>
+			<div class="cards">
+				<a class="card" href="../guide/concepts/security.html">
+					<span class="card__title">认证与安全概念页</span>
+					<span class="card__desc">两种验签模式、分级保护、安全响应头与 CORS。</span>
+				</a>
+				<a class="card" href="../guide/reference/skills.html">
+					<span class="card__title">matex-setup-auth</span>
+					<span class="card__desc">让 AI 按规范把认证授权接进你的项目。</span>
+				</a>
+				<a class="card" href="index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">全部 19 个可运行示例。</span>
+				</a>
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="http.html">examples/http</a>：另一个用 <code>Use</code> 做守卫的例子，不依赖 JWT。</li>
+				<li><a href="feature.html">examples/feature</a>：多副本统一开关时，管理接口同样该加守卫。</li>
+				<li><a href="config.html">examples/config</a>：<code>auth</code> 段里的密钥应该用 <code>${AUTH_SECRET}</code> 从环境注入。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

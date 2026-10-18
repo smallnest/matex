@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>rpcx — 无需 IDL 的 RPC — matex</title>
+		<meta
+			name="description"
+			content="examples/rpcx：一个普通 struct 就是 rpcx 服务，RPCXRegistrar 注册，env.RPCXClient 懒连接调用。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/rpcx">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>rpcx — 无需 IDL 的 RPC</h1>
+			<p class="lede">
+				<code>pkg/core/rpcx</code> 管 rpcx 的生命周期。它和 gRPC 最大的区别：
+				<b>没有 IDL、没有代码生成</b>——一个服务就是一个普通 struct，导出方法签名对上
+				就能被调用。服务端由 <code>verticle.Run</code> 按 <code>rpcx:</code> 段创建，
+				客户端在 <code>Setup</code> 里用 <code>env.RPCXClient</code> 建立。
+			</p>
+
+			<h2>运行</h2>
+			<p>
+				完全离线，不需要 <code>make dev</code>。同时开 HTTP <code>:8080</code> 与
+				rpcx <code>:8972</code>（默认 <code>network: tcp</code>）。配置文件是目录里的
+				<code>config.yaml</code>，<code>-conf</code> 默认指向它。
+			</p>
+			<pre><code class="language-bash">go run ./examples/rpcx             # 等价于 make example NAME=rpcx
+# http :8080 + rpcx :8972
+
+curl -i localhost:8080/api/v1/greet/world          # 本地调用
+curl -i localhost:8080/api/v1/greet-remote/world   # 真实 rpcx 往返（target 默认指向自己）</code></pre>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>服务即 struct</b>：方法签名 <code>func(ctx, *Args, *Reply) error</code>，
+					参数与返回值是导出字段的 struct（默认 gob 编码）。</li>
+				<li><b>注册走 hook</b>：实现 <code>RegisterRPCX</code>，由
+					<code>verticle.Run</code> 在 serve 之前调用，且<b>只在配了 <code>rpcx:</code>
+					段时</b>才调用。</li>
+				<li><b>本地调用 vs 远程调用</b>：<code>greetLocal</code> 直接调服务方法（无网络），
+					<code>greetRemote</code> 走真实 rpcx 客户端。</li>
+				<li><b>懒连接</b>：和 gRPC 不同，<code>RPCXClient</code> 不在 Setup 时探测连通性，
+					第一次 <code>Call</code> 才拨号——所以 target 填自己也能跑通。</li>
+				<li><b>错误跨边界只剩消息</b>：<code>errs.Kind</code> 与业务 code 传不过去，
+					客户端要把错误再映射回自己的 code。</li>
+			</ul>
+
+			<h2>服务端：struct 与注册</h2>
+			<p>
+				来自 <code>examples/rpcx/main.go</code>。<code>Greet</code> 是普通方法，
+				<code>RegisterRPCX</code> 用 <code>RegisterName("Greeter", …)</code> 把它挂上——
+				注册名要和客户端的 servicePath 一致。
+			</p>
+			<pre><code class="language-go">func (g *Greeter) Greet(ctx context.Context, args *GreetArgs, reply *GreetReply) error {
+	if args.Name == "" {
+		// Only the message survives the RPC boundary — the client side
+		// maps it back to a business code.
+		return errs.Invalid(40001, "name is required")
+	}
+	reply.Greeting = g.prefix + args.Name
+	obs.Info(ctx, "greet over rpcx", "name", args.Name)
+	return nil
+}
+
+// RegisterRPCX is called by verticle.Run before serving, and only when the
+// `rpcx:` section is configured.
+func (s *rpcxService) RegisterRPCX(srv *rpcxserver.Server) error {
+	return srv.RegisterName("Greeter", s.greeter, "")
+}</code></pre>
+
+			<h2>客户端：懒连接调用</h2>
+			<p>
+				来自同一文件的 <code>greetRemote</code>。客户端在 <code>Setup</code> 里建立，
+				但只有 <code>Target</code> 非空时才建；没配就是 <code>503</code>。
+			</p>
+			<pre><code class="language-go">if s.client == nil {
+	return nil, errs.Unavailable(50301, "no rpcx peer configured (set rpcxdemo.target)")
+}
+var reply GreetReply
+if err := s.client.Call(ctx, "Greet", &GreetArgs{Name: r.PathValue("name")}, &reply); err != nil {
+	return nil, errs.Unavailable(50302, "rpcx call failed: %v", err)
+}
+return map[string]any{"greeting": reply.Greeting, "where": "remote"}, nil</code></pre>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    participant H as HTTP handler
+    participant C as traceXClient（RPCXClient）
+    participant M as 请求 metadata
+    participant S as tracePlugin（rpcx server）
+    participant G as Greeter.Greet
+    H->>C: Call(ctx, "Greet", args, reply)
+    Note over C: 开 client span
+    C->>M: 注入 W3C traceparent
+    M->>S: 线上传输（rpcx 复制 req metadata）
+    S->>S: Extract 出父 span，开 server span
+    S->>G: 调用服务方法
+    G-->>S: reply
+    S->>S: PostCall 结束 span
+    S-->>C: reply
+    C->>C: 结束 client span
+				</pre>
+				<figcaption>
+					traceparent 跨进程传播。客户端把 W3C trace 上下文写进 rpcx 的请求 metadata，
+					服务端插件从中提取并开一个父级为调用方的 span。关闭 tracing 时两侧都是 no-op，
+					所以这段逻辑无条件接线。
+				</figcaption>
+			</figure>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash">curl -i localhost:8080/api/v1/greet/world          # 本地调用
+curl -i localhost:8080/api/v1/greet-remote/world   # 真实 rpcx 往返（target 默认指向自己）</code></pre>
+			<p>
+				两个端点都返回 <code>{"code":0,"msg":"ok","data":{"greeting":"Hello, world",…}}</code>，
+				差别在 <code>where</code> 字段：本地是 <code>"local"</code>，远程是
+				<code>"remote"</code>。空名字调用服务方法会返回
+				<code>errs.Invalid(40001, …)</code>。
+			</p>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 完全离线：在临时端口上起真实 <code>rpcx.New</code>
+				server（<code>Network: "tcp", Addr: "127.0.0.1:0"</code>），注册
+				<code>Greeter</code>，用 <code>rpcx.PeerClient</code> 连上并发起真实调用，
+				断言 <code>Greeting == "Hi world"</code>；另有两例断言空名字会报错，以及
+				服务端返回 <code>503</code> 路径。rpcx 在 <code>Serve</code> 内部才绑定监听，
+				所以测试有一个 <code>waitForAddr</code> 轮询等监听出现——
+				<b>没有 broker、没有网络</b>。
+			</p>
+			<pre><code class="language-bash">go test ./examples/rpcx</code></pre>
+
+			<h2>相关</h2>
+			<ul>
+				<li><a href="../guide/concepts/rpc.html">gRPC 与 rpcx</a>：IDL、契约与传输的对比。</li>
+				<li><a href="../guide/concepts/observability.html">可观测性</a>：traceparent 如何跨进程。</li>
+				<li><a href="grpc.html">examples/grpc</a>：需要强契约与多语言互通时的选择。</li>
+				<li>Skill：<code>skills/matex-setup-rpcx/SKILL.md</code>。</li>
+				<li><a href="index.html">示例索引</a>。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

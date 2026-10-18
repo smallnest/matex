@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>database 示例 — matex</title>
+		<meta name="description" content="examples/database：一份 SQL 跑 postgres/mysql/sqlite，QueryAll/QueryOne/QueryScalar 泛型扫描，WithTx 与 db.Querier 让 DAO 进出事务。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/database">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>database — 数据库</h1>
+			<p class="lede">
+				<code>pkg/core/db</code> 在 <code>database/sql</code> 上做一层薄封装：SQL 还是你写的 SQL，
+				但一份方言能跑三个驱动。<code>QueryOne[Article]</code> 这样的泛型辅助函数把行扫进结构体，
+				<code>WithTx</code> 管提交与回滚。这个示例默认用临时 SQLite 文件跑完所有步骤，零外部依赖。
+			</p>
+
+			<h2>运行</h2>
+			<pre><code class="language-bash"># 零外部依赖：临时 SQLite（纯 Go，无 cgo）
+go run ./examples/database
+
+# 真库（先 make dev）
+go run ./examples/database -driver postgres \
+  -dsn 'postgres://matex:matex@localhost:5432/matex?sslmode=disable'
+go run ./examples/database -driver mysql \
+  -dsn 'matex:matex@tcp(localhost:3306)/matex?parseTime=true'</code></pre>
+			<p>
+				不监听端口，不是 HTTP 服务。两个标志是 <code>-driver</code>（默认 <code>sqlite</code>）和
+				<code>-dsn</code>（默认空）。不传 <code>-dsn</code> 时，程序在临时目录建一个一次性
+				SQLite 文件，退出时删掉；此时 <code>-driver</code> 只能是 <code>sqlite</code>，
+				否则报 <code>-dsn is required for driver "…"</code> 并以状态码 2 退出。
+			</p>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>三个驱动、一份 SQL</b>：SQL 里一律写 <code>?</code>，postgres 会由包自动改写成 <code>$1..$n</code>。</li>
+				<li><b>泛型扫描</b>：<code>QueryAll[T]</code> / <code>QueryOne[T]</code> / <code>QueryScalar[T]</code>，用 <code>db</code> tag 匹配列名。</li>
+				<li><b>扫描的几条宽容规则</b>：多余的列被忽略（<code>SELECT *</code> 在表加列后照样能用）、<code>NULL</code> → <code>nil</code> 指针、RFC3339 字符串 → <code>time.Time</code>。</li>
+				<li><b>未命中就是 <code>db.ErrNoRow</code></b>：用 <code>errors.Is</code> 判断，而不是比较字符串。</li>
+				<li><b><code>WithTx</code> 的提交与回滚</b>：返回 nil 提交，返回 error（或 panic）自动回滚。</li>
+				<li><b><code>db.Querier</code> 让 DAO 进出事务</b>：同一组 DAO 方法既能在池上调用，也能在事务里调用，且事务内的读能看到本事务自己的写。</li>
+			</ul>
+
+			<h2>可移植的建表语句</h2>
+			<p>
+				下面这段来自 <code>examples/database/main.go</code>。它刻意避开三种方言的差异点：
+				主键用 <code>VARCHAR(64)</code> 而不是 <code>TEXT</code>（MySQL 不能索引裸 TEXT 主键），
+				没有 <code>AUTO_INCREMENT</code>/<code>SERIAL</code>/<code>IDENTITY</code>，
+				时间戳用 <code>VARCHAR</code> 并由 Go 侧填充。
+			</p>
+			<pre><code class="language-go">const schema = `CREATE TABLE IF NOT EXISTS articles (
+	slug       VARCHAR(64)  NOT NULL PRIMARY KEY,
+	title      VARCHAR(255) NOT NULL,
+	views      INTEGER      NOT NULL DEFAULT 0,
+	published  BOOLEAN      NOT NULL DEFAULT FALSE,
+	note       VARCHAR(255) NULL,
+	updated_at VARCHAR(64)  NOT NULL
+)`
+
+type Article struct {
+	Slug      string    `db:"slug"       json:"slug"`
+	Title     string    `db:"title"      json:"title"`
+	Views     int64     `db:"views"      json:"views"`
+	Published bool      `db:"published"  json:"published"`
+	Note      *string   `db:"note"       json:"note"` // NULL → nil
+	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
+}</code></pre>
+
+			<h2>DAO 收 <code>db.Querier</code>，不收 <code>*db.DB</code></h2>
+			<p>
+				这是整个示例里最值得照抄的一条。同样来自 <code>examples/database/main.go</code>：
+				方法收一个 <code>db.Querier</code> 参数，<code>*db.DB</code> 和 <code>*db.Tx</code> 都实现它。
+				注意 <code>QueryOne[T]</code> 必须是包级函数——接口的方法不能带类型参数，
+				所以泛型扫描函数与 <code>Querier</code> 接口是一对，缺一不可。
+			</p>
+			<pre><code class="language-go">// articleDAO is written against db.Querier rather than *db.DB, which is what
+// lets the same methods serve the pool and a transaction.
+type articleDAO struct{}
+
+func (articleDAO) bySlug(ctx context.Context, q db.Querier, slug string) (*Article, error) {
+	return db.QueryOne[Article](ctx, q, `SELECT * FROM articles WHERE slug = ?`, slug)
+}
+
+func (articleDAO) insert(ctx context.Context, q db.Querier, a Article, now string) error {
+	_, err := db.Exec(ctx, q, `INSERT INTO articles (slug, title, views, published, note, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`, a.Slug, a.Title, a.Views, a.Published, a.Note, now)
+	return err
+}
+
+func (articleDAO) count(ctx context.Context, q db.Querier) (int64, error) {
+	return db.QueryScalar[int64](ctx, q, `SELECT COUNT(*) FROM articles`)
+}</code></pre>
+
+			<h2>验证</h2>
+			<p>看标准输出。每行左边是步骤标签，右边是真实数据：</p>
+			<pre><code class="language-bash">go run ./examples/database</code></pre>
+			<pre><code class="language-text">driver = sqlite
+
+schema       OK (driver=sqlite)
+scalar       count=1
+query one    slug=hello-matex views=1 published=false note=&lt;nil&gt; updated_at=2026-…Z
+no row       errors.Is(err, db.ErrNoRow) = true
+tx commit    count=3
+tx rollback  count=3 (unchanged)
+query all    3 row(s), first=hello-matex
+dao + tx     count=4 (same DAO methods, tx and pool)</code></pre>
+			<p>
+				几步之间的数字是对得上的：插入 1 行 → <code>scalar count=1</code>；
+				事务里插 <code>tx-a</code>/<code>tx-b</code> 两行并提交 → <code>count=3</code>；
+				第二个事务写入 <code>tx-c</code> 后返回一个哨兵 error → 回滚，
+				<code>count</code> 仍是 3；最后 DAO 在事务里写入 <code>tx-d</code> 并提交 → <code>count=4</code>。
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    A["db.Open(ctx, Config{Driver, DSN})"] --> B["d.Exec / QueryOne / QueryScalar<br/>（走连接池）"]
+    B --> C["d.WithTx(ctx, fn)"]
+    C --> D["fn(ctx, *db.Tx)"]
+    D -- "返回 nil" --> E["Commit"]
+    D -- "返回 error / panic" --> F["Rollback"]
+    G["DAO 方法<br/>收 db.Querier"] --> B
+    G --> D
+    E --> H["同一 DAO 方法<br/>两种调用点都可用"]
+    classDef ok fill:#f0f7f0,stroke:#3a7a3a,color:#2b2722
+    classDef bad fill:#fdf0f0,stroke:#a33,color:#2b2722
+    class E,H ok
+    class F bad
+				</pre>
+				<figcaption>
+					池与事务是两条入口，DAO 只认 <code>db.Querier</code> 这个共同接口，
+					因此不需要再写一套 <code>…Tx</code> 孪生方法。
+				</figcaption>
+			</figure>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 用 <code>dbtest.Start(t)</code> 拿到一个已迁移的数据库
+				（默认纯 Go SQLite，可离线跑），然后断言 <code>run</code> 返回的
+				<code>result</code> 结构体里的具体数值：
+			</p>
+			<ul>
+				<li><code>InitialCount == 1</code>、<code>AfterCommit == 3</code>、<code>AfterRollback == 3</code>（<code>tx-c</code> 不能落盘）、<code>AfterDAO == 4</code>。</li>
+				<li>第一行是 <code>slug == "hello-matex"</code>、<code>views == 1</code>、<code>published == false</code>。</li>
+				<li><code>Note == nil</code>——SQL 里的 NULL 扫成了 nil 指针。</li>
+				<li><code>UpdatedAt</code> 非零——VARCHAR 里的 RFC3339 字符串扫成了 <code>time.Time</code>。</li>
+				<li><code>len(All) == 3</code> 且第一条是 <code>hello-matex</code>（按 slug 排序）。</li>
+			</ul>
+			<p>设置 <code>DB_TEST_DRIVER</code> / <code>DB_TEST_DSN</code> 可以让同一个测试跑在真库上。</p>
+			<pre><code class="language-bash">go test ./examples/database</code></pre>
+
+			<h2>相关</h2>
+			<div class="cards">
+				<a class="card" href="../guide/concepts/database.html">
+					<span class="card__title">数据库概念页</span>
+					<span class="card__desc">三方言、错误映射、迁移与慢查询日志。</span>
+				</a>
+				<a class="card" href="../guide/reference/skills.html">
+					<span class="card__title">matex-setup-database</span>
+					<span class="card__desc">让 AI 按规范把数据库接进你的项目。</span>
+				</a>
+				<a class="card" href="index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">全部 19 个可运行示例。</span>
+				</a>
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../guide/reference/commands.html">参考：命令</a>：<code>make migrate</code> 与 <code>cmd/migrate</code>。</li>
+				<li><a href="lifecycle.html">examples/lifecycle</a>：进程退出时基础设施按什么顺序关闭。</li>
+				<li><a href="observability.html">examples/observability</a>：慢查询与请求如何共用同一个相关 id。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

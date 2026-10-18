@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>AI Skills — matex</title>
+		<meta name="description" content="matex 的 14 个 AI skill：用途、触发语，以及与 AGENTS.md 的关系。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/reference/skills">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>AI Skills</h1>
+			<p class="lede">
+				代码生成不是交给一个 CLI，而是交给 AI 加一组 skill。skill 是该能力的接入规范：
+				配置怎么配、代码写在哪、测试怎么写、哪些坑不要踩。
+			</p>
+
+			<h2>为什么是 skill 而不是生成器</h2>
+			<p>
+				生成器二进制是"会过时的约定"：它与库版本耦合，用户必须对齐版本才敢跑。
+				skill 是"给 AI 的约定"：模板随仓库一起演进，改了 <code>httpx</code> 的中间件签名，
+				skill 在同一批提交里就改了。用户不需要额外装东西。
+			</p>
+			<div class="callout callout--note">
+				<span class="callout__label">AGENTS.md 是总入口</span>
+				仓库根目录的 <code>AGENTS.md</code> 写清了核心原则、布局与命令；skill 是它之下
+				针对单个能力的展开。AI 读这两个就能生成符合规范的代码。
+			</div>
+
+			<h2>安装</h2>
+			<pre><code class="language-bash">npx skills add smallnest/matex --all   # 一次装齐 14 个</code></pre>
+			<p>
+				插件清单位于 <code>.claude-plugin/plugin.json</code>（插件名 <code>matex-skills</code>），
+				所以也可以只装某几个。
+			</p>
+
+			<h2>全部 skill</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>Skill</th>
+							<th>用途</th>
+							<th>怎么说</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>matex-add-domain</code></td>
+							<td>新增业务域：handler / service / dao + 路由注册 + 装配 + 测试</td>
+							<td>"新增一个订单业务域"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-database</code></td>
+							<td>接 PostgreSQL / MySQL / SQLite：配置、迁移、DAO、<code>Querier</code> 进出事务、dbtest</td>
+							<td>"接 postgres，写个表"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-redis</code></td>
+							<td>接 Redis：缓存读写、分布式锁</td>
+							<td>"加 redis 做缓存"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-memcache</code></td>
+							<td>接 Memcached：JSON 读写、TTL</td>
+							<td>"接 memcached"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-kafka</code></td>
+							<td>接 Kafka：生产者、消费者、死信队列</td>
+							<td>"接 kafka 消费订单事件"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-grpc</code></td>
+							<td>接 gRPC：proto 生成、服务注册、client 拨号、健康检查与 reflection</td>
+							<td>"接 gRPC，暴露 OrderService"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-rpcx</code></td>
+							<td>接 rpcx：无 IDL 的服务注册与调用</td>
+							<td>"用 rpcx 暴露 Greeter"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-auth</code></td>
+							<td>认证授权：HMAC/JWKS 验签、按路由分级、<code>Principal</code> 进 ctx</td>
+							<td>"加认证，admin 才能删"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-tracing</code></td>
+							<td>链路追踪：<code>trace:</code> 段、OTLP 导出、跨进程传播</td>
+							<td>"接链路追踪，导出到 collector"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-resilience</code></td>
+							<td>限流 / 幂等 / 熔断 / 退避重试</td>
+							<td>"给支付接口加幂等和限流"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-cache</code></td>
+							<td>缓存模式：防击穿、防雪崩、写后失效</td>
+							<td>"这个查询加缓存"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-cron</code></td>
+							<td>定时任务：固定周期 / cron 表达式 / 一次性，多副本选主</td>
+							<td>"每天 2 点跑对账"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-feature</code></td>
+							<td>功能开关：声明、读取、运行时切换</td>
+							<td>"新结算流程用开关控制"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-audit</code></td>
+							<td>审计日志：谁对什么做了什么、结果如何</td>
+							<td>"退款操作要记审计"</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>一个 skill 里有什么</h2>
+			<p>
+				以 <code>matex-setup-resilience</code> 为例，它给出的是可执行的顺序，而不是 API 罗列：
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    A["读 AGENTS.md 了解约定"] --> B["确认能力的开关与配置段"]
+    B --> C["在 Setup 里从 env 取句柄"]
+    C --> D["在 BuildRouter 里挂中间件 or 包住下游调用"]
+    D --> E["写测试：用进程内替身，离线可跑"]
+    E --> F["跑 make ci"]
+    classDef step fill:#f5f2ee,stroke:#8a8378,color:#2b2722
+    class A,B,C,D,E,F step
+				</pre>
+				<figcaption>
+					每个 skill 都收敛到同一个验收动作：<code>make ci</code> 通过。规范不靠人记，
+					靠这一步兜底。
+				</figcaption>
+			</figure>
+
+			<h2>相关</h2>
+			<ul>
+				<li><a href="layout.html">目录与约定</a>：skill 生成的东西放在哪。</li>
+				<li>
+					<a href="https://github.com/smallnest/matex/blob/master/AGENTS.md" target="_blank" rel="noopener">AGENTS.md</a>：总入口。
+				</li>
+				<li><a href="../../examples/index.html">示例</a>：skill 产出的代码长什么样。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

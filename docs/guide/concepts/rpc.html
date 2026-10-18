@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>gRPC 与 rpcx — matex</title>
+		<meta name="description" content="pkg/core/grpcx 与 pkg/core/rpcx：Registrar 钩子、内置 grpc.health.v1 与 SERVING 状态流转、reflection 开关、fail-fast / 懒连接客户端、自动 traceparent 传播。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/rpc">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>gRPC 与 rpcx</h1>
+			<p class="lede">
+				两个 RPC 通道都由 verticle 统一管生命周期：配了配置段才建 server，实现了 Registrar
+				接口才监听端口。客户端都在 <code>Setup</code> 里拨号，由框架负责关闭。
+			</p>
+
+			<h2>为什么两个都有</h2>
+			<p>
+				它们解决的场景不重叠。gRPC 靠 protobuf 提供强契约与多语言互通；rpcx 不要 IDL，
+				一个普通 struct 就是服务，代价是契约弱、以 Go 为主。
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th></th>
+							<th>gRPC</th>
+							<th>rpcx</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>IDL / 代码生成</td>
+							<td>需要（<code>.proto</code> + protoc）</td>
+							<td>不需要（struct 即契约）</td>
+						</tr>
+						<tr>
+							<td>契约强度</td>
+							<td>强：字段号与类型都在 IDL 里</td>
+							<td>弱：方法签名与导出字段的约定</td>
+						</tr>
+						<tr>
+							<td>多语言互通</td>
+							<td>好</td>
+							<td>Go 优先（codec 可换 msgpack / protobuf）</td>
+						</tr>
+						<tr>
+							<td>传输</td>
+							<td>HTTP/2</td>
+							<td>tcp / quic / kcp / ws / http 可选</td>
+						</tr>
+						<tr>
+							<td>客户端连接</td>
+							<td>fail-fast：<code>Setup</code> 阶段确认 READY</td>
+							<td>懒连接：第一次 <code>Call</code> 才拨号</td>
+						</tr>
+						<tr>
+							<td>内置健康检查</td>
+							<td><code>grpc.health.v1</code>（默认开）</td>
+							<td>走 HTTP 的 <code>/healthz</code> <code>/readyz</code></td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>跨语言、要强契约用 gRPC；纯 Go 内部服务、想少一层生成代码用 rpcx。两者可以在同一进程里并存。</p>
+
+			<h2>注册：只有实现了 Registrar 才监听</h2>
+			<pre><code class="language-go">// gRPC：verticle.Run 创建 server 后调用它在 serve 之前。
+func (s *DemoService) RegisterGRPC(g *grpc.Server) {
+	pb.RegisterGreeterServer(g, s.greeter)
+}
+
+// rpcx：注册名要和客户端的 servicePath 一致。
+func (s *rpcxService) RegisterRPCX(srv *rpcxserver.Server) error {
+	return srv.RegisterName("Greeter", s.greeter, "")
+}</code></pre>
+			<div class="callout callout--warn">
+				<span class="callout__label">配了地址但没实现接口 = 不监听 + 告警</span>
+				一个没有任何服务的端口只会招来误路由的流量和一个虚假的健康表象。所以 verticle 的
+				规则是：<b>没有 registrar 就没有 listener</b>，只记一条 warn。这个判断是运行时的接口
+				断言 <code>svc.(GRPCRegistrar)</code>，不是配置开关。
+			</div>
+			<pre><code class="language-yaml">grpc:
+  addr: ":9090"        # 留空/删除即禁用 server
+  dial_timeout: 3s     # 客户端拨号超时
+  health: true         # 标准 grpc.health.v1（默认开）
+  reflection: false    # 默认关
+
+rpcx:
+  network: tcp         # tcp | quic | kcp | ws | http
+  addr: ":8972"        # 留空/删除即禁用</code></pre>
+
+			<h2>内置健康服务</h2>
+			<p>
+				<code>grpcx.New</code> 在 <code>health</code> 为 true（或未设，默认即 true）时注册标准
+				<code>grpc.health.v1</code> 服务。<b>业务不要再自己
+				<code>healthpb.RegisterHealthServer</code></b>——重复注册会 panic。
+			</p>
+			<p>状态流转刻意贴合探针的视角：</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>时刻</th>
+							<th>状态</th>
+							<th>原因</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>New</code> 且尚未 <code>Serve</code></td>
+							<td><code>NOT_SERVING</code></td>
+							<td>地址已绑定但还没开始服务</td>
+						</tr>
+						<tr>
+							<td><code>Serve</code> 开始</td>
+							<td><code>SERVING</code></td>
+							<td>探针看到的"健康"与实际能接流量同一时刻</td>
+						</tr>
+						<tr>
+							<td><code>Shutdown</code></td>
+							<td>先 <code>NOT_SERVING</code></td>
+							<td>负载均衡先摘流量，在途调用继续排空</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<pre><code class="language-yaml">grpc:
+  health: false   # 关掉内置健康服务</code></pre>
+			<pre><code class="language-go">// 直接 grpcx.New 的场合：依赖异常时按 service 名翻转状态，
+// 让负载均衡在请求开始失败之前停止路由过来（"" 是整个 server）。
+srv.SetServing("greeter.Greeter", healthpb.HealthCheckResponse_NOT_SERVING)</code></pre>
+
+			<h2>Reflection：默认关</h2>
+			<p>
+				<code>reflection: true</code> 让 grpcurl / grpcui 不用 <code>.proto</code> 就能列出服务
+				（<code>grpcurl -plaintext localhost:9090 list</code>）。默认关闭是安全取向：
+				它把服务的<b>整个面</b>公开给任何能连到端口的人。生产上按需开启，或只在不对外暴露的
+				网络里开。
+			</p>
+
+			<h2>客户端</h2>
+			<pre><code class="language-go">// gRPC：fail-fast。dial_timeout（默认 3s）内确认 READY，连不上就返回错误。
+conn, err := env.GRPCClient(ctx, "user-svc:9090")
+if err != nil {
+	return err   // 依赖不可达 = 启动失败，而不是第一个请求失败
+}
+s.users = pb.NewUserClient(conn)</code></pre>
+			<pre><code class="language-go">// rpcx：对单点地址用 RPCXClient。
+c, err := env.RPCXClient("Greeter", "user-svc:8972")   // 或 "quic@user-svc:8972"
+if err != nil {
+	return err
+}
+s.client = c
+
+// 需要 etcd / consul 发现或多个服务端时换 RPCXClientWith。
+xc := env.RPCXClientWith("Greeter", discovery)</code></pre>
+			<ul>
+				<li>
+					<b>连接由框架关</b>：<code>env.GRPCClient</code> / <code>env.RPCXClient</code> /
+					<code>env.RPCXClientWith</code> 都注册了关闭函数，<code>Setup</code> 里不用
+					<code>defer conn.Close()</code>。
+				</li>
+				<li>
+					<b>传输默认明文</b>（集群内内网）。要对端 TLS 就给 <code>env.GRPCClient</code> 传
+					<code>grpc.WithTransportCredentials(...)</code>；rpcx 传输由 <code>network</code>
+					决定。
+				</li>
+				<li>
+					<b>rpcx 是懒连接</b>：<code>Setup</code> 阶段不探测连通性，所以要校验依赖得自己
+					<code>Call</code> 一个 ping 方法。
+				</li>
+				<li>
+					<b>rpcx 客户端策略固定</b>为 <code>Failtry</code> + <code>RandomSelect</code>
+					（单点重试 + 随机选节点）。
+				</li>
+			</ul>
+			<div class="callout callout--warn">
+				<span class="callout__label">客户端错误只有消息能过 RPC 边界</span>
+				<code>errs.Kind</code> 与业务 code 不会跨进程传递，服务端返回的 <code>errs.Invalid</code>
+				在客户端只是一个普通错误。所以调用方要把错误<b>再映射回</b>自己的 code：
+				<code>errs.Unavailable(50302, "rpcx call failed: %v", err)</code>。
+			</div>
+			<div class="callout callout--note">
+				<span class="callout__label">Setup 阶段不能拨自己</span>
+				那时自己的 server 还没 serve，target 填自己的地址会让 dial 超时、启动失败
+				（gRPC 的 fail-fast 会直接暴露这一点）。
+			</div>
+
+			<h2>链路追踪自动生效</h2>
+			<p>
+				两个通道都自动传播 W3C <code>traceparent</code>，业务代码零改动；未开启 tracing 时
+				全部是 no-op：
+			</p>
+			<ul>
+				<li><b>gRPC</b>：unary 与 stream 的服务端 / 客户端拦截器都在 <code>New</code> 和
+					<code>Dial</code> 里无条件接好。要加自己的 unary 拦截器请用
+					<code>grpc.ChainUnaryInterceptor</code> 组合，别替换掉追踪拦截器。</li>
+				<li><b>rpcx</b>：服务端一个 plugin（<code>PreHandleRequest</code> 开 span、
+					<code>PostCall</code> 关 span 并记录错误）+ 客户端对 <code>XClient</code> 的包装。
+					<code>Failtry</code> 的重试复用同一个 span，因为那是一次逻辑调用。</li>
+			</ul>
+			<p>
+				已知限制：rpcx handler 里自己起 <code>obs.StartSpan</code> 的子 span 不会自动挂在
+				RPC server span 下（OTel 的 span context 键不能从外部写入），但跨进程的 client → server
+				父子链是完整的。
+			</p>
+
+			<h2>一次带健康检查的 BFF 调用</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as 客户端
+    participant B as BFF（本进程）
+    participant P as 对端服务
+    participant PS as grpcx.Server
+    Note over B: Setup
+    B->>P: env.GRPCClient(ctx, target)
+    B->>P: 连接直到 READY（dial_timeout 内）
+    P-->>B: READY / 超时即返回 error（启动失败）
+    Note over C,P: 运行期
+    C->>B: GET /api/v1/health
+    B->>PS: Health/Check（客户端拦截器注入 traceparent）
+    PS->>PS: 服务端拦截器抽出 traceparent，开 server span
+    PS-->>B: SERVING（或 NOT_SERVING）
+    B-->>C: 200 {"status":"SERVING"}
+    Note over PS: Shutdown
+    PS->>PS: 先翻 NOT_SERVING，再 GracefulStop 排空
+				</pre>
+				<figcaption>
+					拨号在 <code>Setup</code> 里发生，所以不可达的对端在启动时就暴露；
+					健康状态与能否接流量始终同一时刻。
+				</figcaption>
+			</figure>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li>
+					<a href="../../examples/grpc.html">examples/grpc</a>：内置健康服务 + reflection，
+					HTTP 侧透传对端状态；config.yaml 打开了 reflection 方便 <code>grpcurl list</code>。
+				</li>
+				<li>
+					<a href="../../examples/rpcx.html">examples/rpcx</a>：无 IDL 的
+					<code>Greeter</code>，本地调用与真实 rpcx 往返各一条路由。
+				</li>
+				<li><a href="service.html">服务与生命周期</a>：Registrar 在启动序列里的位置。</li>
+				<li><a href="observability.html">可观测性</a>：traceparent 是怎么被注入和抽出的。</li>
+				<li><a href="testing.html">离线测试</a>：进程内起 server + 真 client 的写法。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

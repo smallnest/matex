@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>可观测性 — matex</title>
+		<meta name="description" content="pkg/core/obs：slog JSON 日志与相关 id、Prometheus 指标、OpenTelemetry 链路，以及 HTTP / gRPC / rpcx 三通道的自动跨进程传播。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/observability">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>可观测性</h1>
+			<p class="lede">
+				<code>pkg/core/obs</code> 一次给齐三件事：<b>结构化日志</b>、<b>Prometheus 指标</b>、
+				<b>OpenTelemetry 链路</b>。日志默认开，指标随 <code>/metrics</code> 暴露，链路是 opt-in
+				且关掉时全部为 no-op。
+			</p>
+
+			<h2>日志：slog JSON 加一个相关 id</h2>
+			<p>
+				<code>verticle.Run</code> 启动时调用 <code>obs.Init(name, level)</code>：JSON 写到
+				stdout，每条都带 <code>"service"</code> 字段。业务代码一律用带 ctx 的包级函数，
+				相关 id 会自动挂上，不需要传 logger：
+			</p>
+			<pre><code class="language-go">func Init(service string, level string) error {
+    var lv slog.Level
+    if err := lv.UnmarshalText([]byte(level)); err != nil {
+        lv = slog.LevelInfo
+    }
+    h := slog.NewJSONHandler(os.Stdout, &amp;slog.HandlerOptions{Level: lv})
+    slog.SetDefault(slog.New(h).With("service", service))
+    return nil
+}
+
+func Debug(ctx context.Context, msg string, args ...any) { Log(ctx).Debug(msg, args...) }
+func Info(ctx context.Context, msg string, args ...any)  { Log(ctx).Info(msg, args...) }
+func Warn(ctx context.Context, msg string, args ...any)  { Log(ctx).Warn(msg, args...) }
+func Error(ctx context.Context, msg string, args ...any) { Log(ctx).Error(msg, args...) }</code></pre>
+			<pre><code class="language-go">obs.Info(ctx, "user created", "user_id", 123, "dur_ms", 12)
+// {"time":"…","level":"INFO","msg":"user created","service":"demo","trace_id":"a1b2c3d4","user_id":123,"dur_ms":12}</code></pre>
+			<p>
+				<code>obs.Log(ctx)</code> 是"已经带上 trace_id 的 logger"，要传给别的库时用它。
+				不要 <code>fmt.Println</code> 打日志，也不要自己 new logger。
+			</p>
+			<div class="callout callout--note">
+				<span class="callout__label">trace_id 到底是谁</span>
+				<code>obs.TraceID(ctx)</code> 先问当前 span：开了 tracing 就是 span 的 trace id
+				（32 位 hex，能直接拿去追踪后端查）；没有 span 就取 <code>WithTraceID</code> 塞进
+				ctx 的请求级 id。所以<b>把 tracing 打开的那一刻</b>，日志里的相关 id 自动升级为
+				trace id，调用点一行都不用改。
+			</div>
+
+			<h2>相关 id 的来源与优先级</h2>
+			<p>
+				<code>httpx</code> 的封套层按顺序取第一个可用的值，然后回写响应头
+				<code>X-Request-ID</code>：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>顺序</th>
+							<th>来源</th>
+							<th>说明</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>1</td>
+							<td>入站 <code>X-Request-ID</code></td>
+							<td>调用方自己带的关联 id，原样透传（便于跨系统对齐）；超过 128 字节截断</td>
+						</tr>
+						<tr>
+							<td>2</td>
+							<td>当前 span 的 trace id</td>
+							<td>仅当 tracing 开启且入站未带 id</td>
+						</tr>
+						<tr>
+							<td>3</td>
+							<td>新生成的 8 字节 hex</td>
+							<td>两者都没有时兜底，保证日志一定可关联</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<pre><code class="language-go">// pkg/core/httpx/server.go
+traceID := r.Header.Get("X-Request-ID")
+if len(traceID) &gt; maxTraceIDLen {
+    // An oversized id would ride along in every log line.
+    traceID = traceID[:maxTraceIDLen]   // = 128
+}
+if traceID == "" {
+    traceID = obs.TraceID(spanCtx)
+}
+if traceID == "" {
+    traceID = newTraceID()
+}
+w.Header().Set("X-Request-ID", traceID)</code></pre>
+			<div class="callout callout--warn">
+				<span class="callout__label">128 字节上限</span>
+				客户端给的 id 不可信：一个 10 KB 的 <code>X-Request-ID</code> 会跟着这个请求产生的
+				每一条日志、每一个 span 属性走，把存储和带宽吃掉。W3C trace id 只有 32 个 hex 字符，
+				超过 128 字节的已经不是关联 id 了，直接截断。
+			</div>
+			<p>
+				请求的 ctx 与连接解耦，相关 id 在这一步注入。所以客户端断连不会污染 id，handler
+				也还能把副作用写完（记 499，详见 <a href="http.html">HTTP 与路由</a>）：
+			</p>
+			<pre><code class="language-go">ctx, cancel := context.WithTimeout(
+    context.WithoutCancel(obs.WithTraceID(spanCtx, traceID)), s.cfg.Timeout)
+defer cancel()</code></pre>
+
+			<h2>Prometheus 指标</h2>
+			<p>
+				<code>obs.NewMetrics()</code> 建一个独立 registry，装 Go runtime / process 收集器
+				与两个框架指标，<code>GET /metrics</code> 用的就是这个 registry：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>指标</th>
+							<th>类型</th>
+							<th>标签</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>http_server_requests_total</code></td>
+							<td>counter</td>
+							<td><code>route</code> <code>method</code> <code>code</code></td>
+						</tr>
+						<tr>
+							<td><code>http_server_request_duration_seconds</code></td>
+							<td>histogram</td>
+							<td><code>route</code> <code>method</code> <code>code</code></td>
+						</tr>
+						<tr>
+							<td><code>go_*</code> / <code>process_*</code></td>
+							<td>runtime / 进程</td>
+							<td>—</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				<code>route</code> 取的是 <code>http.Request.Pattern</code>，即路由模板
+				（<code>GET /api/v1/hello/{name}</code>）而不是原始路径——否则每个用户 id 都会
+				变成一个独立时间序列。<code>code</code> 来自封套层记录的状态码，客户端断开记 499。
+			</p>
+			<p>
+				自定义指标在 <code>Setup</code> 里注册。<code>env.Metrics</code> 在 <code>Setup</code>
+				之前就已就绪，且与 <code>/metrics</code> 共用同一个 registry：
+			</p>
+			<pre><code class="language-go">func (s *obsService) Setup(ctx context.Context, env *verticle.Env) error {
+    s.work = env.Metrics.Counter("observe_work_total", "processed calls", "name")
+    s.value = env.Metrics.Gauge("observe_last_value", "last computed value", "name")
+    return nil
+}
+
+// handler 里
+s.work.WithLabelValues(name).Inc()
+s.value.WithLabelValues(name).Set(float64(value))</code></pre>
+			<p>
+				<code>Counter</code> / <code>Gauge</code> / <code>Histogram</code> 三个方法签名与
+				prometheus 一致，<code>Histogram</code> 传空 buckets 表示用 <code>prometheus.DefBuckets</code>。
+				<b>同名重复声明返回第一次的句柄</b>（库与服务各自声明同一指标不会互相炸），
+				但同名声明成不同类型会 panic —— 这属于真 bug，应该启动就发现。
+			</p>
+
+			<h2>OpenTelemetry 链路</h2>
+			<p>默认关闭。开关只有配置，代码不写分支：</p>
+			<pre><code class="language-yaml">trace:
+  enabled: false
+  # endpoint: "localhost:4317"   # OTLP/gRPC collector；留空则只生成 span 不外发
+  # sample_ratio: 1.0            # 采样比例 0~1（0 = 全丢，1 = 全采）
+  # export_timeout: 10s</code></pre>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>配置键</th>
+							<th>tag 默认值</th>
+							<th>作用</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>trace.enabled</code></td>
+							<td><code>false</code></td>
+							<td>总开关。关着时 <code>InitTracing</code> 清空 provider 与传播器，回到纯 X-Request-ID 行为</td>
+						</tr>
+						<tr>
+							<td><code>trace.endpoint</code></td>
+							<td>空（optional）</td>
+							<td>OTLP/gRPC collector 地址，如 <code>localhost:4317</code>；留空则 span 只带 trace id 不上报</td>
+						</tr>
+						<tr>
+							<td><code>trace.insecure</code></td>
+							<td>空（optional）</td>
+							<td>OTLP/gRPC 以明文拨号（集群内常见形态，TLS 交给 mesh）</td>
+						</tr>
+						<tr>
+							<td><code>trace.sample_ratio</code></td>
+							<td><code>1.0</code></td>
+							<td>头部采样比例；<code>&ge;1</code> 全采，<code>&le;0</code> 全丢，中间值按 trace id 比例采</td>
+						</tr>
+						<tr>
+							<td><code>trace.export_timeout</code></td>
+							<td><code>10s</code></td>
+							<td>单批导出的上限；<code>&le;0</code> 时在 <code>InitTracing</code> 里回填 10s</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				sampler 一律包一层 <code>ParentBased</code>：上游已经决定采样的链路始终保留，
+				否则追踪后端只会看到半条链——比没有更难用。开启后 <code>Run</code> 拿到一个
+				shutdown 函数，在优雅退出的排空阶段 flush 最后一批 span。
+			</p>
+			<pre><code class="language-go">// 业务代码加子 span：关着的时候是 no-op span，不用写 if tracing 分支
+ctx, span := obs.StartSpan(ctx, "compute")
+defer span.End()
+
+// 出站调用时把链路带出去（HTTP）
+h := http.Header{}
+obs.InjectHTTP(ctx, h)   // 写入 traceparent，下游服务续接同一条链路</code></pre>
+			<p>
+				HTTP 侧由封套层自动完成：<code>obs.StartHTTPSpan</code> 从请求头 extract 出
+				<code>traceparent</code> 续接调用方的链路，开一个 <code>SpanKindServer</code> 的 span，
+				span 名与 <code>http.route</code> 都取路由模板（低基数），响应时
+				<code>obs.EndHTTPSpan</code> 记上 <code>http.response.status_code</code> 并结束。
+			</p>
+			<div class="callout callout--tip">
+				<span class="callout__label">关着的时候为什么不能 extract</span>
+				没开 tracing 时 <code>StartHTTPSpan</code> 直接返回原 ctx 与 no-op span，<b>不读</b>
+				入站的 traceparent：读进来会往 ctx 里塞一个活的 SpanContext，把相关 id 劫持成对方的
+				trace id——而本进程根本没记录任何 span。这是"关掉 tracing 后行为与接入前完全一致"
+				的实现细节。
+			</div>
+
+			<h2>跨进程传播：三条通道都是自动的</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>通道</th>
+							<th>载体</th>
+							<th>接入方式</th>
+							<th>关闭时</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>HTTP</td>
+							<td>请求头（<code>traceparent</code>）</td>
+							<td><code>httpx</code> 封套层，业务零代码</td>
+							<td>no-op span，相关 id 回落 X-Request-ID</td>
+						</tr>
+						<tr>
+							<td>gRPC</td>
+							<td>gRPC metadata 的 <code>traceparent</code></td>
+							<td>服务端 unary / stream 拦截器 + 客户端 unary / stream 拦截器，<code>New</code>/<code>Dial</code> 时无条件装上</td>
+							<td>no-op tracer + no-op propagator</td>
+						</tr>
+						<tr>
+							<td>rpcx</td>
+							<td>请求 metadata（<code>share.ReqMetaDataKey</code>）</td>
+							<td>服务端 plugin（<code>PreHandleRequest</code> + <code>PostCall</code>）+ 客户端 XClient 包装</td>
+							<td>同上</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				<code>obs.Extract</code> / <code>obs.Inject</code> 接受任意
+				<code>propagation.TextMapCarrier</code>，gRPC 与 rpcx 各自用一个薄适配层把 metadata
+				包成 carrier，因此走的是同一套 W3C 传播器。rpcx 的 Failtry 重试会在<b>同一个
+				client span</b> 下重发，一次逻辑调用一个 span。
+			</p>
+
+			<h2>一个请求经过两个服务</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as 客户端
+    participant A as 服务 A（http + 日志 + 指标）
+    participant B as 服务 B
+    participant O as OTLP collector
+    C->>A: GET /api/v1/hello/world<br/>traceparent / X-Request-ID
+    A->>A: StartHTTPSpan：extract 出 trace id<br/>开 server span（名=路由模板）
+    A->>A: ctx 注入 trace id → 每条日志带 trace_id
+    A->>A: obs.StartSpan(&quot;compute&quot;) 子 span
+    A->>B: gRPC/rpcx：Inject 写 traceparent 到 metadata
+    B->>B: 拦截器/plugin：Extract → 续接同一条链路
+    B-->>A: 返回（span 结束，状态码作属性）
+    A->>A: EndHTTPSpan + 记 http_server_* 指标
+    A-->>C: 响应封套 + X-Request-ID 回写
+    A-->>O: 批量导出 span（bounded by export_timeout）
+    B-->>O: 批量导出 span
+                </pre>
+				<figcaption>
+					一条 trace 穿过两个服务：跨进程靠 <code>traceparent</code>，进程内靠 ctx。
+					日志、指标、链路三者在服务 A 内是同一份请求上下文——所以日志里的
+					<code>trace_id</code> 能直接跳到追踪后端，指标里的 <code>route</code>
+					又能定位是哪条路由在变慢。
+				</figcaption>
+			</figure>
+
+			<h2>排障顺序</h2>
+			<ol>
+				<li>
+					<b>先看指标定位面</b>：<code>http_server_requests_total</code> 按
+					<code>route</code> + <code>code</code> 找出是哪条路由的哪类状态码在涨。
+				</li>
+				<li>
+					<b>再用相关 id 收窄</b>：从客户端手上的响应头 <code>X-Request-ID</code> 或日志里的
+					<code>trace_id</code>，把这一个请求在所有服务的日志串起来。
+				</li>
+				<li>
+					<b>最后用链路看因果</b>：开了 tracing 时用 trace id 打开完整 span 树，
+					看时间花在哪一跳、哪一步。
+				</li>
+			</ol>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/observability.html">examples/observability</a>：日志带 trace_id、自定义指标、<code>trace.enabled</code> 开箱对比。</li>
+				<li><a href="../../examples/grpc.html">examples/grpc</a>：gRPC 通道的自动跨进程传播。</li>
+				<li><a href="../../examples/rpcx.html">examples/rpcx</a>：rpcx plugin + 客户端包装的传播。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>LLM 客户端 — matex</title>
+		<meta name="description" content="matex 的统一 LLM 客户端：一份 canonical 请求在四种 wire 协议间互转，协议推断、流式事件、重试边界与 Jev 决策问答。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/llm">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>LLM 客户端</h1>
+			<p class="lede">
+				<code>pkg/core/llm</code> 只做一件事：让业务用一份 canonical 的
+				<code>Request</code> / <code>Response</code> 说话，由客户端负责把它翻成厂商的
+				wire 协议。业务不 import 任何厂商 SDK。
+			</p>
+
+			<h2>canonical 形态</h2>
+			<pre><code class="language-go">type Request struct {
+    Model       string
+    System      string        // 每种协议都有自己的 system 字段，转换时各自归位
+    Messages    []Message
+    Tools       []Tool
+    ToolChoice  string        // "auto" / "none" / "required" / "name:&lt;tool&gt;"；空即 auto
+    MaxTokens   int
+    Temperature *float64
+    TopP        *float64
+    Stop        []string
+    Stream      bool          // 由 ChatStream 设置；Chat 强制关掉
+}
+
+type Response struct {
+    ID           string
+    Model        string
+    Content      string
+    ToolCalls    []ToolCall
+    FinishReason string       // 归一化：stop / length / tool_calls / content_filter / refusal / other
+    Usage        Usage
+}</code></pre>
+			<p>
+				<code>Message.Role</code> 取 <code>"system"</code> / <code>"user"</code> /
+				<code>"assistant"</code> / <code>"tool"</code>；tool 消息带 <code>ToolCallID</code>
+				与 <code>Name</code>，assistant 消息带 <code>ToolCalls</code>。
+				<code>ToolCall.Arguments</code> 永远是紧凑的 JSON 字符串——Anthropic 与 Gemini
+				在线上把它当对象传，转换时在这里对齐。
+			</p>
+
+			<h2>四种 wire 协议</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>协议</th>
+							<th>常量</th>
+							<th>端点</th>
+							<th>鉴权头</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td>OpenAI Chat Completions</td><td><code>ProtocolChat</code></td><td><code>{base}/chat/completions</code></td><td><code>Authorization: Bearer</code></td></tr>
+						<tr><td>OpenAI Responses</td><td><code>ProtocolResponses</code></td><td><code>{base}/responses</code></td><td><code>Authorization: Bearer</code></td></tr>
+						<tr><td>Anthropic Messages</td><td><code>ProtocolAnthropic</code></td><td><code>{base}/v1/messages</code></td><td><code>x-api-key</code> + <code>anthropic-version</code></td></tr>
+						<tr><td>Google Gemini generateContent</td><td><code>ProtocolGemini</code></td><td><code>{base}/models/{model}:generateContent</code>（流式为 <code>:streamGenerateContent?alt=sse</code>）</td><td><code>x-goog-api-key</code></td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				转换是公开 API，双向都通：<code>Request.ToChat()</code> /
+				<code>ToResponses()</code> / <code>ToAnthropic()</code> / <code>ToGemini()</code>
+				把一份 canonical 请求渲染成各协议的 wire body；
+				<code>ParseChat</code> / <code>ParseResponses</code> / <code>ParseAnthropic</code> /
+				<code>ParseGemini</code> 把各协议的响应读回 canonical <code>Response</code>。
+				<code>Convert(body, from, to)</code> 则以 canonical 为中转，把任意协议的请求体翻成
+				任意另一种。
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    R["一份 canonical Request<br/>System + 4 条 Message（含 tool call 与 tool 结果）<br/>Tools + ToolChoice + MaxTokens"] --> C["req.ToChat()"]
+    R --> P["req.ToResponses()"]
+    R --> A["req.ToAnthropic()"]
+    R --> G["req.ToGemini()"]
+    C --> CB["messages[] 数组<br/>system 作为 role:system 消息<br/>tool_calls / tool_call_id"]
+    P --> PB["input[] 条目<br/>instructions 承载 system"]
+    A --> AB["system 独立顶层字段<br/>max_tokens 必填<br/>连续 user 消息合并"]
+    G --> GB["contents[] role 为 user / model<br/>systemInstruction<br/>functionResponse 需要函数名"]
+    CB --> X["Convert(body, from, to)<br/>经 canonical 中转"]
+    PB --> X
+    AB --> X
+    GB --> X
+    classDef canon fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class R,X canon
+				</pre>
+				<figcaption>
+					同一份 canonical 请求变成四份 wire body。信息在四个方向上都不丢：
+					tool call 的 arguments 在 Chat / Responses 是字符串、在 Anthropic / Gemini 是对象，
+					转换时按协议各自成型；Gemini 的 <code>functionResponse</code> 缺函数名时，
+					会按 <code>ToolCallID</code> 回到之前的 assistant 调用里查，兜底取
+					<code>Message.Name</code>。
+				</figcaption>
+			</figure>
+			<p>
+				<code>Convert</code> 只覆盖这四种对话协议。Jev 的 System One 有自己的
+				canonical 类型（<code>DecideRequest</code> / <code>DecideResponse</code>），
+				不进转换集。
+			</p>
+
+			<h2>协议是怎么定的</h2>
+			<p>
+				<code>New</code> 在 <code>WithProtocol</code> 为空时按 <code>BaseURL</code> 推断，
+				规则是纯粹的子串匹配：含 <code>anthropic</code> → Anthropic，含
+				<code>generativelanguage</code> 或 <code>googleapis</code> → Gemini，含
+				<code>typesafe</code> → Jev，其余一律 <code>ProtocolChat</code>——
+				那是多数网关都会说的标准。
+			</p>
+			<div class="callout callout--warn">
+				<span class="callout__label">启发式只认识那几家</span>
+				指向自建网关、代理或其他厂商时必须显式写 <code>WithProtocol</code>，
+				否则请求会以 Chat 格式打到不认它的端点上。客户端<b>从不发探测请求</b>去猜协议。
+			</div>
+
+			<h2>选项</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>选项</th>
+							<th>作用</th>
+							<th>默认</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>WithBaseURL(u)</code></td><td>厂商 base URL，尾部 <code>/</code> 会被去掉</td><td>无（必填）</td></tr>
+						<tr><td><code>WithAPIKey(k)</code></td><td>API key，按协议放到对应的头</td><td>空</td></tr>
+						<tr><td><code>WithModel(m)</code></td><td>默认模型，请求没写 <code>Model</code> 时用它</td><td>空</td></tr>
+						<tr><td><code>WithProtocol(p)</code></td><td>强制 wire 协议，压过 base URL 推断</td><td>按 base URL 推断</td></tr>
+						<tr><td><code>WithTimeout(d)</code></td><td>HTTP 客户端超时；流式调用只用它约束"等到响应头"</td><td>60s</td></tr>
+						<tr><td><code>WithMaxTokens(n)</code></td><td>默认 max tokens</td><td>0（协议各自处理；Anthropic 缺省 4096）</td></tr>
+						<tr><td><code>WithJevVia(v)</code></td><td>System One 的托管形态</td><td><code>JevViaSystemOne</code></td></tr>
+						<tr><td><code>WithRetry(cfg)</code></td><td>只重试"稍后再试"类失败</td><td>关（<code>Attempts &lt;= 1</code>）</td></tr>
+						<tr><td><code>WithHTTPClient(hc)</code></td><td>自定义 HTTP 客户端，其 <code>Timeout</code> 原样保留</td><td>内部构造的 60s 客户端</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<pre><code class="language-go">c := llm.New(
+    llm.WithBaseURL("https://api.openai.com/v1"), // 按域名自动推断协议
+    llm.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
+    llm.WithModel("gpt-4o-mini"),
+    llm.WithTimeout(30*time.Second),
+    llm.WithMaxTokens(1024),
+)
+
+resp, err := c.Chat(ctx, llm.Request{
+    Messages: []llm.Message{{Role: "user", Content: "hi"}},
+})</code></pre>
+			<p>
+				请求缺 <code>Model</code> 且客户端也没配，返回的是一条明确的错误
+				（<code>llm: model is required</code>），而不是发出去让上游拒绝。
+				<code>Close()</code> 释放空闲连接。
+			</p>
+
+			<h2>流式</h2>
+			<p>
+				<code>ChatStream</code> 返回一个 canonical 事件的 channel，只在<b>建流</b>失败时
+				返回 error；流中的失败以 <code>EventError</code> 事件到达。
+			</p>
+			<pre><code class="language-go">ch, err := c.ChatStream(ctx, req)
+if err != nil {
+    return err
+}
+defer llm.StopStream(ch)   // 提前退出也要释放连接与 goroutine
+for ev := range ch {
+    switch ev.Kind {
+    case llm.EventText:     // 增量文本，在 ev.Text
+    case llm.EventToolCall: // 一次完整的函数调用，在 ev.ToolCall
+    case llm.EventUsage:    // 累计 token 数，在 ev.Usage
+    case llm.EventDone:     // 流结束，ev.Stop 是归一化的结束原因
+    case llm.EventError:    // 流以失败结束，ev.Err 是原因
+    }
+}</code></pre>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr><th>事件</th><th>携带</th></tr>
+					</thead>
+					<tbody>
+						<tr><td><code>EventText</code></td><td><code>Text</code>：回复文本的一段增量</td></tr>
+						<tr><td><code>EventToolCall</code></td><td><code>ToolCall</code>：一个完整的函数调用（分片在包内已拼好）</td></tr>
+						<tr><td><code>EventUsage</code></td><td><code>Usage</code>：累计的输入 / 输出 / 总 token</td></tr>
+						<tr><td><code>EventDone</code></td><td><code>Stop</code>：归一化的结束原因</td></tr>
+						<tr><td><code>EventError</code></td><td><code>Err</code>：失败原因</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				超时语义是刻意的：<code>WithTimeout</code> 只约束<b>等到响应头</b>
+				（time-to-first-byte），响应体开始流动后由调用方的 <code>ctx</code> 决定何时结束。
+				慢而持续的流不会被从中间截断，调用方仍可用自己的 deadline 限时。
+			</p>
+			<p>
+				<b><code>StopStream(ch)</code></b> 排空并结束流，让读取 goroutine 在没有消费者时
+				也能退出。它应该紧跟在 <code>ChatStream</code> 之后 <code>defer</code>——
+				一个被遗弃的流不会永久占住连接。
+			</p>
+
+			<h2>重试：只针对"稍后再试"类失败</h2>
+			<p>
+				<code>WithRetry</code> 默认关闭。打开后，只有这些 HTTP 状态会被重试：
+				<b>408、409、425、429、5xx</b>，加上传输层失败（状态未知）。400/401/403/404
+				立即返回，不会白白多花 token。退避与抖动完全走 <code>pkg/core/retry</code>。
+			</p>
+			<pre><code class="language-go">c := llm.New(
+    llm.WithBaseURL(base), llm.WithAPIKey(key), llm.WithModel("gpt-4o-mini"),
+    llm.WithRetry(retry.Config{Attempts: 3, BaseDelay: 200 * time.Millisecond}),
+)</code></pre>
+			<p>重试的边界写死在三个地方：</p>
+			<ul>
+				<li><b>Chat</b>：整次非流式调用可重试——重发一次对话请求是安全的重读，不是重写。</li>
+				<li><b>ChatStream</b>：只重试<b>建流那一次请求</b>。流到一半断开不重试，因为已收到的部分无法回滚。</li>
+				<li><b>Decide</b>：同样可重试。</li>
+			</ul>
+			<p>
+				重试次数受 <code>ctx</code> 截止时间约束——两者要一起设，
+				否则要么白白重试、要么重试根本轮不上。
+			</p>
+			<div class="callout callout--note">
+				<span class="callout__label">16MiB 回复上限，超了直接报错</span>
+				非流式回复由 <code>io.LimitReader</code> 读 <code>maxReplyBytes+1</code> 字节，
+				超过 <b>16MiB</b> 返回 <code>llm: reply exceeds 16MiB</code>。这个上限<b>故意</b>不做
+				静默截断：被截断的 JSON 会解析错，返回一个"看着合理但是错的"答案比直接失败糟得多。
+			</div>
+			<p>
+				上游错误统一映射到 <code>errs</code> 种类：401 → Unauthorized、403 → Forbidden、
+				404 → NotFound、429 → RateLimited、5xx → Unavailable、其余 4xx → InvalidArgument、
+				超时 → Timeout。上游的响应体节选（最多 300 字符）会进错误消息，方便排查。
+			</p>
+
+			<h2>Jev 决策问答（System One）</h2>
+			<p>
+				Jev 不回答对话，而是回答<b>带类型的问题</b>，并给出每个选项的把握度，
+				供路由层判定一条消息属于哪个 intent、这一轮要多重推理。
+				<code>Client.Decide</code> 说的是 System One，无论客户端的 <code>Protocol</code>
+				是什么——同一个 provider 可能既提供对话也提供决策。
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>问题类型</th>
+							<th>用到的字段</th>
+							<th>回答</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>"noul"</code>（Vercel 上叫 <code>"boolean"</code>）</td><td><code>Instructions</code></td><td><code>Answer.Noul</code>：0..1，"是"的程度</td></tr>
+						<tr><td><code>"score"</code></td><td><code>Bands</code>（有序级别，低到高）</td><td><code>Answer.Score</code>：命中级别的下标</td></tr>
+						<tr><td><code>"choice"</code></td><td><code>Criteria</code>（选项 → 它是什么）</td><td><code>Answer.Choice</code> 与 <code>Probabilities</code></td></tr>
+						<tr><td><code>"probability"</code></td><td><code>Criteria</code></td><td><code>Answer.Probabilities</code>：各选项的可能性</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				每个回答还带 <code>Confidence</code>——Jev 对最可能那项有多确定。
+				问题按名字问、按同样的名字答，答案在 <code>DecideResponse.Answers</code> 里。
+			</p>
+			<pre><code class="language-go">out, err := jc.Decide(ctx, llm.DecideRequest{
+    State: map[string]any{"message": "这个查询接口偶尔超时，帮我修一下。"},
+    Questions: map[string]llm.Question{
+        "intent": {Type: "choice", Instructions: "Which kind of request fits it best?",
+            Criteria: map[string]string{"greeting": "", "bug fix": "an ordinary fix"}},
+        "effort": {Type: "score", Instructions: "How much reasoning?",
+            Bands: []string{"a one-line change", "an ordinary fix", "a change across files"}},
+    },
+})
+// out.Answers["intent"].Choice / .Confidence / .Probabilities
+// out.Answers["effort"].Score ; out.Usage</code></pre>
+			<p>
+				注意 score 的 <code>Bands</code> 和 choice 的 <code>Criteria</code> 在线上都叫
+				<code>criteria</code>，但形态不同——score 是有序列表，choice 是映射。
+				所以它在 canonical 类型里是两个字段，不能合并。未命名的 choice 选项（
+				<code>""</code>）在线上保持 <code>null</code>。
+			</p>
+			<h3>三种托管形态</h3>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th><code>WithJevVia</code></th>
+							<th>端点</th>
+							<th>差异</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>JevViaSystemOne</code>（默认）</td>
+							<td><code>{base}/systemone</code></td>
+							<td>body 原样发——TypeSafe 与 magpie 网关的形态</td>
+						</tr>
+						<tr>
+							<td><code>JevViaVercelEval</code></td>
+							<td><code>{base}/evaluation-model</code></td>
+							<td>模型走 <code>ai-model-id</code> 头并附上网关版本头；noul 以 <code>boolean</code> 问，应答归一为 noul；回包没给 <code>confidence</code> 时由概率算出</td>
+						</tr>
+						<tr>
+							<td><code>JevViaCloudflare</code></td>
+							<td><code>{base}/ai/run</code>（base 是账户 URL，如 <code>https://api.cloudflare.com/client/v4/accounts/&lt;id&gt;</code>，不含 <code>/ai</code>）</td>
+							<td>body 包成 <code>{model, input}</code>，答案从 <code>result</code> 里解封</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				<code>Decide</code> 没有流式版本：Jev 一次答完。base URL 含 <code>typesafe</code>
+				时协议推断本来就是 <code>ProtocolJev</code>，但 <code>Decide</code> 不依赖这个——
+				它总是说 System One，<code>jevVia</code> 决定的是<b>怎么问</b>。
+			</p>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/llm.html">examples/llm</a>：一份请求翻成四种 wire body、进程内假上游跑通 Chat 流式与非流式、假 System One 上游问一次 Jev。全部离线。</li>
+				<li><a href="resilience.html">稳定性防护</a>：<code>WithRetry</code> 用的退避与抖动来自 <code>pkg/core/retry</code>。</li>
+				<li><a href="../reference/packages.html">包索引</a>：<code>llm</code> 的导出符号一览。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

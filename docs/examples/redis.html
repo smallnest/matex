@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>redis — 缓存读写与分布式锁 — matex</title>
+		<meta
+			name="description"
+			content="examples/redis：用 pkg/core/redis 做 cache-aside 读写与带 TTL 的 TryLock 分布式锁。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/redis">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>redis — 缓存读写与分布式锁</h1>
+			<p class="lede">
+				<code>pkg/core/redis</code> 包住 go-redis：<code>Open</code> 先 ping 一次，
+				连不上就在启动时失败；业务代码拿到的是两个 JSON 读写入口和一个带 TTL 的分布式锁，
+				不需要 import go-redis。本示例把这两件事各做成一个 HTTP 端点。
+			</p>
+
+			<h2>运行</h2>
+			<p>
+				需要一个真实的 Redis。<code>make dev</code> 会起它（以及其它中间件）。
+				HTTP 默认监听 <code>:8080</code>，配置文件是目录里的
+				<code>config.yaml</code>（<code>-conf</code> 默认指向它）。
+			</p>
+			<pre><code class="language-bash">make dev                      # 起 redis
+go run ./examples/redis       # 等价于 make example NAME=redis</code></pre>
+			<div class="callout callout--warn">
+				<span class="callout__label">未配 redis 段会直接启动失败</span>
+				<code>Setup</code> 用 <code>env.Redis()</code> 逗号-ok 取值，取不到就返回错误。
+				这是刻意的：这个示例的全部能力都依赖 Redis，静默降级只会让问题更晚暴露。
+			</div>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>cache-aside 读</b>：先查缓存，miss 就计算并回填，带 TTL 一起写回。</li>
+				<li><b>命中与未命中的区分</b>：<code>GetJSON</code> 用 <code>ok</code> 报告 miss，
+					<b>不是一个错误</b>。</li>
+				<li><b>写后失效</b>：<code>DELETE</code> 删 key，下一次读会重新回填。</li>
+				<li><b>带 TTL 的分布式锁</b>：<code>TryLock</code> 是带过期时间的 SETNX，
+					持有者崩了也能自动释放，不会死锁。</li>
+				<li><b>锁被占用时的语义</b>：第二个并发请求拿到 <code>ok=false</code>，
+					映射成 <code>409</code>，由调用方决定重试、排队还是放弃。</li>
+			</ul>
+
+			<h2>缓存：cache-aside 回填</h2>
+			<p>
+				下面这段来自 <code>examples/redis/main.go</code> 的 <code>cachedValue</code>。
+				注意 <code>GetJSON</code> 是包级泛型函数（<code>redis.GetJSON[entry](ctx, rc, key)</code>），
+				而 <code>SetJSON</code> 是 <code>*Client</code> 的方法。
+			</p>
+			<pre><code class="language-go">func (s *redisService) cachedValue(ctx context.Context, key string) (value string, cached bool, err error) {
+	full := s.cfg.Prefix + key
+	e, ok, err := redis.GetJSON[entry](ctx, s.rc, full)
+	if err != nil {
+		return "", false, err
+	}
+	if ok {
+		return e.Value, true, nil
+	}
+
+	e = entry{Value: "computed:" + key, ComputedAt: time.Now().UTC()}
+	if err := s.rc.SetJSON(ctx, full, e, s.cfg.TTL); err != nil {
+		return "", false, err
+	}
+	return e.Value, false, nil
+}</code></pre>
+
+			<h2>锁：带 TTL 的 TryLock</h2>
+			<p>
+				来自同一文件的 <code>lock</code> 处理器。<code>TryLock</code> 只做一次尝试，
+				返回的 <code>release</code> 用 Lua 比对 token 再删 key——这样即使锁已经过期、
+				别人拿到了它，也不会误删。
+			</p>
+			<pre><code class="language-go">release, ok, err := s.rc.TryLock(ctx, s.cfg.Prefix+"lock:"+name, s.cfg.LockTTL)
+if err != nil {
+	return nil, err
+}
+if !ok {
+	// Let the caller decide: retry, queue, or give up.
+	return nil, errs.Conflict(40901, "lock %q is held by someone else", name)
+}
+defer func() { _ = release(ctx) }()</code></pre>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    participant C as 调用方
+    participant L as redis（锁 key）
+    participant K as 临界区
+    C->>L: SETNX lock:job1 &lt;token&gt; TTL=5s
+    L-->>C: ok=true（拿到锁）
+    C->>K: 执行临界区（示例 hold=100ms）
+    Note over L: 若持有者崩溃，5s 后 key 自动过期
+    C->>L: Lua: get==token? del : 0
+    L-->>C: 释放（或已被别人持有而不删）
+				</pre>
+				<figcaption>
+					TryLock 的生命周期。TTL 保证崩溃不导致死锁；release 用 Lua 校验 token，
+					避免删掉别人的锁。
+				</figcaption>
+			</figure>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash">curl -i localhost:8080/api/v1/cache/world          # cached=false（miss，回填）
+curl -i localhost:8080/api/v1/cache/world          # cached=true
+curl -i -X DELETE localhost:8080/api/v1/cache/world
+
+# 并发的两个请求，第二个 409
+curl -i -X POST localhost:8080/api/v1/lock/job1 &amp; curl -i -X POST localhost:8080/api/v1/lock/job1</code></pre>
+			<p>
+				命中与未命中以 <code>{"code":0,"msg":"ok","data":{"cached":true,"key":"world","value":"computed:world"}}</code>
+				的封套返回；<code>GET</code> 命中、<code>DELETE</code> 返回
+				<code>{"key":"world","deleted":true}</code>。锁被占用时是
+				<code>409 {"code":40901,"msg":"lock \"job1\" is held by someone else"}</code>。
+			</p>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 用 <code>redistest.Start(t)</code> 拿到一个由进程内
+				miniredis 支撑的真实 <code>*redis.Client</code>（也可以用
+				<code>REDIS_TEST_ADDR</code> 指向真服务器），因此测试<b>不需要 Docker</b>。
+				它钉住三件事：第一次读必然 miss 且值是 <code>computed:k</code>、第二次读必然命中；
+				删除后重新 miss；同一把锁第二次 <code>TryLock</code> 必然 <code>ok=false</code>，
+				释放后又能拿到。
+			</p>
+			<pre><code class="language-bash">go test ./examples/redis</code></pre>
+
+			<h2>相关</h2>
+			<ul>
+				<li><a href="../guide/concepts/cache.html">缓存模式</a>：cache-aside、防击穿、防雪崩。</li>
+				<li><a href="../guide/reference/packages.html">pkg/core 速查</a>：各包入口一览。</li>
+				<li><a href="cache.html">examples/cache</a>：在 redis 之上补并发合并与 TTL 抖动。</li>
+				<li><a href="memcache.html">examples/memcache</a>：另一种缓存后端（无 ping、无 context）。</li>
+				<li>Skill：<code>skills/matex-setup-redis/SKILL.md</code>。</li>
+				<li><a href="index.html">示例索引</a>。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

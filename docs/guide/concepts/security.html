@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>认证与安全 — matex</title>
+		<meta name="description" content="matex 的认证与授权：auth.Verifier 的两种验签模式、按中间件顺序分级保护、Principal、默认安全响应头与 CORS 白名单。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/security">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>认证与安全</h1>
+			<p class="lede">
+				认证落在 <code>httpx</code> 的入站中间件槽上：handler 不解析 <code>Authorization</code>、
+				不手写 401。HTTP 侧的安全头默认下发，CORS 默认不发。两件事合起来就是这一页。
+			</p>
+
+			<h2>Verifier：两种验签模式，二选一</h2>
+			<p>
+				<code>auth.New(Config)</code> 由 <code>Config</code> 里配了哪个字段决定模式。
+				两个都配或都不配都会直接报错——不给出模棱两可的验签路径。
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>模式</th>
+							<th>配置字段</th>
+							<th>接受的算法</th>
+							<th>用途</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>HMAC（共享密钥）</td>
+							<td><code>secret</code></td>
+							<td><code>HS256</code> / <code>HS384</code> / <code>HS512</code></td>
+							<td>内部调用、测试</td>
+						</tr>
+						<tr>
+							<td>非对称（JWKS）</td>
+							<td><code>jwks_url</code></td>
+							<td><code>RS256/384/512</code>、<code>ES256/384/512</code></td>
+							<td>对接 OIDC，公钥从端点拉取</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				算法白名单是写死的（<code>allowedMethods</code>），配合
+				<code>jwt.WithValidMethods</code>。这就是经典的算法混淆攻击的解药：
+				一个用公钥当 HMAC 密钥签出来的 HS256 token，拿到非对称模式的验签器上会被直接拒绝。
+			</p>
+			<pre><code class="language-yaml">auth:
+  # 模式 A：共享密钥（内部调用、测试）
+  # secret: ${AUTH_SECRET}
+  # 模式 B：对接 OIDC，公钥从 JWKS 端点拉
+  jwks_url: https://idp.example.com/.well-known/jwks.json
+
+  issuer: https://idp.example.com   # 可选：校验 iss
+  audience: orders-api              # 可选：校验 aud
+  header: Authorization             # 默认 Authorization
+  scheme: Bearer                    # 默认 Bearer
+  leeway: 30s                       # 容忍时钟偏移，默认 30s
+  jwks_ttl: 10m                     # JWKS 缓存时长，默认 10m</code></pre>
+			<p>
+				留空或删掉 <code>auth:</code> 段即禁用，<code>env.Auth</code> 为 nil。
+				<code>verticle</code> 在配了 <code>secret</code> 或 <code>jwks_url</code> 时构建
+				<code>env.Auth</code>；服务在 <code>BuildRouter</code> 里用它，就是这一层唯一的开关。
+			</p>
+			<p>
+				<code>jwt.WithExpirationRequired()</code> 也总是打开：没有 <code>exp</code> 的 token
+				不是"永不过期"，而是无效。
+			</p>
+
+			<h2>分级保护：靠中间件顺序表达</h2>
+			<p>
+				<code>Use</code> 只护它之后注册的路由，所以"公开 → 登录态 → 更高权限"就是三行代码，
+				不需要任何权限 DSL。
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    REQ([请求]) --> M{{mux 路由匹配}}
+    M -->|"路径是 /api/v1/login"| L["login handler<br/>（公开，签发 token）"]
+    M -->|"其他路径"| AUTH["verifier.Middleware()<br/>验签 → Principal 入 ctx"]
+    AUTH -->|"缺 token / 签名错 / 过期"| E401["401 code 40101"]
+    AUTH -->|"通过"| R1["/api/v1/profile"]
+    AUTH --> G["RequireRole admin<br/>（要求 admin 角色）"]
+    G -->|"角色不足"| E403["403 code 40301"]
+    G -->|"通过"| R2["/api/v1/admin/audit"]
+    classDef deny fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class E401,E403 deny
+				</pre>
+				<figcaption>
+					层级就是书写顺序：<code>srv.Handle</code> 公开路由 → <code>srv.Use(verifier.Middleware())</code>
+					→ <code>srv.Use(auth.RequireRole("admin"))</code>。
+					公开路由必须先注册——<code>Use</code> 不回头保护已经注册的路由。
+				</figcaption>
+			</figure>
+			<pre><code class="language-go">func (s *authDemo) BuildRouter(srv *httpx.Server) error {
+    srv.Handle("POST", "/api/v1/login", s.login)   // 公开
+
+    srv.Use(s.verifier.Middleware())               // 这一行往下都要 token
+    srv.Handle("GET", "/api/v1/profile", profile)
+
+    srv.Use(auth.RequireRole("admin"))             // 再加一层：token + admin
+    srv.Handle("GET", "/api/v1/admin/audit", audit)
+    return nil
+}</code></pre>
+			<p>三个开箱守卫，都是 <code>httpx.Middleware</code>：</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>守卫</th>
+							<th>要求</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>RequireScope(scopes...)</code></td><td>principal 必须携带<b>每一个</b>列出的 scope</td></tr>
+						<tr><td><code>RequireRole(roles...)</code></td><td>必须携带每一个列出的角色</td></tr>
+						<tr><td><code>RequireAnyRole(roles...)</code></td><td>任意一个即可</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				守卫是<b>失败关闭</b>的：没有认证中间件在它前面，<code>mustPrincipal</code> 返回
+				<code>401</code> 而不是放行。漏挂一行不会变成公开接口。
+			</p>
+			<p>
+				更细的资源级授权在 handler 里自己判，用 <code>p.HasScope</code> /
+				<code>p.HasRole</code> / <code>p.HasAnyRole</code>，拒绝时返回
+				<code>errs.Forbidden(40301, …)</code>。
+			</p>
+
+			<h2>Principal：handler 读到的调用方</h2>
+			<pre><code class="language-go">// profile 读中间件放进 ctx 的主体
+func profile(ctx context.Context, _ *http.Request) (any, error) {
+    p, _ := auth.FromContext(ctx)
+    return map[string]any{"subject": p.Subject, "scopes": p.Scopes, "roles": p.Roles}, nil
+}</code></pre>
+			<p>
+				<code>Principal</code> 暴露 <code>Subject</code>、<code>Issuer</code>、
+				<code>Scopes</code>、<code>Roles</code> 与原始 <code>Claims</code>。
+				scope 与 role 的 claim 有好几种方言，<code>principalFrom</code> 都接：
+				scope 认 <code>scope</code>（OAuth2 的空格分隔字符串）、<code>scp</code>、
+				<code>scopes</code>；role 认 <code>roles</code>、<code>role</code>、
+				<code>groups</code>。取第一个非空的。
+			</p>
+			<p>
+				<b><code>Optional()</code></b> 是第三个中间件：有 token 就解析、没有就放行，
+				适合"公开页面登录后个性化"。但<b>畸形</b>的 token 仍然拒绝——静默忽略坏凭证只会藏 bug。
+			</p>
+			<p>
+				签名与密钥解析的失败语义刻意分开：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>情况</th>
+							<th>响应</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td>缺 token / 格式错 / 签名错 / 过期</td><td><code>401 {"code":40101}</code></td></tr>
+						<tr><td>有 token 但 scope / role 不够</td><td><code>403 {"code":40301}</code></td></tr>
+						<tr><td>JWKS 端点不可达</td><td><code>503 {"code":50301}</code></td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				最后一行是刻意的：身份提供方短暂不可用，不该让客户端以为自己的 token 坏了。
+				而且 JWKS 拉取失败时会<b>继续用上一次的公钥</b>（可用性优先），只有从未成功拉取过
+				才对外报 503。缓存里出现没见过的 <code>kid</code> 时会立即重取一次文档，
+				密钥轮转不用等 <code>jwks_ttl</code> 过期；并发请求靠刷新计数器串行化，
+				不会把 IdP 打穿。
+			</p>
+			<p>
+				<b><code>Issue</code></b> 让服务在 HMAC 模式下自己签发 token（内部调用、测试不必
+				再 import JWT 库）。非对称模式下签发方是 IdP，这个方法会报错。
+				<code>IssueRequest.Extra</code> 不能覆盖 <code>sub</code> / <code>iat</code> /
+				<code>exp</code> / <code>iss</code> / <code>aud</code>——否则等于允许调用方伪造身份与有效期。
+			</p>
+
+			<h2>默认安全响应头</h2>
+			<p>
+				<code>httpx.New</code> 在链首装好 <code>SecureHeaders</code>，不用你写。
+				它在<b>任何</b> <code>UseOuter</code> 之前，所以 <code>/healthz</code>、
+				<code>/readyz</code>、<code>/metrics</code>、<code>HandleRaw</code> 路由，
+				以及 guard 渲染的错误响应，全都被覆盖。
+			</p>
+			<pre><code class="language-bash">X-Content-Type-Options: nosniff                              # 不猜 MIME
+X-Frame-Options: DENY                                         # 防点击劫持
+Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
+Referrer-Policy: no-referrer
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Resource-Policy: same-origin
+Permissions-Policy: camera=(), microphone=(), geolocation=()
+Strict-Transport-Security: max-age=31536000; includeSubDomains   # 仅 https</code></pre>
+			<p>
+				CSP 取的是最严的一档，因为 API 只回 JSON：什么都不允许加载、不允许执行。
+				这套头每请求成本为零，默认开而不是默认关的理由是：
+				<b>多一个头对某条路由不合适，可以单独放宽；少一个头则要到审计时才被发现</b>。
+			</p>
+			<div class="callout callout--warn">
+				<span class="callout__label">HSTS 只在 https 上发</span>
+				判定依据是 <code>r.TLS != nil</code> 或 <code>X-Forwarded-Proto: https</code>
+				（TLS 终止在网关时）。明文 http 上发 HSTS 至少会被忽略；若浏览器此前在共享的
+				localhost 端口上收到过，还会被钉死在它并不提供的 https 上。
+			</div>
+
+			<h2>CORS：默认不发，白名单显式给</h2>
+			<p>
+				同源接口不该邀请外部页面来读。<code>CORSPolicy()</code> 空参（也就是默认）
+				不写任何 CORS 头，也没有一个"默认允许"的宽松档位。
+			</p>
+			<pre><code class="language-go">srv.UseOuter(httpx.CORSPolicy("https://app.example"))  // 精确来源；OPTIONS 预检自动应答
+// srv.UseOuter(httpx.CORSPolicy("*"))                 // 任意来源，且不带 credentials</code></pre>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>参数</th>
+							<th>行为</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td>空</td><td>不写任何 CORS 头（默认）</td></tr>
+						<tr><td>精确来源列表</td><td>命中则回该来源 + <code>Access-Control-Allow-Credentials: true</code></td></tr>
+						<tr><td><code>"*"</code></td><td>回 <code>*</code>，<b>不带</b> credentials——两者在规范里不能共存</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				被拒绝时<b>仍然输出 <code>Vary: Origin</code></b>，并且显式删掉
+				<code>Access-Control-Allow-Credentials</code>。前者是缓存正确性的前提：
+				没有它，缓存可能拿 A 来源的响应用来回答 B 来源的请求。
+			</p>
+			<p>
+				<code>CORSPolicy</code> 是 <code>OuterMiddleware</code>，注册在
+				<code>SecureHeaders</code> 之后，所以白名单之外丢掉的只是 CORS 头，安全头照发。
+				预检（带 <code>Access-Control-Request-Method</code> 的 OPTIONS）由它直接回 204。
+			</p>
+
+			<h2>约定</h2>
+			<ul>
+				<li><b>密钥不落文件</b>：生产用 <code>secret: ${AUTH_SECRET}</code> 从环境变量注入。</li>
+				<li><b>登录失败一条消息</b>："用户不存在"和"密码错误"返回同一句话，否则就是给攻击者一个用户名枚举的接口。</li>
+				<li><b>开关不等于权限</b>：运行期翻转功能开关的接口（见<a href="governance.html">开关与审计</a>）本身必须过认证与授权。</li>
+				<li>本包依赖 <code>golang-jwt/jwt/v5</code>（零传递依赖）。验签是安全敏感逻辑，不自研。</li>
+			</ul>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/auth.html">examples/auth</a>：HMAC 验签、三级路由保护、<code>Issue</code> 签发。</li>
+				<li><a href="http.html">HTTP 与路由</a>：中间件槽、封套、安全响应头的挂载位置。</li>
+				<li><a href="governance.html">开关与审计</a>：功能开关与审计轨迹。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

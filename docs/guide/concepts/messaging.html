@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Kafka 消息 — matex</title>
+		<meta name="description" content="pkg/core/kafka：同步与异步生产者、at-least-once 消费循环、单条消息的 panic 隔离、死信队列的提交顺序与降级行为。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/messaging">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>Kafka 消息</h1>
+			<p class="lede">
+				<code>pkg/core/kafka</code> 把 franz-go 关在里面：一个默认 <code>acks=all</code> 的
+				生产者、一个 at-least-once 的消费循环，以及可选死信队列。业务代码不 import franz-go。
+			</p>
+
+			<h2>配了才建</h2>
+			<pre><code class="language-yaml">kafka:
+  brokers: ${KAFKA_BROKERS:localhost:9092}   # 逗号分隔串或 YAML 列表
+  client_id: matex
+  dlq_topic: my.events.dlq                    # 留空则不启用 DLQ</code></pre>
+			<p>
+				<code>brokers</code> 留空即禁用：<code>env.Kafka()</code> 返回 <code>ok=false</code>，
+				<code>env.RequireKafka()</code> 则让启动失败。<code>verticle.Run</code> 按这段配置建
+				<b>一个</b>生产者给所有业务复用，取到后用 <code>env.KafkaCfg</code>（同一份 brokers /
+				client id）去建消费者。
+			</p>
+
+			<h2>生产者：同步还是异步</h2>
+			<pre><code class="language-go">p, err := kafka.NewProducer(kafka.Config{Brokers: []string{"localhost:9092"}, ClientID: "svc"})
+
+err = p.SendSync(ctx, topic, key, value)   // 等 broker 确认；不能丢就用它
+p.Send(ctx, topic, key, value)             // fire-and-forget；失败只记日志
+err = p.SendJSON(ctx, topic, key, obj)     // 同步 + JSON 序列化</code></pre>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>方法</th>
+							<th>语义</th>
+							<th>失败怎么表现</th>
+							<th>什么时候用</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>SendSync</code></td>
+							<td>阻塞到 broker 确认</td>
+							<td>返回包装过的 error，调用者决定怎么办</td>
+							<td>关键事件、事件即业务事实</td>
+						</tr>
+						<tr>
+							<td><code>Send</code></td>
+							<td>立刻返回</td>
+							<td>只记一条 <code>obs.Error</code>，绝不冒泡给调用者</td>
+							<td>可丢的通知、日志、埋点</td>
+						</tr>
+						<tr>
+							<td><code>SendJSON</code></td>
+							<td>序列化后走 <code>SendSync</code></td>
+							<td>序列化失败或发送失败都返回 error</td>
+							<td>结构化事件</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				生产者默认 <code>RequiredAcks(kgo.AllISRAcks())</code>，不额外配置就是持久语义。
+				<code>Close</code> 会 flush 缓冲记录，由 verticle 在关停时调用。
+			</p>
+
+			<h2>消费循环</h2>
+			<p>
+				消费者注册在 <code>Setup</code> 里，用 <code>env.Block</code> 让它随应用启动、随 ctx 取消停止：
+			</p>
+			<pre><code class="language-go">func (s *kafkaService) Setup(ctx context.Context, env *verticle.Env) error {
+	if err := env.DecodeService(&amp;s.cfg); err != nil {
+		return err
+	}
+	p, ok := env.Kafka()
+	if !ok {
+		return errors.New("kafkademo: the `kafka:` section is required")
+	}
+	s.p = p
+
+	if s.cfg.Consume {
+		cfg, topic, group := env.KafkaCfg, s.cfg.Topic, s.cfg.Group
+		env.Block("consumer", func(ctx context.Context) error {
+			return kafka.RunConsumer(ctx, cfg, group, []string{topic}, s.handle)
+		})
+	}
+	return nil
+}</code></pre>
+			<p>
+				handler 签名是 <code>func(ctx context.Context, m *kafka.Message) error</code>，
+				<code>Message</code> 已经归一化成 topic / partition / offset / key / value / time。
+				循环的语义有四点：
+			</p>
+			<ul>
+				<li><b>at-least-once</b>：关闭自动提交，每批 poll（最多 100 条）处理完后<b>同步提交</b>。</li>
+				<li><b>handler 返回 error 只记日志，本批照样提交</b>：一条毒消息不能把整个 partition 卡死。</li>
+				<li><b>起始位点 <code>AtStart</code></b>：换组名会从头消费整个 topic。</li>
+				<li><b>关停时仍提交</b>：用 10 秒超时的 detached context，否则最后一批会被重投给下一个成员。</li>
+			</ul>
+			<div class="callout callout--note">
+				<span class="callout__label">每条消息的 panic 被隔离</span>
+				handler 在一个带 <code>recover</code> 的包装里运行，panic 会连栈一起转成普通 error。
+				一条消息里的 bug 不会带走整个消费者——也就不会连带带走同组的每个成员。
+			</div>
+			<p>
+				at-least-once 意味着<b>可能重复</b>。幂等要自己做：用 key 去重，或写库时靠唯一约束
+				（见 <a href="database.html">数据库</a> 的约束冲突映射）。重试与退避属于 handler 内部的事。
+			</p>
+
+			<h2>死信队列</h2>
+			<p>
+				需要给毒消息留证据、能重放时，把 <code>RunConsumer</code> 换成 <code>RunConsumerDLQ</code>：
+			</p>
+			<pre><code class="language-go">env.Block("consumer", func(ctx context.Context) error {
+	dlq, _ := env.RequireKafka()   // 业务不必再建一个生产者
+	return kafka.RunConsumerDLQ(ctx, env.KafkaCfg, group, []string{topic}, s.handle, dlq)
+})</code></pre>
+			<p>handler 失败时，消息以 <code>kafka.DLQRecord</code> 的 JSON 形态写入 <code>dlq_topic</code>：</p>
+			<pre><code class="language-go">type DLQRecord struct {
+	SourceTopic     string    `json:"source_topic"`
+	SourcePartition int32     `json:"source_partition"`
+	SourceOffset    int64     `json:"source_offset"`
+	SourceTime      time.Time `json:"source_time"`
+	Key             []byte    `json:"key,omitempty"`
+	Value           []byte    `json:"value"`
+	Error           string    `json:"error"`
+}</code></pre>
+			<p>
+				<b>原 key 保留</b>，所以按 key 分区的 DLQ 消费者看到的顺序与源 topic 一致；
+				<code>value</code> 是未经改动的原始字节，加上源坐标就能重放这一条。
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    POLL["PollRecords<br/>一批最多 100 条"] --> H{"handle 单条<br/>（panic 已 recover）"}
+    H -->|"nil"| OK["继续下一条"]
+    H -->|"error"| LG["obs.Error: handle failed<br/>带 topic/partition/offset"]
+    LG --> Q{"dlq_topic 非空<br/>且 dlq 非 nil"}
+    Q -->|否| CMT["降级：与 RunConsumer 相同<br/>log-and-continue"]
+    Q -->|是| PUB["SendSync 到 DLQ<br/>DLQRecord JSON"]
+    PUB -->|成功| WARN["obs.Warn: moved to the dead letter queue"]
+    PUB -->|失败| DROP["obs.Error: publish failed;<br/>record is dropped"]
+    OK --> CMT
+    WARN --> CMT
+    DROP --> CMT
+    CMT["CommitRecords<br/>整批同步提交"] --> NEXT["下一轮 poll"]
+    classDef bad fill:#fbecec,stroke:#b23b3b,color:#2b2722
+    class LG,DROP bad
+				</pre>
+				<figcaption>
+					一条失败消息的路径：先写 DLQ，再提交。DLQ 自己写不进去时记 error 后照常提交——
+					不能为了一条消息把 partition 卡死。
+				</figcaption>
+			</figure>
+			<p>三条行为约定，都是刻意的：</p>
+			<ul>
+				<li>
+					<b>先发 DLQ 再提交</b>：如果先提交再发 DLQ，进程在两者之间挂掉就会同时丢掉这条消息
+					和它的证据。
+				</li>
+				<li>
+					<b>DLQ 发布失败不能卡住 partition</b>：这时代价是丢掉一条<b>已经记过日志</b>的记录，
+					收益是 partition 不会永久停摆。error 级日志是最后的证据。
+				</li>
+				<li>
+					<b><code>dlq_topic</code> 为空（或 <code>dlq</code> 为 nil）即降级</b>：行为与
+					<code>RunConsumer</code> 完全一致。两个条件都不满足时 DLQ 路径才生效，所以传入的
+					<code>dlq</code> 可以是 nil，不必为此多建一个生产者。
+				</li>
+			</ul>
+			<p>
+				DLQ 自身也是一个 <code>RunConsumer</code> / <code>RunConsumerDLQ</code>：在它的 handler
+				里告警或重放。
+			</p>
+
+			<h2>什么时候不用 Kafka</h2>
+			<p>
+				只需要进程内解耦的话，一个带缓冲的 channel 就够了。引入 Kafka 的门槛是：需要
+				<b>跨实例、可回放、单 partition 内有序</b>的事件流。
+			</p>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li>
+					<a href="../../examples/kafka.html">examples/kafka</a>：<code>/events</code> 同步发、
+					<code>/events/async</code> 异步发、<code>/stats</code> 看生产/消费计数。
+				</li>
+				<li><a href="service.html">服务与生命周期</a>：<code>env.Block</code> 与优雅退出。</li>
+				<li><a href="testing.html">离线测试</a>：用 <code>kfake</code> 在进程内起一个 broker。</li>
+				<li><a href="../reference/packages.html">包参考</a>：<code>pkg/core/kafka</code> 的导出面。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

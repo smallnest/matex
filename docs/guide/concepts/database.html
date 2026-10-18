@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>数据库 — matex</title>
+		<meta name="description" content="pkg/core/db：三个驱动一份便携 SQL、泛型扫描、WithTx 与密封的 Querier、重复键映射成 409、按文件名序的迁移与慢查询日志。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/database">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>数据库</h1>
+			<p class="lede">
+				<code>pkg/core/db</code> 在 <code>database/sql</code> 上做一层薄封装：<b>SQL 还是 SQL</b>，
+				一个方言跑三个驱动。业务代码只认 <code>*db.DB</code> / <code>*db.Tx</code> /
+				<code>db.Result</code>，不 import 任何驱动库。
+			</p>
+
+			<h2>三个驱动，一份 SQL</h2>
+			<p>
+				驱动由 <code>Driver</code> 选择，空值默认 PostgreSQL。每个驱动对应一个
+				<code>database/sql</code> driver name：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>driver</th>
+							<th>实现库</th>
+							<th>driver name</th>
+							<th>DSN 示例</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>postgres</code>（默认）</td>
+							<td><code>jackc/pgx/v5/stdlib</code></td>
+							<td><code>pgx</code></td>
+							<td><code>postgres://user:pass@host:5432/db?sslmode=disable</code></td>
+						</tr>
+						<tr>
+							<td><code>mysql</code></td>
+							<td><code>go-sql-driver/mysql</code></td>
+							<td><code>mysql</code></td>
+							<td><code>user:pass@tcp(host:3306)/db?parseTime=true</code></td>
+						</tr>
+						<tr>
+							<td><code>sqlite</code></td>
+							<td><code>modernc.org/sqlite</code>（纯 Go，无 cgo）</td>
+							<td><code>sqlite</code></td>
+							<td><code>file:matex.db</code> 或 <code>:memory:</code></td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>MySQL 的 DSN 记得加 <code>parseTime=true</code>，否则时间列只能扫成字符串。</p>
+			<pre><code class="language-yaml">db:
+  driver: postgres        # postgres | mysql | sqlite
+  dsn: ${DB_DSN:postgres://matex:matex@localhost:5432/matex?sslmode=disable}
+  max_open_conns: 16
+  max_idle_conns: 2
+  conn_max_lifetime: 30m
+  conn_max_idle_time: 5m
+  connect_timeout: 5s
+  slow_threshold: 250ms</code></pre>
+			<p>
+				删掉 <code>db:</code> 段即禁用：<code>env.DB()</code> 返回 <code>ok=false</code>，
+				需要数据库的服务用 <code>env.RequireDB()</code>，此时启动直接失败。
+			</p>
+			<div class="callout callout--note">
+				<span class="callout__label">SQLite 的连接池是 1</span>
+				<code>Open</code> 在驱动为 SQLite 且未显式设 <code>max_open_conns</code> 时把池压到
+				<b>一个连接</b>：SQLite 只有一个写者，单连接池不改你的 SQL 就避开了
+				<code>SQLITE_BUSY</code>。
+			</div>
+
+			<h2>占位符：只写 <code>?</code></h2>
+			<p>
+				业务 SQL 一律写 <code>?</code>。postgres 会在执行前改写成 <code>$1..$n</code>，
+				MySQL 与 SQLite 原样使用。改写器会跳过引号串与注释，并用 <code>??</code> 转义一个字面
+				<code>?</code>——postgres 的 JSON 操作符 <code>?</code> 因此写成 <code>data ?? 'key'</code>，
+				或直接改用 <code>jsonb_exists(...)</code>。
+			</p>
+			<pre><code class="language-go">// 三种驱动共用同一份 SQL。
+const insert = `INSERT INTO articles (slug, title, views, published, note, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?)`
+
+_, err := d.Exec(ctx, insert, "hello-matex", "Hello matex", 0, false, nil, now)</code></pre>
+			<p>
+				保持一个占位符风格意味着 SQL 是便携的；只有驱动专属的写法（DDL 类型、upsert 语法、
+				<code>RETURNING</code>）需要单独注意。
+			</p>
+
+			<h2>泛型扫描：QueryAll / QueryOne / QueryScalar</h2>
+			<p>
+				结果行按 <code>db</code> tag 映射到结构体字段，缺省用字段名，大小写不敏感。
+				<b>多余的列直接忽略</b>，所以 <code>SELECT *</code> 在表加列后不会出错。
+			</p>
+			<pre><code class="language-go">type Article struct {
+	Slug      string    `db:"slug"       json:"slug"`
+	Title     string    `db:"title"      json:"title"`
+	Views     int64     `db:"views"      json:"views"`
+	Published bool      `db:"published"  json:"published"`
+	Note      *string   `db:"note"       json:"note"`       // NULL → nil
+	UpdatedAt time.Time `db:"updated_at" json:"updated_at"` // RFC3339 字符串 → time.Time
+}
+
+a, err := d.QueryOne[Article](ctx, `SELECT * FROM articles WHERE slug = ?`, slug)
+list, err := d.QueryAll[Article](ctx, `SELECT * FROM articles ORDER BY slug`)
+n, err := d.QueryScalar[int64](ctx, `SELECT COUNT(*) FROM articles`)</code></pre>
+			<p>扫描的类型转换是固定的：</p>
+			<ul>
+				<li><b>NULL</b> 进指针字段即置 nil；进 <code>sql.Null*</code> 或任何自定义
+					<code>sql.Scanner</code> 则交给该类型自己解码。</li>
+				<li><b>时间列</b>是 <code>time.Time</code> 就用它；是字符串则依次按 RFC3339Nano、
+					<code>2006-01-02 15:04:05.999999999-07:00</code>、<code>2006-01-02 15:04:05</code>、
+					<code>2006-01-02</code> 解析。</li>
+				<li><b>数值与布尔</b>支持跨驱动的宽松转换（如 <code>[]byte</code> → <code>int64</code>），
+					溢出即报错，不静默截断。</li>
+				<li><b><code>[]byte</code></b> 是唯一支持的切片字段类型。</li>
+			</ul>
+			<div class="callout callout--tip">
+				<span class="callout__label">查无此行是 db.ErrNoRow</span>
+				<code>QueryOne</code> / <code>QueryScalar</code> 无匹配行时返回哨兵错误
+				<code>db.ErrNoRow</code>，用 <code>errors.Is(err, db.ErrNoRow)</code> 判断，
+				业务层通常把它映射成 <code>errs.NotFound</code>。它不是 SQL 错误，不会进 500。
+			</div>
+
+			<h2>事务与密封的 Querier</h2>
+			<p>
+				<code>WithTx</code> 在 <code>fn</code> 返回 nil 时提交，返回 error 或 panic 时回滚。
+				<code>*db.Tx</code> 与 <code>*db.DB</code> 提供<b>同一组方法</b>。
+			</p>
+			<pre><code class="language-go">err := d.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
+	if _, err := tx.Exec(ctx, `UPDATE accounts SET balance = balance - ? WHERE id = ?`, amt, from); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE accounts SET balance = balance + ? WHERE id = ?`, amt, to); err != nil {
+		return err
+	}
+	return nil // nil 提交；返回 error（或 panic）自动回滚
+})</code></pre>
+			<p>
+				让一段 DAO 代码在池上和事务里都能跑，靠的是 <code>db.Querier</code>：
+				DAO 方法收 <code>db.Querier</code> 而不是 <code>*db.DB</code>。
+			</p>
+			<pre><code class="language-go">type articleDAO struct{}
+
+func (articleDAO) bySlug(ctx context.Context, q db.Querier, slug string) (*Article, error) {
+	return db.QueryOne[Article](ctx, q, `SELECT * FROM articles WHERE slug = ?`, slug)
+}
+
+db, _ := env.RequireDB()
+a, err := dao.bySlug(ctx, db, "hello-matex")           // 池上
+
+err = db.WithTx(ctx, func(ctx context.Context, tx *db.Tx) error {
+	_, err := dao.bySlug(ctx, tx, "hello-matex")       // 同一份代码，事务内
+	return err                                          // 事务里能读到本事务自己的写
+})</code></pre>
+			<div class="callout callout--note">
+				<span class="callout__label">为什么 Querier 必须存在</span>
+				<b>接口的方法不能带类型参数</b>——类型可以（Go 1.27 起），接口不行，编译器报
+				<code>interface method must have no type parameters</code>。所以
+				<code>QueryOne[T]</code> 只能是包级函数 <code>db.QueryOne[T](ctx, q, …)</code>，
+				而 <code>q</code> 的类型是 <code>Querier</code>。接口是<b>密封的</b>（唯一方法是未导出的
+				<code>conn()</code>），所以实现只有 <code>*DB</code> 与 <code>*Tx</code>，业务代码长不出
+				第三条访问驱动的路。
+			</div>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TB
+    H["handler"] --> D["articleDAO<br/>方法签名收 db.Querier"]
+    D -->|"直接调用<br/>dao.bySlug(ctx, db, slug)"| POOL["*db.DB<br/>连接池"]
+    H -->|"db.WithTx(ctx, fn)"| TXU["WithTx<br/>BeginTx → fn → Commit"]
+    TXU -->|"回调收到 *db.Tx"| TX["*db.Tx<br/>同一个 Querier"]
+    TX -->|"dao.bySlug(ctx, tx, slug)"| D
+    POOL --> SQL[("SQL")]
+    TX --> SQL
+    TXU -.->|"fn 返回 error / panic"| RB["Rollback"]
+    classDef one fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class D one
+				</pre>
+				<figcaption>
+					一个 DAO，两个调用点。事务内复用同一份 SQL 代码，不需要 <code>bySlug</code> +
+					<code>bySlugTx</code> 的两个方法。
+				</figcaption>
+			</figure>
+
+			<h2>错误映射：约束冲突 → 409</h2>
+			<p>
+				业务代码看不到驱动错误。每次调用返回前，<code>db</code> 都会把一个驱动错误包装成
+				<code>errs</code> 的某个 Kind，HTTP 层据此选状态码：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>来源错误</th>
+							<th>映射结果</th>
+							<th>HTTP</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>context.DeadlineExceeded</code></td>
+							<td><code>errs.KindTimeout</code>（50400）</td>
+							<td>504</td>
+						</tr>
+						<tr>
+							<td><code>context.Canceled</code></td>
+							<td><code>errs.KindUnavailable</code>（50300）</td>
+							<td>503</td>
+						</tr>
+						<tr>
+							<td>唯一约束冲突</td>
+							<td><code>errs.KindConflict</code>（40901）</td>
+							<td>409</td>
+						</tr>
+						<tr>
+							<td>其它</td>
+							<td><code>errs.InternalWrap</code>（50000）</td>
+							<td>500</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				识别冲突发生在包内一个叫 <code>driverCode</code> 的缝上：Postgres 的 <code>23505</code>
+				与 SQLite 的 <code>2067</code>（扩展码 <code>SQLITE_CONSTRAINT_UNIQUE</code>）通过
+				<b>方法</b>暴露，按结构匹配；MySQL 把 <code>Number</code>（<code>1062</code>）只暴露成
+				字段，按具体类型匹配。业务层因此不需要知道背后是哪种库，就能对重复写入返回 409。
+			</p>
+			<pre><code class="language-go">// handler 不用判断是哪个库：插入重复 slug 直接就是 409。
+_, err := dao.insert(ctx, db, a, now)
+if err != nil {
+	return nil, err // KindConflict → 409 {"code":40901,…}
+}</code></pre>
+
+			<h2>便携写法的几条硬规矩</h2>
+			<ul>
+				<li>主键用 <code>VARCHAR(n)</code>，别用 <code>TEXT</code>——MySQL 不能索引裸 TEXT 主键。</li>
+				<li>别依赖 <code>AUTO_INCREMENT</code> / <code>SERIAL</code> / <code>IDENTITY</code>；ID 由应用生成。</li>
+				<li>时间戳在 Go 里格式化后写入（<code>time.Now().UTC().Format(time.RFC3339)</code>），
+					不要 <code>now()</code> / <code>CURRENT_TIMESTAMP</code>。</li>
+				<li>upsert 三方言不同（<code>ON CONFLICT</code> / <code>ON DUPLICATE KEY</code> /
+					<code>INSERT OR REPLACE</code>）：跨库就先 <code>UPDATE</code>，
+					<code>RowsAffected()==0</code> 再 <code>INSERT</code>。</li>
+				<li><code>RETURNING</code> 只有 postgres / sqlite 有；MySQL 用 <code>LastInsertId</code>
+					或再查一次。</li>
+			</ul>
+
+			<h2>迁移：按文件名序，只追加</h2>
+			<p>
+				<code>ApplyMigrations(ctx, dir)</code> 遍历目录里所有 <code>*.sql</code>，
+				<b>按文件名排序</b>执行未应用的文件，状态记在 <code>schema_migrations</code> 表
+				（<code>version</code> + <code>applied_at</code>）。每个文件在一个事务里跑完：
+				语句执行成功后才写入记录，中途失败则整个文件回滚。
+			</p>
+			<pre><code class="language-bash">make migrate DSN=postgres://...                          # 默认 postgres
+go run ./cmd/migrate -driver sqlite -dsn file:matex.db
+go run ./cmd/migrate -driver mysql  -dsn 'user:pass@tcp(localhost:3306)/matex?parseTime=true'</code></pre>
+			<div class="callout callout--warn">
+				<span class="callout__label">追加新文件，不要改老文件</span>
+				已执行的版本名记在表里，改了老文件的内容也不会重跑——改了等于没改，只有新环境才用得上。
+				迁移体按 <code>;</code> 切分语句，所以别在一个文件里写 <code>CREATE FUNCTION</code> 这类
+				含分号的构造。
+			</div>
+			<p>
+				PostgreSQL 下整个迁移过程持一把 advisory lock（key 是常量
+				<code>0x6d61746578</code>，即 "matex"），并且锁与释放都发生在<b>同一条
+				<code>*sql.Conn</code></b> 上：多个副本同时启动时，只有一个真正执行 DDL，其余等待。
+				MySQL 与 SQLite 不加锁（SQLite 是测试驱动；MySQL 需要别致的机制）——已应用状态的检查
+				加上容忍 <code>IF NOT EXISTS</code> 的 DDL 覆盖了常见情况。
+			</p>
+
+			<h2>慢查询日志</h2>
+			<p>
+				每次 <code>Exec</code> / <code>Query</code> 都计时。超过 <code>slow_threshold</code>
+				（默认 250ms；<code>Config</code> 未设或小于 0 时回落到这个默认）就记一条 warn，带上操作类型、
+				耗时、被截断到 200 字符的 SQL 以及错误：
+			</p>
+			<pre><code class="language-json">{"level":"WARN","msg":"db slow query","op":"query","dur_ms":412,"sql":"SELECT * FROM articles WHERE slug = ?","err":null}</code></pre>
+			<p>阈值是每个 <code>*DB</code> 自己的属性，事务里的语句沿用池的阈值。</p>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li>
+					<a href="../../examples/database.html">examples/database</a>：三驱动、<code>?</code>
+					占位符、泛型扫描、<code>WithTx</code>、DAO 进出事务。
+				</li>
+				<li><a href="cache.html">缓存模式</a>：把回源包在 <code>cache.GetOrLoad</code> 里。</li>
+				<li><a href="testing.html">离线测试</a>：<code>dbtest.Start(t)</code> 起一个已迁移的库。</li>
+				<li><a href="../reference/packages.html">包参考</a>：<code>pkg/core/db</code> 的导出面。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

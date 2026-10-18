@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>kafka — 生产者、消费者与死信队列 — matex</title>
+		<meta
+			name="description"
+			content="examples/kafka：同步/异步生产者、env.Block 里的 at-least-once 消费循环，以及 pkg/core/kafka 的 DLQ 路径。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/kafka">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>kafka — 生产者、消费者与死信队列</h1>
+			<p class="lede">
+				<code>pkg/core/kafka</code> 包住 franz-go：<code>NewProducer</code> 默认
+				<code>acks=all</code>（durable），<code>RunConsumer</code> 是一个 at-least-once
+				的消费循环。本示例把生产者做成两个 HTTP 端点，把消费者注册成
+				<code>env.Block</code>，随应用一起启动、随 ctx 取消一起停止。
+			</p>
+
+			<h2>运行</h2>
+			<p>
+				需要真实的 Kafka，先 <code>make dev</code>（起一个单节点 KRaft broker）。
+				HTTP 默认监听 <code>:8080</code>，配置文件是目录里的 <code>config.yaml</code>，
+				<code>-conf</code> 默认指向它。
+			</p>
+			<pre><code class="language-bash">make dev                      # 起 Kafka（KRaft 单节点）
+go run ./examples/kafka       # 等价于 make example NAME=kafka</code></pre>
+			<div class="callout callout--note">
+				<span class="callout__label">生产者由框架建，你只借用</span>
+				<code>verticle.Run</code> 按 <code>kafka:</code> 段创建<b>一个</b>生产者并复用
+				（<code>p, ok := env.Kafka()</code>；一定要有就用 <code>env.RequireKafka()</code>），
+				不需要自己 <code>NewProducer</code>，也不需要自己 <code>Close</code>。
+			</div>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>同步生产</b>：<code>SendSync</code> 等 broker 确认，写请求不能丢时用它。</li>
+				<li><b>异步生产</b>：<code>Send</code> 立即返回，失败只记日志（fire-and-forget）。</li>
+				<li><b>消费循环挂在生命周期上</b>：<code>env.Block("consumer", …)</code>
+					让它随应用启动、随 ctx 取消停止，不用自己管 goroutine。</li>
+				<li><b>at-least-once 与它的代价</b>：handler 返回 error 只记日志，本批照样提交，
+					所以可能重复——幂等要自己做。</li>
+				<li><b>可开关的消费</b>：配置项 <code>kafka.consume</code>（示例里是
+					<code>kafkademo.consume</code>），<code>false</code> 时只产不消，适合网关/写入侧。</li>
+				<li><b>生产/消费计数</b>：<code>/api/v1/stats</code> 暴露 <code>produced</code>
+					与 <code>consumed</code>。</li>
+			</ul>
+
+			<h2>消费者注册</h2>
+			<p>
+				来自 <code>examples/kafka/main.go</code> 的 <code>Setup</code>。
+				注意它复用生产者用过的同一份 broker 配置（<code>env.KafkaCfg</code>），
+				组名与 topic 来自服务段。
+			</p>
+			<pre><code class="language-go">if s.cfg.Consume {
+	// The same brokers/client id the producer used.
+	cfg, topic, group := env.KafkaCfg, s.cfg.Topic, s.cfg.Group
+	env.Block("consumer", func(ctx context.Context) error {
+		obs.Info(ctx, "consumer started", "topic", topic, "group", group)
+		return kafka.RunConsumer(ctx, cfg, group, []string{topic}, s.handle)
+	})
+}</code></pre>
+
+			<h2>同步生产</h2>
+			<p>
+				来自 <code>publishSync</code>。生产者的错误已经被包过一层，直接返回即可；
+				成功才增加计数。
+			</p>
+			<pre><code class="language-go">if err := s.p.SendSync(ctx, s.cfg.Topic, []byte(e.Key), []byte(e.Value)); err != nil {
+	return nil, err // kafka wrapper already wrapped it
+}
+s.produced.Add(1)
+return map[string]any{"topic": s.cfg.Topic, "key": e.Key, "mode": "sync"}, nil</code></pre>
+
+			<h2>死信队列</h2>
+			<p>
+				本示例注册的是 <code>kafka.RunConsumer</code>，它遇到 handler 错误是
+				"记日志后照样提交"。<code>pkg/core/kafka</code> 还提供
+				<code>RunConsumerDLQ</code>：handler 出错时先把消息以
+				<code>kafka.DLQRecord</code>（源 topic / partition / offset、key、value、error）
+				写进 <code>cfg.DLQTopic</code>，写完再提交本批。
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    P["PollRecords(maxPoll=100)"] --> H{"handle(msg)"}
+    H -- "err == nil" --> C["提交本批 offset"]
+    H -- "err != nil" --> D{"RunConsumerDLQ<br/>DLQTopic 非空?"}
+    D -- "是" --> S["dlq.SendSync(DLQRecord)<br/>保留原 key 与源坐标"]
+    S --> C
+    D -- "否" --> C
+    C --> P
+    classDef drop fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    classDef ok fill:#eef7f0,stroke:#2f7d4f,color:#22372a
+    class C,S ok
+    class D drop
+				</pre>
+				<figcaption>
+					死信路径。只有 <code>RunConsumerDLQ</code> 且 <code>DLQTopic</code> 非空时才
+					写 DLQ；若连写 DLQ 也失败，消息记日志后仍提交——把 partition 永久堵在一个坏掉的
+					DLQ 上，比丢掉一条已经记过日志的记录更糟。
+				</figcaption>
+			</figure>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash">curl -i -X POST localhost:8080/api/v1/events       -d '{"key":"u1","value":"hello"}'
+curl -i -X POST localhost:8080/api/v1/events/async -d '{"key":"u2","value":"fire-and-forget"}'
+curl -i localhost:8080/api/v1/stats</code></pre>
+			<p>
+				两个生产端点都返回 <code>{"topic":"matex.example.events","key":"u1","mode":"sync"}</code>
+				（异步端 <code>mode</code> 为 <code>async</code>）；空 <code>value</code> 回
+				<code>400 {"code":40002,"msg":"value is required"}</code>。
+				<code>/api/v1/stats</code> 返回
+				<code>{"topic":…,"group":"kafkademo-consumers","produced":N,"consumed":M}</code>——
+				消费由后台 <code>env.Block</code> 完成，稍等片刻 <code>consumed</code> 就会涨上来。
+			</p>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 用 <b>kfake</b>（进程内 broker，<code>kfake.NewCluster</code>）
+				起一个单 broker 集群并 seed 一个 topic，然后用真实的
+				<code>kafka.NewProducer</code> + <code>kafka.RunConsumer</code> 跑一遍
+				生产-消费闭环。它钉住"发出去的消息能被同组消费者收到且 value 一致"，
+				<b>不需要 Docker、不需要网络</b>。kfake 是唯一允许示例测试 import 的
+				franz-go 子包（见 <code>.golangci.yml</code> 的 <code>examples-no-drivers</code>），
+				因为它只是测试替身。
+			</p>
+			<pre><code class="language-bash">go test ./examples/kafka</code></pre>
+			<p>
+				运行时记得：起始位点是 <code>AtStart</code>，新组会把 topic 里的历史消息全读一遍；
+				换组名也会从头消费。
+			</p>
+
+			<h2>相关</h2>
+			<ul>
+				<li><a href="../guide/concepts/messaging.html">Kafka 消息</a>：生产/消费与交付语义。</li>
+				<li><a href="../guide/concepts/observability.html">可观测性</a>：消费日志里的 trace id。</li>
+				<li><a href="observability.html">examples/observability</a>：结构化日志与指标。</li>
+				<li>Skill：<code>skills/matex-setup-kafka/SKILL.md</code>。</li>
+				<li><a href="index.html">示例索引</a>。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

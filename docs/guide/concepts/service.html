@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>服务与生命周期 — matex</title>
+		<meta name="description" content="verticle.Service、Env 访问器、后台任务、清理栈、优雅退出与配置热更。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/service">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>服务与生命周期</h1>
+			<p class="lede">
+				一个部署单元就是一个 <code>verticle.Service</code>。三个方法定义了它的边界，
+				其余全部由 <code>Run</code> 驱动：进程怎么起、依赖怎么来、怎么停。
+			</p>
+
+			<h2>三个方法</h2>
+			<pre><code class="language-go">package verticle
+
+type Service interface {
+    Name() string                              // 配置段 key、日志与指标前缀
+    Setup(ctx context.Context, env *Env) error // 解码服务段、装配 domain
+    BuildRouter(s *httpx.Server) error         // 注册路由
+}</code></pre>
+			<ul>
+				<li>
+					<b><code>Name()</code></b> 决定去配置文件的哪一段取服务自己的配置，
+					同时作为日志与指标的 service 标签。框架段（<code>http</code>、<code>db</code>…）
+					与它无关。
+				</li>
+				<li>
+					<b><code>Setup</code></b> 做装配：解码服务段、从 <code>env</code> 取基础设施句柄、
+					构造 domain。这里是<b>唯一</b>该出现"装配代码"的地方。
+				</li>
+				<li>
+					<b><code>BuildRouter</code></b> 只注册路由，不写业务逻辑。
+				</li>
+			</ul>
+
+			<p>完整实现见 <code>internal/app/service.go</code>：</p>
+			<pre><code class="language-go">func (s *DemoService) Name() string { return "demo" }
+
+func (s *DemoService) Setup(ctx context.Context, env *verticle.Env) error {
+    if err := env.DecodeService(&amp;s.cfg); err != nil {   // 解码 demo 段
+        return err
+    }
+    deps := helloworld.Deps{Greeting: s.cfg.Greeting}
+    if db, ok := env.DB(); ok { deps.DB = db }          // 可选依赖：逗号-ok
+    if rc, ok := env.Redis(); ok { deps.Redis = rc }
+    s.hello = helloworld.New(deps)
+
+    env.Block("consumer", s.consume)                    // 后台任务随进程生命周期
+    return nil
+}
+
+func (s *DemoService) BuildRouter(srv *httpx.Server) error {
+    h := helloworld.NewHandler(s.hello)
+    srv.Handle("GET", "/api/v1/hello/{name}", h.Greet)
+    srv.Handle("GET", "/api/v1/hello/stats/{name}", h.Stats)
+    return nil
+}</code></pre>
+
+			<h2>Env：基础设施的唯一入口</h2>
+			<p>
+				业务拿不到 <code>*sql.DB</code> 或 redis 客户端本身，只能经访问器取。<b>同一件事有两个
+				访问器</b>，选哪个就表达了这段代码对依赖的期望：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>访问器</th>
+							<th>行为</th>
+							<th>什么时候用</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>RequireDB()</code></td>
+							<td>未配置时返回错误，启动失败</td>
+							<td>没有这个依赖服务就没意义（例如 DAO 层）</td>
+						</tr>
+						<tr>
+							<td><code>DB()</code></td>
+							<td>返回 <code>(*db.DB, bool)</code></td>
+							<td>依赖可选，没有就走降级路径</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>同样的两套访问器覆盖 <code>Redis</code> / <code>Memcache</code> / <code>Kafka</code>。</p>
+			<div class="callout callout--note">
+				<span class="callout__label">为什么不是 Dev / Prod 两套装配</span>
+				依赖是否存在是<b>部署事实</b>，不是环境名。本地开发想省掉 Kafka，就删掉那一段配置——
+				代码不用改，也不会因为断言而炸。
+			</div>
+
+			<h2>可选接口：按需实现</h2>
+			<p>服务可以实现这些接口中的任意子集，<code>Run</code> 会探测：</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>接口</th>
+							<th>作用</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>ConfigWatcher</code></td>
+							<td>
+								<code>OnServiceConfigChange(raw map[string]any)</code>：配置文件变化时收到
+								本服务段的新内容。
+							</td>
+						</tr>
+						<tr>
+							<td><code>ReadyChecker</code></td>
+							<td><code>Ready(ctx) error</code>：<code>/readyz</code> 的判定，返回错误即 503。</td>
+						</tr>
+						<tr>
+							<td><code>GRPCRegistrar</code></td>
+							<td><code>RegisterGRPC(*grpc.Server)</code>：只有实现了才会监听 <code>grpc.addr</code>。</td>
+						</tr>
+						<tr>
+							<td><code>RPCXRegistrar</code></td>
+							<td><code>RegisterRPCX(*rpcx.Server)</code>：同上，对应 <code>rpcx.addr</code>。</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>后台任务与清理栈</h2>
+			<p>两类"服务活着就得一直跑"的东西有专门的位置，不用自己管 goroutine 与信号：</p>
+			<pre><code class="language-go">// Block：阻塞式后台任务。ctx 取消即返回，Run 会等它退出。
+env.Block("cron", s.sched.Run)
+env.Block("consumer", func(ctx context.Context) error {
+    return kafka.RunConsumer(ctx, cfg, group, topics, s.handle)
+})
+
+// AddCloser：清理函数，逆序执行（后注册的先跑）。
+env.AddCloser(func() { _ = s.producer.Close() })</code></pre>
+			<div class="callout callout--warn">
+				<span class="callout__label">Block 必须响应 ctx</span>
+				退出时框架会<b>等</b>每个 Block 返回。一个忽略 ctx 的 Block 会让优雅退出卡住，
+				最后只能被超时强杀。写循环时永远 <code>select</code> 在 <code>ctx.Done()</code> 上。
+			</div>
+
+			<h2>退出顺序</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant K as K8s / 终端
+    participant V as verticle.Run
+    participant B as Block 任务
+    participant H as HTTP server
+    participant I as 基础设施
+    K->>V: SIGTERM / ctx 取消
+    V->>B: 取消 ctx
+    B-->>V: 任务返回（定时任务停、消费者收尾）
+    V->>H: Shutdown(ctx)
+    H-->>V: 在途请求排空完成
+    V->>V: flush 链路追踪
+    V->>I: 逆序执行 AddCloser，关连接池
+    V-->>K: Run 返回 nil
+				</pre>
+				<figcaption>
+					先停后台任务再排空 HTTP：否则排空期间定时任务还在产生新工作。
+					基础设施最后关：排空中的请求还要用它。
+				</figcaption>
+			</figure>
+
+			<h2>配置热更</h2>
+			<p>
+				实现 <code>ConfigWatcher</code> 即可。注意它收到的是<b>服务段</b>的原始 map，
+				通常需要解码成一个新的配置结构再原子替换：
+			</p>
+			<pre><code class="language-go">func (s *Service) OnServiceConfigChange(raw map[string]any) {
+    var cfg lifecycleConfig
+    if err := config.ParseMap(raw, &amp;cfg); err != nil {
+        obs.Warn(context.Background(), "reload rejected", "err", err)
+        return   // 新配置不合法就保持旧配置，不要半更新
+    }
+    s.mu.Lock()
+    s.cfg = cfg
+    s.mu.Unlock()
+}</code></pre>
+			<div class="callout callout--note">
+				<span class="callout__label">热更不重建设施</span>
+				热更只更新服务段配置，不重建 db / redis 连接池——连接池的生命周期与配置的生命周期
+				本来就不同。要改连接参数请滚动重启。
+			</div>
+
+			<h2>就绪与存活</h2>
+			<p>
+				<code>/healthz</code> 是存活探针，不查任何依赖；<code>/readyz</code> 会 ping 已配置的
+				基础设施并调用服务的 <code>ReadyChecker</code>。把"依赖还没就绪"和"进程还活着"
+				分开，才不会在依赖抖动时被 K8s 反复重启：
+			</p>
+			<pre><code class="language-go">func (s *Service) Ready(context.Context) error {
+    if time.Since(s.started) &lt; warmup {
+        return errs.Unavailable(50301, "warming up")   // → /readyz 返回 503
+    }
+    return nil
+}</code></pre>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/lifecycle.html">examples/lifecycle</a>：Block、Closer、热更、就绪门。</li>
+				<li><a href="../../examples/http.html">examples/http</a>：最小服务的路由注册。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

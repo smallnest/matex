@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>audit — 审计日志与可插拔 sink — matex</title>
+		<meta
+			name="description"
+			content="examples/audit：每个业务动作一条结构化审计记录，actor/action/resource/result，sink 可替换。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/audit">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>audit — 审计日志与可插拔 sink</h1>
+			<p class="lede">
+				<code>pkg/core/audit</code> 记录<b>谁对什么资源做了什么、结果如何</b>——
+				合规审查和事故排查读的那条线索。默认一条事件变成一行结构化日志；
+				用 <code>audit.SetSink</code> 可以把它改道到一个持久 sink（审计表、
+				只追加的 Kafka topic、不可变文件）。
+			</p>
+
+			<h2>运行</h2>
+			<p>
+				完全离线，不需要 <code>make dev</code>。HTTP 默认监听 <code>:8086</code>，
+				配置文件是目录里的 <code>config.yaml</code>，<code>-conf</code> 默认指向它。
+				写端点要求请求头 <code>X-API-Key</code>（默认值 <code>demo-key</code>）。
+			</p>
+			<pre><code class="language-bash">go run ./examples/audit           # 等价于 make example NAME=audit</code></pre>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>一个业务动作一条记录</b>：<code>audit.Record</code> 记下
+					<code>Actor / Action / Resource / Result</code>。</li>
+				<li><b>成功和失败都记</b>：重复退款返回 <code>409</code>，同样入审计
+					（<code>Result: audit.Failure</code>，并带 <code>Detail</code> 说明原因）。</li>
+				<li><b>Record 自动补时间与 trace id</b>：<code>At</code> 与
+					<code>TraceID</code> 为空时由框架填，所以审计轨迹能和日志对齐。</li>
+				<li><b>sink 可插拔</b>：默认是结构化日志；示例用
+					<code>audit.SetSink(s.store)</code> 换成内存表，从而能在端点里读回来。</li>
+				<li><b>鉴权拒绝不是业务动作</b>：缺 / 错 API key 返回 <code>401</code>，
+					<b>不写审计</b>——它没走到业务逻辑。</li>
+			</ul>
+
+			<h2>记录一个业务动作</h2>
+			<p>
+				来自 <code>examples/audit/main.go</code> 的 <code>refund</code>。
+				注意记录在 <code>return</code> 之前写下，所以审计轨迹与调用方看到的响应一致；
+				失败路径带一个 <code>Detail</code> 说明原因。
+			</p>
+			<pre><code class="language-go">s.store.mu.Lock()
+done := s.store.refunded[id]
+s.store.mu.Unlock()
+if done {
+	audit.Record(ctx, audit.Event{
+		Actor: actor, Action: "order.refund", Resource: resource, Result: audit.Failure,
+		Detail: map[string]string{"reason": "already refunded"},
+	})
+	return nil, errs.Conflict(40901, "order already refunded")
+}
+s.store.mu.Lock()
+s.store.refunded[id] = true
+s.store.mu.Unlock()
+audit.Record(ctx, audit.Event{
+	Actor: actor, Action: "order.refund", Resource: resource, Result: audit.Success,
+})
+return map[string]any{"refunded": id}, nil</code></pre>
+
+			<h2>装上自定义 sink</h2>
+			<p>
+				来自 <code>Setup</code>。示例的 <code>orderStore</code> 既是业务存储又是审计
+				sink；真实服务在这里换成数据库写入，<b>同步写并上报错误</b>，否则轨迹会有洞。
+			</p>
+			<pre><code class="language-go">// A second destination beside the default log sink: the demo keeps the
+// trail in memory so it can be read back. A real service writes to a
+// table or an append-only topic here — synchronously, and reporting
+// write errors, or the trail has holes.
+s.store = &orderStore{refunded: map[int64]bool{}}
+audit.SetSink(s.store)</code></pre>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    B["业务动作成功 / 被拒"] --> R["audit.Record(ctx, Event)"]
+    R --> S{"SetSink 装过吗?"}
+    S -- "否（默认）" --> L["logSink：obs.Info<br/>audit_actor / audit_action<br/>audit_resource / audit_result"]
+    S -- "是" --> D["自定义 Sink.Write(ctx, Event)<br/>审计表 / DLQ topic / WORM 文件"]
+    R -. "补 At 与 TraceID" .-> R
+    classDef plug fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class S,D plug
+				</pre>
+				<figcaption>
+					sink 的插拔点。<code>Record</code> 负责把字段补全并盖时间戳，然后<b>同步</b>
+					调 <code>Sink.Write</code>；顺序、保留期、不可篡改与访问控制都由 sink 负责。
+				</figcaption>
+			</figure>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash">curl -i -X POST localhost:8086/api/v1/orders/42/refund -H 'X-API-Key: demo-key'   # 200
+curl -i -X POST localhost:8086/api/v1/orders/42/refund -H 'X-API-Key: demo-key'   # 409，同样入审计
+curl -s localhost:8086/api/v1/audit                                              # 内存里的审计轨迹</code></pre>
+			<p>
+				第一次返回 <code>{"code":0,"msg":"ok","data":{"refunded":42}}</code>；
+				第二次是 <code>409 {"code":40901,"msg":"order already refunded"}</code>。
+				<code>GET /api/v1/audit</code> 返回一个数组，每项的字段与值形如
+				<code>{"at":"…"</code> <code>"actor":"anonymous"</code>
+				<code>"action":"order.refund"</code> <code>"resource":"order/42"</code>
+				<code>"result":"success"</code> <code>"detail":null</code>
+				<code>"trace_id":"…"}</code>；
+				失败那条 <code>result</code> 为 <code>"failure"</code> 且 <code>detail</code> 含
+				<code>reason</code>。加 <code>-H 'X-User: alice'</code> 可把
+				<code>actor</code> 从 <code>anonymous</code> 改成 <code>alice</code>。
+			</p>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 完全离线：它按 <code>verticle</code> 的方式跑
+				<code>Setup</code>（装上 sink）再 <code>BuildRouter</code>，用
+				<code>httptest</code> 发请求。它钉住三件事：
+				<b>每个结果各只记一条</b>（一次成功 + 一次 <code>409</code> 失败，共 2 条，
+				成功事件字段正确、失败事件带 <code>Detail</code>，且事件都被盖了时间与 trace id）；
+				<b>鉴权拒绝不是业务动作</b>（<code>401</code> 后审计表为空）；
+				<b>审计端点如实回放</b>（<code>POST</code> 退款 <code>order/7</code> 后，
+				trail 里能查到 <code>"resource":"order/7"</code> 与 <code>"actor":"bob"</code>）。
+			</p>
+			<pre><code class="language-bash">go test ./examples/audit</code></pre>
+
+			<h2>相关</h2>
+			<ul>
+				<li><a href="../guide/concepts/governance.html">开关与审计</a>：审计的语义与约定。</li>
+				<li><a href="../guide/concepts/security.html">认证与授权</a>：actor 从哪来。</li>
+				<li><a href="observability.html">examples/observability</a>：审计事件落进日志后怎么读。</li>
+				<li>Skill：<code>skills/matex-setup-audit/SKILL.md</code>。</li>
+				<li><a href="index.html">示例索引</a>。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

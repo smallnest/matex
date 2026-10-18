@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>离线测试 — matex</title>
+		<meta name="description" content="四个离线测试基座：dbtest、redistest、kfake、进程内 gRPC/rpcx；以及为什么 CI 不需要 Docker。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/testing">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>离线测试</h1>
+			<p class="lede">
+				matex 的测试基座只有一个目标：<b>不装 Docker、不连网络，也能跑通完整的路径</b>。
+				这不是为了"跑得快"，而是因为 CI 里没有中间件——离线跑不起来的测试等于不存在的测试。
+			</p>
+
+			<h2>四个基座</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>基座</th>
+							<th>默认实现</th>
+							<th>切到真服务</th>
+							<th>入口</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>数据库</td>
+							<td>每个测试一个纯 Go SQLite 临时文件，自动跑迁移</td>
+							<td><code>DB_TEST_DRIVER</code> + <code>DB_TEST_DSN</code></td>
+							<td><code>dbtest.Start(t)</code></td>
+						</tr>
+						<tr>
+							<td>Redis</td>
+							<td>进程内 miniredis</td>
+							<td><code>REDIS_TEST_ADDR</code></td>
+							<td><code>redistest.Start(t)</code> / <code>redistest.Addr(t)</code></td>
+						</tr>
+						<tr>
+							<td>Kafka</td>
+							<td>进程内 broker（<code>kfake</code>）</td>
+							<td>—</td>
+							<td><code>kfake.NewCluster(...)</code> + <code>kafka.Config{Brokers: cluster.ListenAddrs()}</code></td>
+						</tr>
+						<tr>
+							<td>gRPC / rpcx</td>
+							<td>进程内 server，监听 <code>127.0.0.1:0</code>，用真 client 拨号</td>
+							<td>—</td>
+							<td><code>grpcx.New</code> / <code>rpcx.New</code> + <code>Serve()</code></td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>数据库：dbtest.Start</h2>
+			<pre><code class="language-go">// dbtest.Start 返回一个已迁移的 *db.DB，清理挂到 t 上。
+func Start(t testing.TB) *db.DB</code></pre>
+			<pre><code class="language-go">func TestDAOByID(t *testing.T) {
+	d := dbtest.Start(t)
+	dao := NewDAO(d)
+
+	if _, err := dao.ByID(t.Context(), 1); !errors.Is(err, db.ErrNoRow) {
+		t.Fatalf("want ErrNoRow, got %v", err)
+	}
+}</code></pre>
+			<p>三个细节值得知道：</p>
+			<ul>
+				<li>
+					<b>每个测试一个临时文件</b>（<code>file:&lt;t.TempDir()&gt;/matex.db</code>），
+					不用 <code>:memory:</code>——文件库允许连接池安全地开多个连接，测试之间也天然隔离。
+				</li>
+				<li>
+					<b>自动跑迁移</b>：从本文件位置向上三级定位仓库的 <code>migrations/</code> 目录，
+					按文件名序应用。迁移写错在这里就会暴露。
+				</li>
+				<li>
+					<b>切真库是环境变量的事</b>，同一套测试不用改一行代码：
+					<code>DB_TEST_DRIVER</code> 为空时默认 <code>postgres</code>。
+				</li>
+			</ul>
+			<pre><code class="language-bash">make test-short                      # 默认：纯 Go SQLite，离线可跑
+DB_TEST_DRIVER=postgres DB_TEST_DSN='postgres://...' go test ./...
+DB_TEST_DRIVER=mysql    DB_TEST_DSN='user:pass@tcp(localhost:3306)/matex?parseTime=true' go test ./...</code></pre>
+
+			<h2>Redis：redistest</h2>
+			<pre><code class="language-go">func Start(t testing.TB) *redis.Client   // miniredis，或 REDIS_TEST_ADDR 指向的真服务
+func Addr(t testing.TB) string           // 只想要地址时用（自己建 client 的代码）</code></pre>
+			<pre><code class="language-go">// examples/cache 的测试：Setup 走真路径，只把 redis 换成 miniredis。
+func newTestService(t *testing.T, cfg *cacheConfig) (*cacheService, http.Handler) {
+	svc := &amp;cacheService{}
+	if err := svc.Setup(t.Context(), &amp;verticle.Env{Metrics: obs.NewMetrics()}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	svc.redis = redistest.Start(t)
+	svc.users = newUserStore()          // 回源换成一个刻意慢 50ms 的假查询
+	// …BuildRouter 后返回 srv.Handler()
+}</code></pre>
+			<p>
+				要断言"并发 miss 只回源一次"，在假源里放一个计数器即可：8 个并发请求之后
+				<code>source_reads</code> 仍必须是 1。
+			</p>
+
+			<h2>HTTP：httptest 打 srv.Handler()</h2>
+			<p>
+				不需要绑定端口。<code>httpx.Server.Handler()</code> 返回的就是带完整封套（trace id、
+				超时、错误映射）的 <code>http.Handler</code>，用 <code>httptest</code> 直接驱动：
+			</p>
+			<pre><code class="language-go">func newTestHandler(t *testing.T) http.Handler {
+	t.Helper()
+	srv := httpx.New(httpx.Config{Timeout: time.Second, MaxBody: 1 &lt;&lt; 20})
+	svc := &amp;httpService{cfg: httpConfig{Greeting: "hi ", APIKey: "demo-key"}}
+	if err := svc.BuildRouter(srv); err != nil {
+		t.Fatalf("build router: %v", err)
+	}
+	return srv.Handler()
+}
+
+req := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(`{"name":"alice"}`))
+req.Header.Set("X-API-Key", "demo-key")
+rec := httptest.NewRecorder()
+newTestHandler(t).ServeHTTP(rec, req)
+// 断言 rec.Code、rec.Body、rec.Header().Get("X-Request-ID")…</code></pre>
+			<p>
+				这条路会经过 guard 与中间件，所以<b>测试断言的是真实行为</b>，而不是绕过封套的伪路径。
+				<code>examples/http</code> 的用例表就是按状态码与业务 code 断言的。
+			</p>
+
+			<h2>Kafka：kfake</h2>
+			<pre><code class="language-go">cluster, err := kfake.NewCluster(
+	kfake.NumBrokers(1),
+	kfake.SeedTopics(1, topic),
+)
+if err != nil {
+	t.Fatalf("kfake: %v", err)
+}
+t.Cleanup(cluster.Close)
+
+cfg := kafka.Config{Brokers: cluster.ListenAddrs(), ClientID: "kafkademo-test"}
+p, _ := kafka.NewProducer(cfg)
+go kafka.RunConsumer(ctx, cfg, group, []string{topic}, handler)   // 真循环、真提交
+err = p.SendSync(ctx, topic, []byte("k"), []byte("v"))</code></pre>
+			<p>
+				kfake 是 franz-go 自带的进程内 broker。测试里的 producer / consumer 就是生产代码用的那一套，
+				所以 at-least-once 的提交语义在测试里也是真的。
+			</p>
+			<div class="callout callout--note">
+				<span class="callout__label">唯一一处依赖豁免</span>
+				depguard 的 <code>examples-no-drivers</code> 规则禁止 examples 直接 import 驱动库，
+				唯一例外就是 kafka 示例<b>测试</b>里的 <code>franz-go/pkg/kfake</code>。
+				非测试代码依然不豁免。
+			</div>
+
+			<h2>gRPC / rpcx：进程内起 server</h2>
+			<pre><code class="language-go">// gRPC：不需要 .proto——用内置健康服务就能验证 server + client 的完整往返。
+srv, _ := grpcx.New(grpcx.Config{Addr: "127.0.0.1:0"})
+go func() { _ = srv.Serve() }()
+t.Cleanup(func() { _ = srv.Shutdown(ctx) })
+
+conn, err := grpcx.Dial(ctx, srv.Addr())
+resp, _ := healthpb.NewHealthClient(conn).Check(ctx, &amp;healthpb.HealthCheckRequest{})</code></pre>
+			<pre><code class="language-go">// rpcx：真 server + 真 client，走完整的注册/调用路径。
+srv := rpcx.New(rpcx.Config{Network: "tcp", Addr: "127.0.0.1:0"})
+srv.RPCX().RegisterName("Greeter", &amp;Greeter{prefix: "Hi "}, "")
+go func() { _ = srv.Serve() }()
+
+cl, _ := rpcx.PeerClient("Greeter", addr)      // rpcx 在 Serve 里才 bind，需等地址出现
+cl.Call(ctx, "Greet", &amp;GreetArgs{Name: "world"}, &amp;reply)</code></pre>
+			<p>
+				监听 <code>:0</code> 由内核分配端口，所以同一测试套件可以并发跑。
+				gRPC 的 server 在 <code>New</code> 时就已绑定地址，<code>Addr()</code> 立刻可用；
+				rpcx 在 <code>Serve</code> 里才 bind，所以测试要轮询
+				<code>srv.RPCX().Address()</code> 直到非 nil。
+			</p>
+
+			<h2>CI 门禁</h2>
+			<p>
+				因为四个基座都在进程内，<code>make ci</code> 就能在没有 Docker 的环境里真正验证<b>每一个
+				示例</b>——它们都带测试，而且都能离线跑：
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    A["make ci"] --> V["go vet ./..."]
+    V --> T["go test -short -race -count=1 ./..."]
+    T --> D["dbtest<br/>纯 Go SQLite + 迁移"]
+    T --> R["redistest<br/>miniredis"]
+    T --> K["kfake<br/>进程内 broker"]
+    T --> G["grpcx / rpcx<br/>127.0.0.1:0 进程内"]
+    T --> H["httptest<br/>srv.Handler()"]
+    D --> P{全部通过}
+    R --> P
+    K --> P
+    G --> P
+    H --> P
+    P -->|是| B["go build ./..."]
+    P -->|否| F(["CI 失败"])
+    B --> OK(["可交付"])
+    classDef gate fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class A,P gate
+				</pre>
+				<figcaption>
+					GitHub Actions 跑同一套命令并加 golangci-lint；本机 <code>make ci</code> 与 CI 一致，
+					不存在"本地过了 CI 挂"的差别。
+				</figcaption>
+			</figure>
+			<div class="callout callout--tip">
+				<span class="callout__label">每个示例都必须带测试</span>
+				这不是风格建议：示例索引把每个能力都列成一个可运行页面，而"可运行"由测试保证。
+				加新示例时同时加 <code>main_test.go</code>，否则它只是一段会腐烂的演示代码。
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/database.html">examples/database</a>：<code>dbtest.Start</code> + 断言 DAO 行为。</li>
+				<li><a href="../../examples/cache.html">examples/cache</a>：<code>redistest.Start</code> + 并发 miss 合并的断言。</li>
+				<li><a href="../../examples/kafka.html">examples/kafka</a>：<code>kfake</code> 进程内 broker。</li>
+				<li><a href="../../examples/grpc.html">examples/grpc</a>、<a href="../../examples/rpcx.html">examples/rpcx</a>：进程内 server + 真 client。</li>
+				<li><a href="../../examples/http.html">examples/http</a>：<code>httptest</code> 打 <code>srv.Handler()</code>。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

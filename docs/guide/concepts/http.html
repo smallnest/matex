@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>HTTP 与路由 — matex</title>
+		<meta name="description" content="matex 的 HTTP 层：handler 约定、响应封套、错误映射、两个中间件槽、默认安全响应头与 CORS。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/http">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>HTTP 与路由</h1>
+			<p class="lede">
+				没有 Web 框架，只有标准库 <code>net/http</code> 加一层约定：handler 返回
+				<code>(any, error)</code>，成功由框架渲染，失败由 <code>errs</code> 映射成状态码。
+			</p>
+
+			<h2>handler 约定</h2>
+			<pre><code class="language-go">type HandlerFunc func(ctx context.Context, r *http.Request) (any, error)
+
+func (h *Handler) Greet(ctx context.Context, r *http.Request) (any, error) {
+    name := r.PathValue("name")            // Go 1.22 路径参数
+    if name == "" {
+        return nil, errs.Invalid(40001, "name is required")
+    }
+    resp, err := h.svc.Greet(ctx, name)
+    if err != nil {
+        return nil, err                       // errs 值直接返回，框架负责映射
+    }
+    return map[string]string{"greeting": resp.Greeting}, nil
+}</code></pre>
+			<p>返回值到响应的映射是固定的：</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>返回</th>
+							<th>响应</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>data, nil</code></td>
+							<td><code>200 {"code":0,"msg":"ok","data":data}</code></td>
+						</tr>
+						<tr>
+							<td><code>nil, nil</code></td>
+							<td><code>204</code>，无响应体</td>
+						</tr>
+						<tr>
+							<td><code>nil, errs.NotFound(40401, …)</code></td>
+							<td><code>404 {"code":40401,"msg":"…","data":null}</code></td>
+						</tr>
+						<tr>
+							<td><code>nil, fmt.Errorf("plain")</code></td>
+							<td><code>500</code>——非 errs 错误一律按内部错误处理，不泄露细节</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout callout--tip">
+				<span class="callout__label">handler 里永远不出现 w http.ResponseWriter</span>
+				这是它能被单测、能被中间件包装、能统一加超时与日志的前提。
+				需要原生控制的场景用 <code>HandleRaw</code>（见下）。
+			</div>
+
+			<h2>注册路由</h2>
+			<pre><code class="language-go">func (s *Service) BuildRouter(srv *httpx.Server) error {
+    h := order.NewHandler(s.orders)
+
+    srv.Handle("POST", "/api/v1/orders", h.Create)          // 公开
+    srv.Use(auth.Middleware(s.verifier))                    // 从这里往下都受保护
+    srv.Handle("GET", "/api/v1/orders/{id}", h.Get)
+    srv.Handle("DELETE", "/api/v1/orders/{id}", h.Cancel)   // 重复 pattern 会 panic
+    return nil
+}</code></pre>
+			<p>
+				路由用 ServeMux 语法，注册重复 pattern 会在<b>启动时 panic</b>——
+				路由冲突属于配置错误，应该立刻发现，而不是等某个请求走错分支。
+			</p>
+
+			<h2>两个中间件槽</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    REQ([请求]) --> GUARD["guard<br/>panic 恢复 · max_body"]
+    GUARD --> SH["SecureHeaders<br/>默认安全响应头"]
+    SH --> OUT["UseOuter 中间件<br/>CORS · gzip · RealIP"]
+    OUT --> MUX{{mux 路由匹配}}
+    MUX --> WRAP["wrap<br/>trace id · 超时 · 封套"]
+    WRAP --> MW["Use 中间件<br/>认证 · 限流 · 幂等"]
+    MW --> H["Handler"]
+    H --> RESP([响应封套])
+    classDef slot fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class SH,OUT,MW slot
+				</pre>
+				<figcaption>
+					橙色是三个可插拔位置。<code>SecureHeaders</code> 与 <code>guard</code> 由框架固定，
+					其余两处按需挂载。
+				</figcaption>
+			</figure>
+
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>槽</th>
+							<th>签名</th>
+							<th>位置</th>
+							<th>典型用途</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>Use</code></td>
+							<td><code>func(next HandlerFunc) HandlerFunc</code></td>
+							<td>封套<b>内部</b></td>
+							<td>认证、限流、幂等、往 ctx 塞东西</td>
+						</tr>
+						<tr>
+							<td><code>UseOuter</code></td>
+							<td><code>func(next http.Handler) http.Handler</code></td>
+							<td>mux <b>外部</b></td>
+							<td>CORS、gzip、真实客户端 IP、改响应头</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<p>
+				<b><code>Use</code> 走封套</b>：中间件拿到已带 trace id 与超时的 ctx，要拒绝就直接返回
+				<code>errs</code> 值，不用碰 <code>ResponseWriter</code>：
+			</p>
+			<pre><code class="language-go">func requireAPIKey(next httpx.HandlerFunc) httpx.HandlerFunc {
+    return func(ctx context.Context, r *http.Request) (any, error) {
+        if r.Header.Get("X-API-Key") != key {
+            return nil, errs.Unauthorized(40101, "missing or invalid X-API-Key")  // → 401
+        }
+        return next(ctx, r)
+    }
+}</code></pre>
+			<p>
+				<b><code>Use</code> 只护它之后注册的路由</b>，公开/受保护的边界靠书写顺序表达。
+				<b><code>UseOuter</code> 覆盖整个 mux</b>，所以 <code>/healthz</code>、
+				<code>/readyz</code>、<code>/metrics</code> 与 <code>HandleRaw</code> 路由它都管得到。
+			</p>
+
+			<h2>默认安全响应头</h2>
+			<p>
+				<code>httpx.New</code> 在链首装好安全头，不用你写：
+			</p>
+			<pre><code class="language-bash">X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
+Referrer-Policy: no-referrer
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Resource-Policy: same-origin
+Permissions-Policy: camera=(), microphone=(), geolocation=()
+Strict-Transport-Security: max-age=31536000; includeSubDomains   # 仅 https</code></pre>
+			<div class="callout callout--note">
+				<span class="callout__label">HSTS 只在 https 下发</span>
+				明文 http 上发 HSTS 至少会被忽略；若浏览器此前在 localhost 上收到过，
+				还会被钉死在它并不提供的 https 上。所以判定依据是 TLS 或
+				<code>X-Forwarded-Proto: https</code>（TLS 终止在网关时）。
+			</div>
+
+			<h2>CORS：默认不发</h2>
+			<p>
+				同源接口不该邀请外部页面来读。<code>CORSPolicy</code> 需要一个显式白名单，
+				它总是在 <code>SecureHeaders</code> 之后，所以在白名单之外丢掉的只是 CORS 头，
+				不是安全头：
+			</p>
+			<pre><code class="language-go">srv.UseOuter(httpx.CORSPolicy("https://app.example"))  // 精确来源；OPTIONS 预检自动应答
+// srv.UseOuter(httpx.CORSPolicy("*"))                 // 任意来源，且不带 credentials</code></pre>
+			<p>
+				被拒绝时仍会输出 <code>Vary: Origin</code>——否则缓存会把 A 来源的响应用来回答
+				B 来源的请求。
+			</p>
+
+			<h2>需要原生控制时：HandleRaw</h2>
+			<p>
+				流式响应、自定义状态码（201/202/206）、文件下载、SSE 走这条路。它注册在 mux 上，
+				不经过封套与超时 select：
+			</p>
+			<pre><code class="language-go">srv.HandleRaw("GET /raw/plain", func(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+    w.WriteHeader(http.StatusAccepted)
+    _, _ = w.Write([]byte("ok\n"))
+})</code></pre>
+
+			<h2>内置端点</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>路径</th>
+							<th>说明</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>GET /healthz</code></td><td>存活探针，不查依赖</td></tr>
+						<tr><td><code>GET /readyz</code></td><td>就绪探针，ping 已配置的基础设施 + 服务自己的 ReadyChecker</td></tr>
+						<tr><td><code>GET /metrics</code></td><td>Prometheus，注入 metrics 后自动注册</td></tr>
+						<tr>
+							<td><code>GET /version</code></td>
+							<td>构建信息（service / go 版本 / 模块 / vcs revision），在 BuildRouter 之前注册，不受业务中间件影响</td>
+						</tr>
+						<tr><td><code>GET /debug/pprof/*</code></td><td>标准库 profiler，<b>默认关闭</b>，需 <code>http.pprof: true</code></td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>请求的作用域</h2>
+			<p>
+				每个请求的 ctx 由框架构造，携带 trace id 与超时；<b>它与连接的 ctx 是分离的</b>：
+			</p>
+			<pre><code class="language-go">ctx, cancel := context.WithTimeout(
+    context.WithoutCancel(obs.WithTraceID(spanCtx, traceID)), cfg.Timeout)
+defer cancel()</code></pre>
+			<p>
+				这样客户端断连不会被记成服务端超时（记 499），而 handler 还能把副作用完整写完——
+				包括幂等结果的落盘，所以重试同一个请求能拿到真话（见
+				<a href="resilience.html">稳定性防护</a>）。
+			</p>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/http.html">examples/http</a>：路由、封套、中间件、HandleRaw。</li>
+				<li><a href="../../examples/observability.html">examples/observability</a>：日志、trace id、指标。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

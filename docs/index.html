@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>matex — 大道至简的企业级 Go 脚手架</title>
+		<meta
+			name="description"
+			content="matex 是零 Web 框架、零 ORM 的企业级 Go 脚手架：标准库 + 薄封装，19 个可离线运行的示例，14 个 AI skill。"
+		/>
+		<link rel="stylesheet" href="assets/site.css" />
+	</head>
+	<body data-page="index">
+		<a class="skip-link" href="#main">跳到正文</a>
+
+		<main id="main">
+			<div class="hero">
+				<div>
+					<p class="hero__eyebrow">Go 1.27 · 零 Web 框架 · 零 ORM</p>
+					<h1>把企业级 Go 服务的常用部分，一次性固化下来</h1>
+					<p class="hero__sub">
+						matex 不做全家桶。它只固化最常用的布局与基础设施入口——标准库
+						<code>net/http</code> + 薄封装，配了才建、不配就不存在——再把这套约定交给
+						AI 与 skills 去生成代码。
+					</p>
+					<div class="hero__actions">
+						<a class="btn btn--primary" href="guide/quickstart.html">三分钟起步</a>
+						<a class="btn btn--ghost" href="guide/introduction.html">为什么这样设计</a>
+						<a class="btn btn--ghost" href="examples/index.html">看 19 个示例</a>
+					</div>
+					<div class="hero__stats">
+						<div class="hero__stat"><b>25</b><span>pkg/core 基础设施包</span></div>
+						<div class="hero__stat"><b>19</b><span>可离线运行的示例</span></div>
+						<div class="hero__stat"><b>14</b><span>AI skill</span></div>
+						<div class="hero__stat"><b>0</b><span>第三方路由 / ORM 依赖</span></div>
+					</div>
+				</div>
+
+				<div>
+					<div class="codeblock">
+						<div class="codeblock__bar">
+							<span class="codeblock__lang">bash</span>
+						</div>
+						<pre><code class="language-bash"># 1. 零依赖起步：只要 configs/config.min.yaml（http + log + 服务段）
+make run-min
+
+curl -i localhost:8080/healthz
+curl -i localhost:8080/api/v1/hello/world
+
+# 2. 带数据库、仍然零外部依赖（纯 Go SQLite，无 cgo、无 Docker）
+make migrate DRIVER=sqlite DSN=file:matex.db
+make run-sqlite
+
+# 3. 要真依赖时
+make dev                     # postgres / mysql / redis / memcache / kafka
+make migrate DSN=postgres://matex:matex@localhost:5432/matex?sslmode=disable
+make run</code></pre>
+					</div>
+				</div>
+			</div>
+
+			<section class="section">
+				<div class="split split--wide-start">
+					<div>
+						<div class="section__head">
+							<h2>一个部署单元，四行代码</h2>
+							<p>
+								服务 = <code>Name()</code> + <code>Setup()</code> + <code>BuildRouter()</code>。
+								<code>verticle.Run</code> 负责其余全部：加载配置、初始化基础设施、启动 HTTP、
+								处理信号、优雅退出。
+							</p>
+						</div>
+
+						<div class="codeblock">
+							<div class="codeblock__bar">
+								<span class="codeblock__lang">go</span>
+							</div>
+							<pre><code class="language-go">type Service interface {
+    Name() string                              // 配置段 key、日志与指标前缀
+    Setup(ctx context.Context, env *Env) error // 解码服务段、装配 domain
+    BuildRouter(s *httpx.Server) error         // 注册路由
+}
+
+func main() {
+    if err := verticle.Run(context.Background(), &app.DemoService{}); err != nil {
+        log.Fatal(err)
+    }
+}</code></pre>
+						</div>
+
+						<p>
+							基础设施句柄对业务是私有的，一律经 <code>Env</code> 访问器读取：<code>RequireDB()</code>
+							在未配置时让启动失败，<code>DB()</code> 用逗号-ok 判可用。业务代码里不会出现
+							<code>if env.DB != nil</code> 这种话。
+						</p>
+					</div>
+
+					<div>
+						<ul class="feature-list">
+							<li>
+								<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+									<path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+								</svg>
+								<div>
+									<b>业务代码不 import 驱动库</b>
+									<span
+										>pgx、go-redis、franz-go、gin… 全部收在 <code>pkg/core/*</code> 之后，
+										由 golangci-lint 的 depguard 强制，不靠自觉。</span
+									>
+								</div>
+							</li>
+							<li>
+								<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+									<path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+								</svg>
+								<div>
+									<b>Handler 不碰 ResponseWriter</b>
+									<span
+										>签名统一 <code>func(ctx, *http.Request) (any, error)</code>：返回 nil 即
+										204，返回 <code>errs.*</code> 即对应状态码 + <code>{code,msg,data}</code>。</span
+									>
+								</div>
+							</li>
+							<li>
+								<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+									<path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+								</svg>
+								<div>
+									<b>配了才建，不配就不存在</b>
+									<span
+										>只有 <code>http:</code> 段的最小配置也能起服务；db / redis / kafka /
+										tracing / auth 随加随用，未配置时是 no-op，不为它们付任何代价。</span
+									>
+								</div>
+							</li>
+							<li>
+								<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+									<path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+								</svg>
+								<div>
+									<b>测试不需要 Docker</b>
+									<span
+										>纯 Go SQLite、miniredis、kfake、进程内 gRPC·rpcx——<code>make ci</code>
+										跑的就是全部示例。</span
+									>
+								</div>
+							</li>
+						</ul>
+					</div>
+				</div>
+			</section>
+
+			<section class="section section--sunk">
+				<div class="section__inner">
+					<div class="section__head">
+						<h2>请求走一趟，发生了什么</h2>
+						<p>
+							一次请求要经过的每一层都是显式的：中间件槽、超时、trace id、错误映射、指标。
+							下图的每一步在 <a href="guide/architecture.html">架构总览</a> 里都有对应代码。
+						</p>
+					</div>
+
+					<figure class="mermaid-figure">
+						<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as 客户端
+    participant G as guard<br/>（panic 恢复 · 体积限制 · 安全头）
+    participant W as wrap<br/>（trace id · 超时 · 封套）
+    participant M as 中间件<br/>（认证 · 限流 · 幂等）
+    participant H as Handler<br/>(ctx, *http.Request) (any, error)
+    C->>G: GET /api/v1/hello/world
+    G->>W: 放行
+    W->>W: 开 server span，定 X-Request-ID
+    W->>M: 带 trace id 与超时的 ctx
+    M->>H: ctx + 请求
+    H-->>M: (data, nil) 或 (nil, errs.*)
+    M-->>W: 结果
+    W->>W: 渲染 {code,msg,data} · 记日志与指标
+    W-->>C: 200 或 4xx/5xx
+						</pre>
+						<figcaption>
+							trace id 的优先级是「调用方给的 X-Request-ID → 当前 trace id → 新生成」，
+							并回写到响应头，客户端不用接链路后端也能做关联。
+						</figcaption>
+					</figure>
+				</div>
+			</section>
+
+			<section class="section">
+				<div class="section__head">
+					<h2>能力按需接入，语义写进 skill</h2>
+					<p>
+						每项能力都有：一个可离线跑的示例、一个教 AI 怎么接的 skill、以及一节说明取舍的文档。
+						三者指向同一份代码。
+					</p>
+				</div>
+
+				<div class="cards">
+					<a class="card" href="guide/concepts/http.html">
+						<span class="card__title">HTTP 与路由</span>
+						<span class="card__desc"
+							>标准库 ServeMux + 方法路由；统一封套、错误映射、两个中间件槽、默认安全响应头。</span
+						>
+						<span class="card__meta">examples/http</span>
+					</a>
+					<a class="card" href="guide/concepts/database.html">
+						<span class="card__title">数据库</span>
+						<span class="card__desc"
+							>PostgreSQL / MySQL / SQLite 三驱动；统一 <code>?</code> 占位符、泛型扫描、事务、迁移。</span
+						>
+						<span class="card__meta">examples/database</span>
+					</a>
+					<a class="card" href="guide/concepts/resilience.html">
+						<span class="card__title">稳定性防护</span>
+						<span class="card__desc"
+							>限流、幂等、熔断（连续失败或错误率滑窗）、全抖动退避重试——防护自身故障时放行。</span
+						>
+						<span class="card__meta">examples/resilience</span>
+					</a>
+					<a class="card" href="guide/concepts/observability.html">
+						<span class="card__title">可观测性</span>
+						<span class="card__desc"
+							>slog JSON 日志、trace id、Prometheus 指标、OpenTelemetry；HTTP / gRPC / rpcx
+							三通道自动跨进程传播。</span
+						>
+						<span class="card__meta">examples/observability</span>
+					</a>
+					<a class="card" href="guide/concepts/messaging.html">
+						<span class="card__title">Kafka</span>
+						<span class="card__desc"
+							>同步/异步生产者、at-least-once 消费循环，失败消息可落死信队列（带源坐标）后再提交。</span
+						>
+						<span class="card__meta">examples/kafka</span>
+					</a>
+					<a class="card" href="guide/concepts/governance.html">
+						<span class="card__title">开关与审计</span>
+						<span class="card__desc"
+							>进程内功能开关（运行时 &gt; 环境变量 &gt; 配置 &gt; 默认）与可插拔 sink 的审计事件。</span
+						>
+						<span class="card__meta">examples/feature · audit</span>
+					</a>
+				</div>
+
+				<p style="margin-block-start: 1.5rem">
+					<a href="examples/index.html">看全部 19 个示例 →</a>
+				</p>
+			</section>
+
+			<section class="section section--sunk">
+				<div class="section__inner">
+					<div class="split">
+						<div>
+							<div class="section__head">
+								<h2>代码生成交给 AI，不交给 CLI</h2>
+								<p>
+									生成器是「会过时的约定」，skill 是「给 AI 的约定」。仓库里的
+									<code>AGENTS.md</code> 加一组 skill 就是生成器，而且随代码一起演进。
+								</p>
+							</div>
+
+							<div class="codeblock">
+								<div class="codeblock__bar">
+									<span class="codeblock__lang">bash</span>
+								</div>
+								<pre><code class="language-bash">npx skills add smallnest/matex --all   # 一次装齐 14 个 skill
+
+# 之后直接说人话：
+#   "新增一个订单业务域"
+#   "接 postgres，加 Redis 缓存，配 gRPC"
+#   "给支付接口加幂等和限流"</code></pre>
+							</div>
+						</div>
+
+						<div>
+							<div class="section__head">
+								<h2>取舍写在明面上</h2>
+								<p>不做什么，和做什么一样重要。</p>
+							</div>
+
+							<div class="table-wrap">
+								<table>
+									<thead>
+										<tr>
+											<th>舍弃</th>
+											<th>理由</th>
+										</tr>
+									</thead>
+									<tbody>
+										<tr>
+											<td>ORM</td>
+											<td>SQL 直写 + 泛型扫描已够；ORM 增加黑盒与逃逸面。</td>
+										</tr>
+										<tr>
+											<td>gin / echo / chi</td>
+											<td>Go 1.22 ServeMux 已支持方法路由与路径参数，再引第三方路由只会增加依赖面。</td>
+										</tr>
+										<tr>
+											<td>服务发现 / 注册中心</td>
+											<td>归 K8s 与网关；静态 DNS + 环境变量足够。</td>
+										</tr>
+										<tr>
+											<td>默认开启的重治理</td>
+											<td>限流、熔断、幂等、追踪都有薄封装，但一律 opt-in。</td>
+										</tr>
+									</tbody>
+								</table>
+							</div>
+
+							<p style="margin-block-start: 1rem">
+								<a href="guide/introduction.html">完整取舍与理由 →</a>
+							</p>
+						</div>
+					</div>
+				</div>
+			</section>
+		</main>
+
+		<script src="assets/mermaid.min.js" defer></script>
+		<script src="assets/search-index.js" defer></script>
+		<script src="assets/site.js" defer></script>
+	</body>
+</html>

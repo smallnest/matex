@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>grpc — 服务注册与 fail-fast 客户端 — matex</title>
+		<meta
+			name="description"
+			content="examples/grpc：verticle 按 grpc: 段建服务端，grpcx 内置健康服务与 reflection，env.GRPCClient 拨号。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/grpc">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>grpc — 服务注册与 fail-fast 客户端</h1>
+			<p class="lede">
+				<code>pkg/core/grpcx</code> 管 gRPC 的<b>生命周期</b>：服务端由
+				<code>verticle.Run</code> 按 <code>grpc:</code> 段创建并优雅关停，客户端在
+				<code>Setup</code> 里用 <code>env.GRPCClient</code> 拨号并自动注册关闭。
+				因为 grpcx 内置了标准健康服务，这个示例<b>不需要 .proto、不需要 protoc</b>。
+			</p>
+
+			<h2>运行</h2>
+			<p>
+				完全离线，不需要 <code>make dev</code>。同时开两个端口：HTTP <code>:8080</code>、
+				gRPC <code>:9090</code>。配置文件是目录里的 <code>config.yaml</code>，
+				<code>-conf</code> 默认指向它。
+			</p>
+			<pre><code class="language-bash">go run ./examples/grpc             # 等价于 make example NAME=grpc
+# http :8080 + grpc :9090
+
+grpcurl -plaintext localhost:9090 grpc.health.v1.Health/Check   # 开了 reflection，免 proto
+grpcurl -plaintext localhost:9090 list
+curl -i localhost:8080/api/v1/health                            # 未配 target → 503</code></pre>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>服务端由框架建</b>：<code>grpc:</code> 段配了地址才会创建 server；
+					没配就不起 gRPC，HTTP 照常工作。</li>
+				<li><b>内置健康服务</b>：<code>grpcx</code> 自己注册标准
+					<code>grpc.health.v1</code>，示例代码里<b>没有一行注册代码</b>；
+					K8s gRPC 探针与负载均衡直接可用（<code>health: true</code>，默认开）。</li>
+				<li><b>用于调试的 reflection 开关</b>：<code>reflection: true</code> 时
+					grpcurl/grpcui 免 proto（本示例的 config.yaml 打开了它；生产按需关闭）。</li>
+				<li><b>fail-fast 客户端</b>：<code>env.GRPCClient</code> 在
+					<code>grpc.dial_timeout</code>（示例 3s）内确认连接 READY，连不上就让启动失败。</li>
+				<li><b>连接由框架关</b>：<code>env.GRPCClient</code> 内部
+					<code>AddCloser(conn.Close)</code>，你不手动关。</li>
+				<li><b>BFF 形态</b>：HTTP handler 调对端 gRPC，把结果暴露成 JSON。</li>
+			</ul>
+
+			<h2>客户端拨号</h2>
+			<p>
+				来自 <code>examples/grpc/main.go</code> 的 <code>Setup</code>。
+				拨号放在 Setup 是刻意的：不可达的依赖应该在<b>启动时</b>失败，而不是第一个请求。
+				<code>target</code> 留空则只做服务端。
+			</p>
+			<pre><code class="language-go">// A peer client. Dialing here is deliberate: an unreachable
+// dependency should fail the startup, not the first request.
+if s.cfg.Target != "" {
+	conn, err := env.GRPCClient(ctx, s.cfg.Target)
+	if err != nil {
+		return err
+	}
+	s.client = healthpb.NewHealthClient(conn)
+	obs.Info(ctx, "grpc client ready", "target", s.cfg.Target)
+}</code></pre>
+
+			<h2>健康检查的时机</h2>
+			<p>
+				来自 <code>check</code>。没有配 <code>target</code> 时返回
+				<code>errs.Unavailable</code>（<code>503</code>）；调不通对端也是
+				<code>503</code>，但用不同的业务 code。
+			</p>
+			<pre><code class="language-go">if s.client == nil {
+	return nil, errs.Unavailable(50301, "no gRPC peer configured (set grpcdemo.target)")
+}
+resp, err := s.client.Check(ctx, &healthpb.HealthCheckRequest{Service: s.cfg.Service})
+if err != nil {
+	return nil, errs.Unavailable(50302, "gRPC check failed: %v", err)
+}
+return map[string]any{
+	"target":  s.cfg.Target,
+	"service": s.cfg.Service,
+	"status":  resp.GetStatus().String(),
+}, nil</code></pre>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    participant O as verticle.Run
+    participant S as grpcx.Server :9090
+    participant C as env.GRPCClient
+    participant P as 对端 gRPC
+    O->>S: New(addr, health=true, reflection=true)
+    Note over S: 启动时 NOT_SERVING，Serve 后才 SERVING
+    O->>C: Setup 里 Dial(target, dial_timeout=3s)
+    C->>P: 等到连接 READY，否则返回错误
+    P-->>C: READY
+    Note over O: 服务启动；HTTP :8080 同时可用
+    O->>S: Shutdown：先 NOT_SERVING 再排空在途调用
+				</pre>
+				<figcaption>
+					健康检查的时机。"监听"与"就绪"是同一时刻：探针看到 SERVING 时，
+					服务确实已经能接流量；关停时先转 NOT_SERVING，让负载均衡先摘流量。
+				</figcaption>
+			</figure>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash"># 服务端：自带健康服务 + reflection
+grpcurl -plaintext localhost:9090 grpc.health.v1.Health/Check
+grpcurl -plaintext localhost:9090 list
+
+# BFF 端点：未配 grpcdemo.target 时是 503
+curl -i localhost:8080/api/v1/health</code></pre>
+			<p>
+				未配 <code>target</code> 时返回
+				<code>503 {"code":50301,"msg":"no gRPC peer configured (set grpcdemo.target)"}</code>。
+				要验证客户端路径：再起一个实例（或任何提供 <code>grpc.health.v1</code> 的对端），
+				把本实例的 <code>grpcdemo.target</code> 指向它的 gRPC 地址，然后
+				<code>curl -i localhost:8080/api/v1/health</code> 会得到
+				<code>{"status":"SERVING","target":"…","service":""}</code>。
+			</p>
+			<div class="callout callout--warn">
+				<span class="callout__label">target 不能填自己</span>
+				<code>Setup</code> 阶段自己的 gRPC server <b>还没开始 serve</b>，所以把
+				<code>target</code> 填成 <code>:9090</code>（自己）会让 dial 超时、启动失败。
+			</div>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 完全离线：它在临时端口上起一个真实的
+				<code>grpcx.New</code> server，用 <code>grpcx.Dial</code> 拨号，
+				断言健康检查返回 <code>SERVING</code>；另有一例把示例的 BFF handler
+				接到一个真实对端上，断言 <code>status</code> 能穿到 HTTP 结果里；
+				还有一例断言未配对端时 <code>check</code> 会报错。它<b>没有 .proto、没有网络</b>，
+				因为 grpcx 默认就提供健康服务。
+			</p>
+			<pre><code class="language-bash">go test ./examples/grpc</code></pre>
+
+			<h2>相关</h2>
+			<ul>
+				<li><a href="../guide/concepts/rpc.html">gRPC 与 rpcx</a>：两种 RPC 的对比与选型。</li>
+				<li><a href="../guide/concepts/observability.html">可观测性</a>：gRPC 的 traceparent 传播。</li>
+				<li><a href="rpcx.html">examples/rpcx</a>：无需 IDL 的另一种 RPC。</li>
+				<li>Skill：<code>skills/matex-setup-grpc/SKILL.md</code>。</li>
+				<li><a href="index.html">示例索引</a>。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

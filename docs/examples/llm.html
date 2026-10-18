@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>llm — 四协议互转与 Jev 决策 — matex</title>
+		<meta
+			name="description"
+			content="examples/llm：一份 canonical 请求翻译成四种 wire 协议，流式/非流式调用，Jev（System One）决策问答；全程离线。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/llm">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>llm — 四协议互转与 Jev 决策</h1>
+			<p class="lede">
+				<code>pkg/core/llm</code> 用一份<b>统一的请求/响应模型</b>（canonical
+				<code>Request</code> / <code>Response</code>）在四种 wire 协议间互转，
+				并提供统一的访问入口；<code>Client.Decide</code> 另外走 Jev（System One）
+				决策问答。本示例不离开本机、不需要 API key。
+			</p>
+
+			<h2>运行</h2>
+			<p>
+				完全离线，是一个命令行程序，没有端口也没有 <code>config.yaml</code>。
+				示例先打印同一份请求翻译成的四种 wire body，再用进程内假上游（httptest）
+				跑通 Chat 协议的非流式与流式调用，最后在假 System One 上游上问一次 Jev。
+			</p>
+			<pre><code class="language-bash">go run ./examples/llm             # 等价于 make example NAME=llm</code></pre>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>四种协议互转</b>：<code>req.ToChat() / ToResponses() / ToAnthropic() /
+					ToGemini()</code> 把一份 canonical 请求渲染成各协议的 wire body。</li>
+				<li><b>跨协议转换</b>：<code>llm.Convert(body, ProtocolChat, ProtocolAnthropic)</code>
+					走 canonical 中转。</li>
+				<li><b>统一访问</b>：功能选项建 client（<code>WithBaseURL</code> /
+					<code>WithAPIKey</code> / <code>WithModel</code> / <code>WithTimeout</code> /
+					<code>WithMaxTokens</code>），<code>Chat</code> 一次拿完整响应。</li>
+				<li><b>流式事件</b>：<code>ChatStream</code> 返回一个统一事件通道
+					（<code>EventText / EventToolCall / EventUsage / EventDone / EventError</code>）。</li>
+				<li><b>Jev 决策问答</b>：<code>Decide</code> 回答<b>带类型的问题</b>——
+					<code>choice</code>（从 criteria 里选一项）与 <code>score</code>（按 bands 打分）。</li>
+				<li><b>可选重试</b>：<code>WithRetry(retry.Config{Attempts: 3})</code>
+					只重试"稍后再试"类失败（408/409/425/429/5xx 与传输错误），400/401/403/404
+					立即返回——本示例不设重试，默认关。</li>
+			</ul>
+
+			<h2>四种协议的渲染</h2>
+			<p>
+				来自 <code>examples/llm/main.go</code>。同一份 canonical 请求交给四个
+				<code>To*</code> 方法，各协议的工具调用形状不同——Chat 是
+				<code>tool_calls</code>、Responses 是 <code>function_call</code>、
+				Anthropic 是 <code>tool_use</code>、Gemini 是 <code>functionCall</code>。
+			</p>
+			<pre><code class="language-go">req := demoRequest()
+
+// 1. 四种协议的转换：同一份请求 → 各协议的 wire body。
+fmt.Println("== 一份 canonical 请求 → 四种协议 ==")
+printWire("OpenAI Chat Completions", req.ToChat)
+printWire("OpenAI Responses", req.ToResponses)
+printWire("Anthropic Messages", req.ToAnthropic)
+printWire("Google Gemini", req.ToGemini)
+
+// 协议互转：Chat 的 wire body → Anthropic 的 wire body。
+chatBody, _ := req.ToChat()
+anthropic, err := llm.Convert(chatBody, llm.ProtocolChat, llm.ProtocolAnthropic)
+if err != nil {
+	fatalf("Convert: %v", err)
+}</code></pre>
+			<p>
+				<code>demoRequest</code> 刻意覆盖了文本、一次工具调用和一条工具结果——
+				每个协议都必须承载这三种形状。
+			</p>
+
+			<h2>流式调用</h2>
+			<p>
+				来自 <code>main.go</code> 的 ChatStream 段。事件是统一的，所以调用方不关心
+				上游是 SSE 还是别的分片方式；提前退出用 <code>llm.StopStream(ch)</code>
+				释放连接与 goroutine（示例是消费到底）。
+			</p>
+			<pre><code class="language-go">ch, err := c.ChatStream(context.Background(), req)
+if err != nil {
+	fatalf("ChatStream: %v", err)
+}
+for ev := range ch {
+	switch ev.Kind {
+	case llm.EventText:
+		fmt.Print(ev.Text)
+	case llm.EventToolCall:
+		fmt.Printf("\n[tool call] %s(%s)\n", ev.ToolCall.Name, ev.ToolCall.Arguments)
+	case llm.EventUsage:
+		fmt.Printf("\n[usage] in=%d out=%d total=%d\n", ev.Usage.InputTokens, ev.Usage.OutputTokens, ev.Usage.TotalTokens)
+	case llm.EventDone:
+		fmt.Printf("[done] finish=%s\n", ev.Stop)
+	case llm.EventError:
+		fatalf("stream: %v", ev.Err)
+	}
+}</code></pre>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    R["canonical Request"] --> C["ToChat"]
+    R --> RS["ToResponses"]
+    R --> A["ToAnthropic"]
+    R --> G["ToGemini"]
+    C --> W["各协议 wire body"]
+    RS --> W
+    A --> W
+    G --> W
+    W --> CV["Convert(from, to)<br/>走 canonical 中转"]
+    J["DecideRequest"] --> JV["Jev / System One<br/>自带 canonical 类型"]
+    classDef canon fill:#eef4fb,stroke:#2f5d8f,color:#22303a
+    classDef wire fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class R,J canon
+    class C,RS,A,G,CV,JV wire
+				</pre>
+				<figcaption>
+					四种对话协议共享 canonical 中转，<code>Convert</code> 因此能两两互通。
+					Jev 有自己的 canonical 类型（<code>DecideRequest</code> /
+					<code>DecideResponse</code>），不进这个转换集。
+				</figcaption>
+			</figure>
+
+			<h2>Jev 决策问答</h2>
+			<p>
+				来自 <code>main.go</code> 的 Jev 段。<code>Decide</code> 接受一个
+				<code>State</code>（带类型的上下文）和一组命名问题，返回每个问题的答案与
+				把握度 <code>Confidence</code>。
+			</p>
+			<pre><code class="language-go">dr, err := jc.Decide(context.Background(), llm.DecideRequest{
+	State: map[string]any{"message": "这个查询接口偶尔超时，帮我修一下。"},
+	Questions: map[string]llm.Question{
+		"intent": {Type: "choice", Instructions: "Which kind of request fits it best?",
+			Criteria: map[string]string{"greeting": "", "bug fix": "an ordinary fix", "feature": "a small feature"}},
+		"effort": {Type: "score", Instructions: "How much reasoning does a coding assistant need?",
+			Bands: []string{"a one-line change", "an ordinary fix", "a change across files"}},
+	},
+})</code></pre>
+
+			<h2>验证</h2>
+			<p>跑一遍，stdout 依次给出四段输出，末尾几行长这样：</p>
+			<pre><code class="language-bash">$ go run ./examples/llm
+== 一份 canonical 请求 → 四种协议 ==
+-- OpenAI Chat Completions --
+{ … "tool_calls": [ … ] … }
+-- OpenAI Responses -- / -- Anthropic Messages -- / -- Google Gemini --
+== Convert: Chat wire → Anthropic wire ==
+== Chat（非流式）==
+id=chatcmpl-1 model=demo-model finish=stop content="北京今天晴，21°C，适合散步。"
+usage in=12 out=9 total=21
+== ChatStream（流式）==
+北京今天晴，21°C，适合散步。
+[usage] in=12 out=9 total=21
+[done] finish=stop
+== Jev Decide（System One 决策问答）==
+intent: bug fix (confidence 0.90)
+effort: score 1
+usage in=40 out=12 total=52</code></pre>
+			<p>
+				这些数字全部来自假上游的固定应答（见 <code>newFakeChatServer</code> /
+				<code>newFakeJevServer</code>），所以输出是确定的。<code>WithBaseURL</code>
+				指向的是 <code>httptest</code> 的本地地址，没有请求离开本机。
+			</p>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 复用同一对假上游（<code>httptest</code>），
+				完全离线。它钉住四件事：<b>非流式 Chat</b> 返回 <code>id=chatcmpl-1</code>、
+				<code>finish=stop</code>、content 含"散步"、usage 总量 21；
+				<b>流式 Chat</b> 收到 <code>EventDone</code> 且累积文本含"适合散步"；
+				<b>Jev Decide</b> 的 <code>choice</code> 是 <code>bug fix</code>、<code>score</code>
+				是 <code>1.0</code>、usage 总量 52；<b>四种协议的 wire body</b> 各自含其关键字段
+				（<code>tool_calls</code> / <code>function_call</code> / <code>tool_use</code> /
+				<code>functionCall</code>），且 <code>Convert</code> 的 Chat→Anthropic 含
+				<code>tool_use</code>。
+			</p>
+			<pre><code class="language-bash">go test ./examples/llm</code></pre>
+
+			<h2>相关</h2>
+			<ul>
+				<li><a href="../guide/reference/packages.html">pkg/core 速查</a>：<code>llm</code> 包的入口。</li>
+				<li><a href="../guide/concepts/resilience.html">稳定性防护</a>：<code>retry</code>
+					与 <code>WithRetry</code> 的退避语义。</li>
+				<li><a href="resilience.html">examples/resilience</a>：限流、幂等、熔断、重试。</li>
+				<li><a href="observability.html">examples/observability</a>：把调用接进日志与链路。</li>
+				<li><a href="index.html">示例索引</a>。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

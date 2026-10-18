@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>observability 示例 — matex</title>
+		<meta name="description" content="examples/observability：结构化 JSON 日志、相关 id 的三种来源、自定义 Prometheus 指标与可选的 OpenTelemetry 链路。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/observability">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>observability — 日志、指标与链路</h1>
+			<p class="lede">
+				<code>pkg/core/obs</code> 把三件事装在一起：slog JSON 日志、Prometheus 指标、
+				OpenTelemetry 链路。这个示例让一个请求同时留下三种痕迹——一条带相关 id 的日志、
+				一次自定义计数器的自增、以及（开启 tracing 时）一个能与调用方对齐的 span。
+				看完你会知道相关 id 从哪来、指标该在哪个生命周期方法里注册。
+			</p>
+
+			<h2>运行</h2>
+			<pre><code class="language-bash">go run ./examples/observability
+
+# 相关 id：不传就自动生成，传了就透传（响应头也会回写）
+curl -i -H 'X-Request-ID: demo-1' localhost:8080/api/v1/work/alice
+
+# 看日志（stdout）里的 service / trace_id / 字段
+go run ./examples/observability 2&gt;&amp;1 | grep '"trace_id"'
+
+# 看指标
+curl -s localhost:8080/metrics | grep -E '^(observe_|http_server_)'
+
+# 看链路（先把 config.yaml 的 trace.enabled 改成 true）
+curl -i -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+  localhost:8080/api/v1/work/alice</code></pre>
+			<p>
+				没有外部依赖，不需要 <code>make dev</code>。监听 <code>:8080</code>，
+				<code>-conf</code> 默认指向 <code>examples/observability/config.yaml</code>。
+				该文件里 <code>trace.enabled</code> 默认是 <code>false</code>，
+				所以开箱即跑时链路是关闭的。
+			</p>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>结构化日志</b>：<code>obs.Init</code> 由 <code>verticle.Run</code> 调用，JSON 输出到 stdout，每行都带 <code>"service"</code>。</li>
+				<li><b>相关 id 跟着 ctx 走</b>：日志一律用 <code>obs.Info(ctx, …)</code>，不用自己传 logger。</li>
+				<li><b>相关 id 的三种来源</b>：开 tracing 时是当前 span 的 trace id；否则是入站 <code>X-Request-ID</code>；都没有则生成一个。</li>
+				<li><b>相关 id 会写回响应体</b>：<code>obs.TraceID(ctx)</code> 直接放进 <code>data.trace_id</code>。</li>
+				<li><b>自定义指标在 <code>Setup</code> 注册</b>：<code>env.Metrics</code> 在 <code>Setup</code> 之前就已就绪，和 <code>GET /metrics</code> 共用同一个 registry。</li>
+				<li><b>子 span 无条件写</b>：<code>obs.StartSpan</code> 在 tracing 关闭时是 no-op，所以不需要 <code>if tracing</code> 分支。</li>
+			</ul>
+
+			<h2>注册指标与请求处理</h2>
+			<p>
+				这段来自 <code>examples/observability/main.go</code>。<code>Setup</code>
+				里注册了两个自定义 collector，handler 里更新它们，并把 <code>obs.TraceID(ctx)</code>
+				一起返回——这样一次 curl 就能同时看到日志、指标与链路三个视角。
+			</p>
+			<pre><code class="language-go">// Setup registers the custom metrics. env.Metrics is created before Setup
+// (and the same registry backs GET /metrics), so a service can declare its
+// own collectors here.
+func (s *obsService) Setup(ctx context.Context, env *verticle.Env) error {
+	if err := env.DecodeService(&amp;s.cfg); err != nil {
+		return err
+	}
+	s.work = env.Metrics.Counter("observe_work_total", "processed calls", "name")
+	s.value = env.Metrics.Gauge("observe_last_value", "last computed value", "name")
+	obs.Info(ctx, "custom metrics registered", "prefix", s.cfg.Prefix)
+	return nil
+}</code></pre>
+			<pre><code class="language-go">func (s *obsService) workHandler(ctx context.Context, r *http.Request) (any, error) {
+	name := r.PathValue("name")
+	start := time.Now()
+
+	// ctx carries the correlation id injected by httpx, so every line is
+	// correlatable; no need to pass a logger around.
+	obs.Info(ctx, s.cfg.Prefix+" started", "name", name)
+
+	value := s.compute(ctx, name)
+
+	s.work.WithLabelValues(name).Inc()
+	s.value.WithLabelValues(name).Set(float64(value))
+
+	obs.Info(ctx, s.cfg.Prefix+" done",
+		"name", name, "value", value, "dur_ms", time.Since(start).Milliseconds())
+
+	return map[string]any{
+		"name":     name,
+		"value":    value,
+		"trace_id": obs.TraceID(ctx),
+	}, nil
+}</code></pre>
+
+			<h2>把耗时的部分包进自己的 span</h2>
+			<p>
+				同一份文件里的 <code>compute</code>。注意 <code>obs.StartSpan</code> 那句：
+				它无条件写着，关闭 tracing 时整个函数退化成直接调用，日志照常输出。
+			</p>
+			<pre><code class="language-go">// compute wraps the expensive step in its own span, nested under the
+// request's server span. obs.StartSpan is a no-op when tracing is off, so
+// the instrumentation stays unconditional — no `if tracing` branches.
+func (s *obsService) compute(ctx context.Context, name string) int {
+	ctx, span := obs.StartSpan(ctx, "compute")
+	defer span.End()
+
+	time.Sleep(5 * time.Millisecond)
+	obs.Debug(ctx, "computed", "name", name)
+	return len(name) * 2
+}</code></pre>
+
+			<h2>一次请求留下的三种痕迹</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    C([客户端]) -->|"X-Request-ID 或 traceparent"| H["httpx wrapper<br/>构造请求 ctx"]
+    H --> S["server span<br/>GET /api/v1/work/{name}"]
+    S --> L["obs.Info(ctx, …)<br/>→ slog JSON，带 trace_id"]
+    S --> M["env.Metrics<br/>→ Prometheus registry"]
+    S --> T["obs.StartSpan(ctx, 'compute')<br/>→ 嵌套子 span"]
+    M --> EP["GET /metrics"]
+    T --> EX["OTLP exporter<br/>（trace.enabled 时）"]
+    L --> STDOUT["stdout"]
+    classDef off fill:#f4f4f4,stroke:#888,color:#2b2722
+    class EX,EP off
+				</pre>
+				<figcaption>
+					日志、指标、链路三条路都从同一个请求 ctx 出发，因此能靠相关 id 对上。
+					灰色两个出口由配置决定：<code>/metrics</code> 由 <code>verticle</code>
+					在注入 metrics 后自动注册，OTLP 导出只在 <code>trace.enabled: true</code> 时发生。
+				</figcaption>
+			</figure>
+			<p>
+				相关 id 的取值优先级是：<b>当前 span 的 trace id</b>（32 位 hex，跨服务唯一）
+				→ 入站的 <code>X-Request-ID</code> → 生成一个 8 字节 hex。
+				结果写回响应头 <code>X-Request-ID</code> 并塞进 ctx，之后所有
+				<code>obs.*(ctx, …)</code> 都带它。开了 tracing 时，span 名用路由模板
+				（<code>GET /api/v1/work/{name}</code>）而不是原始路径——每个 URL 一个 span 名会把后端打爆。
+			</p>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash">curl -i -H 'X-Request-ID: demo-1' localhost:8080/api/v1/work/alice</code></pre>
+			<pre><code class="language-json">{
+  "code": 0,
+  "msg": "ok",
+  "data": { "name": "alice", "trace_id": "demo-1", "value": 10 }
+}</code></pre>
+			<p>
+				<code>value</code> 是 <code>len("alice") * 2 = 10</code>；
+				<code>trace_id</code> 回显了传进去的 <code>X-Request-ID</code>，
+				响应头 <code>X-Request-ID</code> 也是 <code>demo-1</code>。同时 stdout 会打印：
+			</p>
+			<pre><code class="language-text">{"time":"…","level":"INFO","msg":"work started","service":"observe","trace_id":"demo-1","name":"alice"}
+{"time":"…","level":"DEBUG","msg":"computed","service":"observe","trace_id":"demo-1","name":"alice"}
+{"time":"…","level":"INFO","msg":"work done","service":"observe","trace_id":"demo-1","name":"alice","value":10,"dur_ms":5}</code></pre>
+			<p>指标端点上，自定义指标与框架指标并列出现：</p>
+			<pre><code class="language-bash">curl -s localhost:8080/metrics | grep -E '^(observe_|http_server_)'
+# observe_work_total{name="alice"} 1
+# observe_last_value{name="alice"} 10
+# http_server_requests_total{code="200",method="GET",route="GET /api/v1/work/{name}"} 1
+# http_server_request_duration_seconds_bucket{…}</code></pre>
+			<p>
+				打开 tracing（把 <code>config.yaml</code> 的 <code>trace.enabled</code> 改成 <code>true</code>）
+				后带上 <code>traceparent</code> 请求，响应头 <code>X-Request-ID</code> 与
+				<code>data.trace_id</code> 都会变成链路里的 trace id；
+				<code>endpoint</code> 留空时只生成 span、不外发，便于离线观察。
+			</p>
+
+			<h2>测试</h2>
+			<p><code>main_test.go</code> 断言的是：</p>
+			<ul>
+				<li><code>TestWorkHandlerCarriesTraceID</code>：用
+					<code>obs.WithTraceID(req.Context(), "trace-1")</code> 造一个 ctx 后，
+					返回的 <code>trace_id</code> 是 <code>trace-1</code>，
+					而 <code>value</code> 是 <code>10</code>。</li>
+				<li><code>TestCustomMetricsAreExported</code>：调用一次 handler 后，
+					registry 上有 <code>observe_work_total</code>，恰好 1 条 series，计数值为 1。</li>
+				<li><code>TestFrameworkMetricsExist</code>：registry 上能找到
+					<code>go_goroutines</code>——Go collector 已注册。</li>
+				<li><code>TestTracingJoinsTheCallersTrace</code>：用
+					<code>obs.InitTracing(…, TraceConfig{Enabled: true})</code> 打开链路后，
+					带 <code>traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-…</code> 的请求，
+					响应头 <code>X-Request-ID</code> 是 <code>4bf92f3577b34da6a3ce929d0e0e4736</code>，
+					响应体里也含这个 id。</li>
+				<li><code>TestTracingOffKeepsTheOldContract</code>：默认（无 <code>trace</code> 段）时，
+					入站的 <code>traceparent</code> <b>不会</b>变成相关 id——关闭 tracing 的行为与接入前完全一致。</li>
+			</ul>
+			<pre><code class="language-bash">go test ./examples/observability</code></pre>
+
+			<h2>相关</h2>
+			<div class="cards">
+				<a class="card" href="../guide/concepts/observability.html">
+					<span class="card__title">可观测性概念页</span>
+					<span class="card__desc">相关 id 优先级、跨进程传播与排障顺序。</span>
+				</a>
+				<a class="card" href="../guide/reference/skills.html">
+					<span class="card__title">matex-setup-tracing</span>
+					<span class="card__desc">让 AI 按规范把链路追踪接进你的项目。</span>
+				</a>
+				<a class="card" href="index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">全部 19 个可运行示例。</span>
+				</a>
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="http.html">examples/http</a>：<code>X-Request-ID</code> 在 wrapper 里的处理与 128 字节截断。</li>
+				<li><a href="lifecycle.html">examples/lifecycle</a>：优雅退出时 flush 最后一批 span。</li>
+				<li><a href="errors.html">examples/errors</a>：错误里的 cause 最终打到日志的哪个字段。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

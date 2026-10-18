@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>介绍 — matex</title>
+		<meta name="description" content="matex 的定位与设计取舍：大道至简、零 Web 框架、零 ORM，以及为什么把代码生成交给 AI。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="guide/introduction">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>介绍</h1>
+			<p class="lede">
+				matex 取「中间偏简」：不做全家桶，也不做"迁移专用"脚手架。它把企业级项目里最常用、
+				最通用的部分固化下来，把不适用的部分明确交给外部（K8s、网关）或 AI（skills）。
+			</p>
+
+			<h2>它解决的问题</h2>
+			<p>每个 Go 服务都在重复回答同样几个问题，而答案通常散落在各人的习惯里：</p>
+			<ul>
+				<li>目录怎么分，业务域放在哪，装配写在哪；</li>
+				<li>数据库、Redis、Kafka 的句柄怎么传进业务代码，什么时候判空；</li>
+				<li>handler 返回什么，错误怎么变成状态码，日志怎么带 trace id；</li>
+				<li>怎么启动、怎么优雅退出、怎么热更配置。</li>
+			</ul>
+			<p>
+				matex 把这些答案固定成一套约定与一套薄封装，并用工具保证它们不被绕开。剩下的部分
+				（业务逻辑本身）它不碰——那是你和 AI 的事。
+			</p>
+
+			<h2>一个部署单元长什么样</h2>
+			<pre><code class="language-go">type Service interface {
+    Name() string                              // 配置段 key、日志与指标前缀
+    Setup(ctx context.Context, env *Env) error // 解码服务段、装配 domain
+    BuildRouter(s *httpx.Server) error         // 注册路由
+}</code></pre>
+			<p>
+				<code>verticle.Run</code> 把其余全部接管：加载配置 → 初始化日志 → 灌功能开关 →
+				建链路追踪 → 按配置建 db/redis/memcache/kafka/auth → 调 <code>Setup</code> →
+				建 HTTP server 与路由 → 运行 → 信号触发优雅退出。
+			</p>
+
+			<h3>"配了才建"是什么意思</h3>
+			<p>
+				基础设施句柄对业务是私有的，一律经 <code>Env</code> 访问器读取。<b>没有配置段就没有
+				这个依赖</b>，此时它是 <code>nil</code>，而访问器让这件事显式：
+			</p>
+			<pre><code class="language-go">// 可选依赖：逗号-ok
+if db, ok := env.DB(); ok {
+    deps.DB = db
+}
+
+// 必需依赖：缺失即启动失败
+db, err := env.RequireDB()</code></pre>
+			<p>
+				好处是一个只配了 <code>http:</code> 段的服务能零依赖起来，而它不会为 Kafka、
+				链路追踪、认证付出任何代价——那些代码路径根本不存在。<code>make run-min</code>
+				跑的就是这种最小服务。
+			</p>
+
+			<h2>刻意不做什么</h2>
+			<p>舍弃和选择同样重要，理由写在下面这张表里。</p>
+
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>舍弃</th>
+							<th>理由</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>ORM</td>
+							<td>
+								SQL 直写 + <code>QueryOne[T]</code> 泛型扫描已经够用；ORM 增加黑盒与
+								逃逸面，也让 review 变难。
+							</td>
+						</tr>
+						<tr>
+							<td>gin / echo / chi</td>
+							<td>
+								Go 1.22 的 <code>ServeMux</code> 原生支持方法路由与路径参数；
+								<code>httpx</code> 补齐统一响应与观测。再引第三方路由只会增加依赖面与分叉。
+							</td>
+						</tr>
+						<tr>
+							<td>服务发现 / 注册中心</td>
+							<td>K8s 拓扑 + 网关单一入口已经解决寻址；静态 DNS + 环境变量足够。</td>
+						</tr>
+						<tr>
+							<td>默认开启的重治理</td>
+							<td>
+								熔断、限流、幂等、链路追踪都<b>有</b>薄封装，但一律 opt-in——脚手架不替
+								使用者决定开启重治理，也不把开销强加给一个只想跑 HTTP 的服务。
+							</td>
+						</tr>
+						<tr>
+							<td>配置热更时重建设施</td>
+							<td>
+								热更只回调服务段配置，不重建 db/redis 连接——连接池的生命周期与配置的
+								生命周期本来就不同，混在一起复杂度爆炸。
+							</td>
+						</tr>
+						<tr>
+							<td>代码生成器二进制</td>
+							<td>
+								生成器是"会过时的约定"，skill 是"给 AI 的约定"。模板随仓库演进，
+								不给用户多一个要与库版本对齐的工具。
+							</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>提供了、但默认关闭的能力</h2>
+			<p>
+				上一条反对的是<b>默认开启</b>的重治理，不是这些能力本身。它们都在脚手架里，
+				但全部 opt-in：不配对应的配置段、不在代码里显式挂载，就完全不存在。
+			</p>
+
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>能力</th>
+							<th>开关</th>
+							<th>为什么留在服务内，而不是只靠网关 / K8s</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>限流</td>
+							<td>显式 <code>Use</code></td>
+							<td>网关按路由/租户限流，粒度粗；服务内能按用户、API key 这类业务维度。</td>
+						</tr>
+						<tr>
+							<td>熔断 / 重试</td>
+							<td>包住具体调用</td>
+							<td>网关看不到"本服务到某个下游"的失败率；重试本来就是出站的事。</td>
+						</tr>
+						<tr>
+							<td>幂等</td>
+							<td><code>Use</code> + <code>Idempotency-Key</code></td>
+							<td>网关无从判断"这两个请求是同一笔业务"。</td>
+						</tr>
+						<tr>
+							<td>链路追踪</td>
+							<td><code>trace.enabled</code></td>
+							<td>跨服务因果链，网关只覆盖入口。</td>
+						</tr>
+						<tr>
+							<td>缓存模式</td>
+							<td>调用处</td>
+							<td>防击穿、防雪崩是数据访问层的职责。</td>
+						</tr>
+						<tr>
+							<td>定时任务</td>
+							<td><code>env.Block</code></td>
+							<td>网关不跑定时任务；多副本选主是业务语义。</td>
+						</tr>
+						<tr>
+							<td>功能开关 / 审计</td>
+							<td><code>feature:</code> 段、<code>audit.Record</code></td>
+							<td>
+								开关决定<b>本进程</b>走哪条代码路径；审计要记录业务语义（哪笔订单、哪个用户），
+								只有服务自己知道。
+							</td>
+						</tr>
+						<tr>
+							<td>pprof</td>
+							<td><code>http.pprof</code></td>
+							<td>排障必需，但 heap 里可能有凭证，故默认关且只该在受信网络暴露。</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<div class="callout callout--tip">
+				<span class="callout__label">共同约定：降级优先于熔断主流程</span>
+				防护组件自身故障时一律放行——限流器、幂等存储出错只记 warn，不拒流量。
+				把"防护挂了"变成"服务挂了"是最常见的事故放大器。
+			</div>
+
+			<h2>一致性由工具保证，而不是纪律</h2>
+			<ul>
+				<li>
+					<b>不 import 驱动库</b>：pgx、go-sql-driver/mysql、go-redis、franz-go、gocql…
+					一律经 <code>pkg/core/*</code>。由 golangci-lint 的 depguard 规则强制，
+					违反则 CI 失败。
+				</li>
+				<li><b>不 import Web 框架</b>：第二条 depguard 规则，业务代码与示例都适用。</li>
+				<li>
+					<b>无 Docker 也能跑全量测试</b>：SQLite、miniredis、kfake、进程内 gRPC·rpcx，
+					所以 <code>make ci</code> 能验证全部 19 个示例。
+				</li>
+			</ul>
+			<p>
+				为什么这件事值得写进 lint 而不是文档：约定只要靠自觉，三个月后就会有一处
+				<code>import "github.com/redis/go-redis/v9"</code> 出现在 handler 里，
+				而从此"基础设施入口唯一"就不再成立。
+			</p>
+
+			<h2>代码生成交给 AI</h2>
+			<p>
+				仓库里的 <code>AGENTS.md</code> 加 <code>skills/</code> 下的 14 个 skill 就是生成器。
+				它们随代码演进（改了 <code>httpx</code> 的中间件签名，skill 一起改），而且不要求
+				使用者额外装一个 CLI 来对齐版本。
+			</p>
+			<pre><code class="language-bash">npx skills add smallnest/matex --all   # 一次装齐 14 个 skill</code></pre>
+			<p>
+				之后用自然语言描述意图即可：<em>"新增一个订单业务域"</em>、
+				<em>"接 postgres 并加 Redis 缓存"</em>、<em>"给支付接口加幂等和限流"</em>。
+				每个 skill 都给出该能力的配置、代码位置、测试写法与常见坑。
+			</p>
+
+			<h2>下一步</h2>
+			<ul>
+				<li><a href="quickstart.html">快速开始</a>：三条命令把服务跑起来。</li>
+				<li><a href="architecture.html">架构总览</a>：启动序列与分层依赖方向。</li>
+				<li>
+					<a href="https://github.com/smallnest/matex/blob/master/docs/design.md" target="_blank" rel="noopener"
+						>docs/design.md</a
+					>：上面这些取舍的完整论证。
+				</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

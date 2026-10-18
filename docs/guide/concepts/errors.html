@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>错误模型 — matex</title>
+		<meta name="description" content="pkg/core/errs：Kind 到 HTTP 状态的映射、快捷构造、Status 三返回值、Wrap 与 cause 只进日志的约定。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/errors">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>错误模型</h1>
+			<p class="lede">
+				一个错误 = <b>Kind</b>（决定 HTTP 状态）+ <b>业务 code</b> + <b>给人看的消息</b>。
+				业务代码只管返回 <code>errs</code> 值，映射成状态码与响应体是 HTTP 层的事。
+			</p>
+
+			<h2>Error 是什么</h2>
+			<pre><code class="language-go">type Kind int
+
+const (
+    KindInvalidArgument Kind = iota + 1 // 400
+    KindUnauthorized                    // 401
+    KindForbidden                       // 403
+    KindNotFound                        // 404
+    KindConflict                        // 409
+    KindRateLimited                     // 429
+    KindInternal                        // 500
+    KindUnavailable                     // 503
+    KindTimeout                         // 504
+)
+
+type Error struct {
+    Kind  Kind   // 决定 HTTP 状态
+    Code  int    // 业务码，每服务自己的常量
+    Msg   string // 回给客户端的消息
+    Cause error  // 内部原因，只进日志
+}</code></pre>
+			<p>
+				<code>Error</code> 实现 <code>Error()</code> 与 <code>Unwrap()</code>：<code>Error()</code>
+				在有 cause 时返回 <code>Msg + ": " + Cause.Error()</code>，所以日志里有完整因果链；
+				<code>Unwrap()</code> 让 <code>errors.Is</code> / <code>errors.As</code> 能穿透到 cause。
+			</p>
+
+			<h2>Kind 到 HTTP 状态</h2>
+			<p><code>Kind.HTTPStatus()</code> 是唯一的映射点，未识别的 Kind 一律 500。</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>Kind</th>
+							<th>HTTP</th>
+							<th>语义</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>KindInvalidArgument</code></td><td>400</td><td>参数缺失或格式错误</td></tr>
+						<tr><td><code>KindUnauthorized</code></td><td>401</td><td>没有身份或凭据已失效</td></tr>
+						<tr><td><code>KindForbidden</code></td><td>403</td><td>有身份但无权访问该资源</td></tr>
+						<tr><td><code>KindNotFound</code></td><td>404</td><td>资源不存在</td></tr>
+						<tr><td><code>KindConflict</code></td><td>409</td><td>状态冲突，例如唯一键重复</td></tr>
+						<tr><td><code>KindRateLimited</code></td><td>429</td><td>被限流拒绝</td></tr>
+						<tr><td><code>KindInternal</code></td><td>500</td><td>服务内部错误</td></tr>
+						<tr><td><code>KindUnavailable</code></td><td>503</td><td>依赖未配置或暂不可用</td></tr>
+						<tr><td><code>KindTimeout</code></td><td>504</td><td>超时</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout callout--note">
+				<span class="callout__label">编码约定</span>
+				业务 code 写成 <code>&lt;http-status&gt;*100 + 子号</code>：<code>40401</code> 是 404 下的
+				"用户不存在"，<code>40901</code> 是 409 下的"名字已被占用"。这样看日志里的 code
+				就能直接知道状态码类别，且各子号在服务内自洽。
+			</div>
+
+			<h2>构造：New / Newf / Wrap</h2>
+			<pre><code class="language-go">// 定值消息
+err := errs.New(errs.KindNotFound, 40401, "user not found")
+
+// 格式化消息
+err := errs.Newf(errs.KindNotFound, 40401, "user %d not found", 42)
+
+// 带上内部原因：Msg 给客户端，cause 只进日志
+err := errs.Wrap(errs.KindConflict, 40901, dbErr, "创建用户失败")</code></pre>
+			<p>
+				<code>Wrap</code> 是唯一需要 cause 的构造方式，也是唯一会把内部细节带进
+				<code>Error()</code> 的方式。只用 <code>New</code> / <code>Newf</code> 时，
+				<code>Error()</code> 就等于 <code>Msg</code>。
+			</p>
+
+			<h2>快捷构造</h2>
+			<p>
+				每个 Kind 一个同名函数，签名统一为 <code>(code int, format string, a ...any)</code>，
+				内部就是 <code>Newf</code>。只有 <code>InternalWrap</code> 多一个 cause 参数。
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>构造</th>
+							<th>Kind</th>
+							<th>典型用法</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>errs.Invalid(40001, "name is required")</code></td><td><code>KindInvalidArgument</code></td><td>请求参数校验失败</td></tr>
+						<tr><td><code>errs.Unauthorized(40101, "token expired")</code></td><td><code>KindUnauthorized</code></td><td>凭据缺失或过期</td></tr>
+						<tr><td><code>errs.Forbidden(40301, "not your resource")</code></td><td><code>KindForbidden</code></td><td>越权访问</td></tr>
+						<tr><td><code>errs.NotFound(40401, "user %d not found", 42)</code></td><td><code>KindNotFound</code></td><td>查询无结果</td></tr>
+						<tr><td><code>errs.Conflict(40901, "name already taken")</code></td><td><code>KindConflict</code></td><td>唯一键冲突、状态冲突</td></tr>
+						<tr><td><code>errs.RateLimited(42901, "too many requests")</code></td><td><code>KindRateLimited</code></td><td>限流器拒绝</td></tr>
+						<tr><td><code>errs.Internal(50001, "boom")</code></td><td><code>KindInternal</code></td><td>内部错误，无 cause</td></tr>
+						<tr><td><code>errs.InternalWrap(50002, cause, "load config")</code></td><td><code>KindInternal</code></td><td>内部错误，带 cause</td></tr>
+						<tr><td><code>errs.Unavailable(50301, "database is not configured")</code></td><td><code>KindUnavailable</code></td><td>依赖不可用</td></tr>
+						<tr><td><code>errs.Timeout(50401, "upstream timeout")</code></td><td><code>KindTimeout</code></td><td>下游超时</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<pre><code class="language-go">// internal/domain/helloworld/handler.go
+var errNoDB = errs.Unavailable(50301, "database is not configured")
+
+func (h *Handler) Greet(ctx context.Context, r *http.Request) (any, error) {
+    name := r.PathValue("name")
+    if name == "" {
+        return nil, errs.Invalid(40001, "name is required")
+    }
+    return h.svc.Greet(ctx, name)
+}</code></pre>
+
+			<h2>Status：三个返回值</h2>
+			<p>
+				HTTP 层只调一个函数。它返回 <code>(httpStatus, code, msg)</code>，
+				三者的关系就上面那两条约定：
+			</p>
+			<pre><code class="language-go">func Status(err error) (httpStatus, code int, msg string) {
+    if e, ok := errors.AsType[*Error](err); ok {
+        c := e.Code
+        if c == 0 {
+            c = e.Kind.HTTPStatus() * 100   // code 省略时回退为 状态码*100
+        }
+        return e.Kind.HTTPStatus(), c, e.Msg
+    }
+    // 裸 context 错误保留其含义，不降级成笼统 500
+    if errors.Is(err, context.DeadlineExceeded) {
+        return KindTimeout.HTTPStatus(), KindTimeout.HTTPStatus() * 100, "request timeout"
+    }
+    if errors.Is(err, context.Canceled) {
+        return KindUnavailable.HTTPStatus(), KindUnavailable.HTTPStatus() * 100, "request canceled"
+    }
+    return 500, 50000, "internal error"
+}</code></pre>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>输入</th>
+							<th>返回</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>errs.NotFound(40401, …)</code></td><td><code>404, 40401, "…"</code></td></tr>
+						<tr><td><code>errs.New(errs.KindConflict, 0, "已存在")</code></td><td><code>409, 40900, "已存在"</code>（code 省略 → 状态码 ×100）</td></tr>
+						<tr><td><code>context.DeadlineExceeded</code></td><td><code>504, 50400, "request timeout"</code></td></tr>
+						<tr><td><code>context.Canceled</code></td><td><code>503, 50300, "request canceled"</code></td></tr>
+						<tr><td><code>errors.New("internal detail…")</code></td><td><code>500, 50000, "internal error"</code></td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>普通 error 一律 500，且不泄露细节</h2>
+			<p>
+				非 <code>errs</code> 的错误没有经过设计，谁也不能保证它的话术适合给客户端看——
+				它可能带着 SQL、文件路径、内网主机名。所以 <code>Status</code> 走兜底分支时
+				只返回固定串 <code>"internal error"</code>，原始文本被丢掉：
+			</p>
+			<pre><code class="language-go">// 真实输出（examples/errors）：
+//   status=500 code=50000 msg="internal error"
+status, code, msg := errs.Status(errors.New("internal detail nobody should see"))</code></pre>
+			<p>
+				但 5xx 不代表日志里也该沉默。<code>httpx</code> 在写响应前先按原错误记一条 Error 日志，
+				带上完整的 <code>err</code>（含 cause 与调用栈语义），排查时从这里看：
+			</p>
+			<pre><code class="language-go">// pkg/core/httpx/server.go
+func (s *Server) writeError(ctx context.Context, w http.ResponseWriter, err error) {
+    status, code, msg := errs.Status(err)
+    if status &gt;= 500 {
+        obs.Log(ctx).Error("request failed", "err", err, "status", status)
+    }
+    writeJSON(w, status, envelope{Code: code, Msg: msg})
+}</code></pre>
+			<div class="callout callout--warn">
+				<span class="callout__label">cause 永远不进响应体</span>
+				<code>errs.Wrap(KindConflict, 40901, errors.New(`pq: duplicate key … "users_name_key"`), "创建用户失败")</code>
+				的 <code>Error()</code> 含库名与约束名，但响应体只有 <code>{"code":40901,"msg":"创建用户失败"}</code>。
+				设计上"能定位问题"和"能对客户端说话"是两件事，不要为了排障方便把 cause 拼进 Msg。
+			</div>
+
+			<h2>包装链穿透</h2>
+			<p>
+				<code>Status</code> 与 <code>KindOf</code> 都用 <code>errors.AsType[*Error]</code>
+				取最外层的 <code>*Error</code>，所以中间隔多少层普通包装都不影响：
+			</p>
+			<pre><code class="language-go">base := errs.Wrap(errs.KindNotFound, 40401,
+    errors.New("sql: no rows in result set"), "user 42 not found")
+wrapped := fmt.Errorf("handler: %w", base)   // 普通 %w 包装也能穿透
+
+status, code, msg := errs.Status(wrapped)    // 404 40401 "user 42 not found"
+
+e, ok := errors.AsType[*errs.Error](wrapped)
+// e.Kind = KindNotFound，e.Cause = sql: no rows in result set（只进日志）</code></pre>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    W["fmt.Errorf 包装（%w 保留因果链）"] --> B["*errs.Error<br/>Kind=NotFound<br/>Code=40401<br/>Msg=&quot;user 42 not found&quot;"]
+    B --> C["Cause<br/>sql: no rows in result set"]
+    W -. "errors.AsType 穿透" .-> B
+    B -- "Status() → 404 / 40401 / Msg" --> R["响应体<br/>{code,msg,data}"]
+    C -- "Error() → 完整因果链" --> L["日志 stdout<br/>级别 Error"]
+    classDef hide fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class L hide
+				</pre>
+				<figcaption>
+					一条包装链，两个出口：<code>Status</code> 取到的是 Kind/code/Msg，走响应；
+					cause 只沿 <code>Error()</code> 去日志。橙色一侧是客户端永远看不到的部分。
+				</figcaption>
+			</figure>
+			<p>
+				需要按错误类型分支时用 <code>errors.Is</code> / <code>errors.As</code>
+				（或 Go 1.26 的泛型形式 <code>errors.AsType[T]</code>，仓库里统一用后者），
+				不要做字符串比较：
+			</p>
+			<pre><code class="language-go">if errors.Is(err, db.ErrNoRow) {
+    return nil, errs.NotFound(40401, "user %s not found", id)
+}
+if err != nil {
+    return nil, err   // 交给框架 → 500
+}</code></pre>
+
+			<h2>KindOf：只要类别</h2>
+			<p>
+				<code>KindOf(err)</code> 返回 Kind，兜底同样是 <code>KindInternal</code>，
+				裸 context 错误分别归到 <code>KindTimeout</code> / <code>KindUnavailable</code>。
+				熔断器、指标分类这类"按错误类别计数"的地方用它——它们需要的是 4xx 还是 5xx
+				这种粗粒度判断，不是 code：
+			</p>
+			<pre><code class="language-go">if errs.KindOf(err) == errs.KindInternal {
+    // 计入下游失败
+}</code></pre>
+
+			<h2>在 handler 里怎么用</h2>
+			<p>
+				三条规则：校验失败立刻返回 <code>errs.Invalid</code>；业务失败返回最贴近事实的
+				Kind；拿不准就原样返回 <code>err</code>，让框架兜底成 500——不要为了"好看"
+				把内部错误包成 400。
+			</p>
+			<pre><code class="language-go">func (h *Handler) Get(ctx context.Context, r *http.Request) (any, error) {
+    id := r.PathValue("id")
+    if id == "" {
+        return nil, errs.Invalid(40001, "id is required")        // → 400
+    }
+    u, err := h.svc.Get(ctx, id)
+    if errors.Is(err, db.ErrNoRow) {
+        return nil, errs.NotFound(40401, "user %s not found", id) // → 404
+    }
+    if err != nil {
+        return nil, err                                         // → 500，细节只进日志
+    }
+    return u, nil
+}</code></pre>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/errors.html">examples/errors</a>：Kind → 状态的九条映射、快捷构造、Wrap 的响应与日志分叉。</li>
+				<li><a href="../../examples/http.html">examples/http</a>：封套渲染，错误如何变成 <code>{code,msg,data}</code>。</li>
+				<li><a href="http.html">HTTP 与路由</a>：返回值到响应的完整映射表。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

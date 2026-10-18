@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>feature 示例 — matex</title>
+		<meta name="description" content="examples/feature：进程内功能开关，取值按运行时 Set、FEATURE_&lt;NAME&gt; 环境变量、feature 配置段、注册默认值四层解析。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/feature">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>feature — 功能开关</h1>
+			<p class="lede">
+				<code>pkg/core/feature</code> 是进程内的功能开关：按名字读一个布尔值，
+				就能按部署环境切换代码路径，不改代码也不重新编译。这个示例注册两个开关，
+				暴露一个运行期翻转接口，并把取值优先级（运行时 → 环境变量 → 配置 → 默认值）
+				完整地跑给你看。
+			</p>
+
+			<h2>运行</h2>
+			<pre><code class="language-bash">go run ./examples/feature
+
+curl -s localhost:8085/api/v1/checkout                              # flag 决定走 v1 还是 v2
+curl -s -X POST "localhost:8085/api/v1/flags/beta-search?on=true"   # 运行期翻转
+curl -s localhost:8085/api/v1/flags                                 # 所有开关的当前值
+
+FEATURE_BETA_SEARCH=on go run ./examples/feature                    # 环境变量优先于配置</code></pre>
+			<p>
+				没有外部依赖，不需要 <code>make dev</code>。监听 <code>:8085</code>，
+				<code>-conf</code> 默认指向 <code>examples/feature/config.yaml</code>；
+				那份配置里 <code>new-checkout: true</code>、<code>beta-search: false</code>。
+			</p>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>声明与注册</b>：<code>feature.Flag{Name, Default}</code> 加 <code>feature.Register(…)</code>，在 <code>init()</code> 里做。</li>
+				<li><b>每个请求处读</b>：<code>flag.Enabled()</code> 写在 handler 里，翻转后下一次请求就生效。</li>
+				<li><b>四层取值优先级</b>：运行时 <code>feature.Set</code> → <code>FEATURE_&lt;NAME&gt;</code> → <code>feature:</code> 配置段 → 注册时的默认值。</li>
+				<li><b>运行期翻转接口</b>：<code>POST /api/v1/flags/{name}?on=true|false</code>，非法值返回 400。</li>
+				<li><b>配置由框架灌入</b>：<code>verticle.Run</code> 会在 <code>Setup</code> 之前加载 <code>feature:</code> 段。</li>
+				<li><b>未注册的名字也能开</b>：<code>Enabled(name)</code> 对没注册过的开关返回 false，但配置或环境里可以直接给新名字开。</li>
+			</ul>
+
+			<h2>声明与注册</h2>
+			<p>
+				这段来自 <code>examples/feature/main.go</code>。两个 flag 是包级变量，
+				在 <code>init</code> 里注册——<code>Register</code> 只负责填入默认值，
+				真正的值由配置/环境/运行时决定。
+			</p>
+			<pre><code class="language-go">// The flags this service owns, with their defaults. verticle loads the
+// `feature:` section before Setup; Register only fills in the defaults.
+var (
+	flagNewCheckout = feature.Flag{Name: "new-checkout", Default: false}
+	flagBetaSearch  = feature.Flag{Name: "beta-search", Default: false}
+)
+
+func init() {
+	feature.Register(flagNewCheckout, flagBetaSearch)
+}</code></pre>
+
+			<h2>翻转与读取</h2>
+			<p>
+				同一份文件里的两个 handler。<code>checkout</code> 在<b>每个请求</b>里读开关，
+				而不是在 <code>Setup</code> 里读一次存进结构体字段——这正是翻转能立即生效的原因。
+				<code>set</code> 展示了运行期覆盖，注释也点明了真实服务该给它加守卫。
+			</p>
+			<pre><code class="language-go">// checkout picks its implementation per request, so a flip takes effect on
+// the next call — no restart, no stale copy in a struct field.
+func (s *featureService) checkout(context.Context, *http.Request) (any, error) {
+	if flagNewCheckout.Enabled() {
+		return map[string]string{"path": "checkout-v2", "note": "one-page flow"}, nil
+	}
+	return map[string]string{"path": "checkout-v1", "note": "legacy three-step flow"}, nil
+}</code></pre>
+			<pre><code class="language-go">// set is the operator switch. Real services guard it (auth middleware,
+// admin-only); it exists here to show the runtime override.
+func (s *featureService) set(_ context.Context, r *http.Request) (any, error) {
+	name := r.PathValue("name")
+	switch r.URL.Query().Get("on") {
+	case "true", "1", "on":
+		feature.Set(name, true)
+	case "false", "0", "off":
+		feature.Set(name, false)
+	default:
+		return nil, errs.Invalid(40001, "on must be true or false")
+	}
+	return map[string]any{"name": name, "enabled": feature.Enabled(name)}, nil
+}</code></pre>
+
+			<h2>一个开关的四层来源</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    Q["flag.Enabled()<br/>每个请求都调用"] --> S{"运行时<br/>feature.Set 过吗？"}
+    S -- 是 --> V1["用运行时值"]
+    S -- 否 --> E{"FEATURE_&lt;NAME&gt;<br/>环境变量存在且可解析吗？"}
+    E -- 是 --> V2["用环境变量值"]
+    E -- 否 --> C{"feature: 配置段里有吗？"}
+    C -- 有 --> V3["用配置值"]
+    C -- 否 --> V4["用 Register 时的 Default"]
+    classDef win fill:#f0f7f0,stroke:#3a7a3a,color:#2b2722
+    class V1 win
+				</pre>
+				<figcaption>
+					从上到下第一个命中的来源胜出。绿色的运行时层最强，所以控制面板可以
+					在进程存活期间任意覆盖发布时定下的值；重启后回到环境变量/配置。
+				</figcaption>
+			</figure>
+			<p>
+				环境变量名的规则是 <code>FEATURE_&lt;NAME&gt;</code>：名字转大写、
+				非字母数字字符换成 <code>_</code>，所以 <code>beta-search</code> 对应
+				<code>FEATURE_BETA_SEARCH</code>。它接受 <code>1/true/on/yes</code> 与
+				<code>0/false/off/no</code>；无法解析的值会被忽略，回落到下一层。
+			</p>
+
+			<h2>验证</h2>
+			<pre><code class="language-bash"># 1. 配置里 new-checkout: true → 走 v2
+curl -s localhost:8085/api/v1/checkout
+# {"code":0,"msg":"ok","data":{"note":"one-page flow","path":"checkout-v2"}}
+
+# 2. 所有开关的当前值
+curl -s localhost:8085/api/v1/flags
+# {"code":0,"msg":"ok","data":{"beta-search":false,"new-checkout":true}}
+
+# 3. 运行期翻转 beta-search
+curl -s -X POST "localhost:8085/api/v1/flags/beta-search?on=true"
+# {"code":0,"msg":"ok","data":{"enabled":true,"name":"beta-search"}}
+curl -s localhost:8085/api/v1/flags
+# {"code":0,"msg":"ok","data":{"beta-search":true,"new-checkout":true}}
+
+# 4. 非法值被拒
+curl -i -X POST "localhost:8085/api/v1/flags/x?on=maybe"
+# 400 {"code":40001,"msg":"on must be true or false","data":null}</code></pre>
+			<p>环境变量优先于配置，用一个进程级的观察最直观：</p>
+			<pre><code class="language-bash">FEATURE_NEW_CHECKOUT=off go run ./examples/feature
+curl -s localhost:8085/api/v1/checkout
+# {"code":0,"msg":"ok","data":{"note":"legacy three-step flow","path":"checkout-v1"}}
+# 配置里写的是 true，但环境变量赢了</code></pre>
+
+			<h2>测试</h2>
+			<p>
+				测试里用 <code>feature.Configure(map[string]bool{…})</code> 隔离取值
+				（它会整体替换配置层），断言的是：
+			</p>
+			<ul>
+				<li><code>TestConfigSelectsThePath</code>：<code>new-checkout</code> 为 true 时
+					<code>/checkout</code> 返回 <code>checkout-v2</code>，为 false 时返回
+					<code>checkout-v1</code>。</li>
+				<li><code>TestRuntimeFlipTakesEffectOnTheNextRequest</code>：翻转前
+					<code>/flags</code> 里是 <code>"beta-search":false</code>，
+					调一次 <code>POST /api/v1/flags/beta-search?on=true</code> 后立刻变成
+					<code>"beta-search":true</code>——<b>下一次请求就生效，不用重启</b>。</li>
+				<li><code>TestBadFlipValueIsRejected</code>：<code>?on=maybe</code> 返回 400。</li>
+			</ul>
+			<pre><code class="language-bash">go test ./examples/feature</code></pre>
+
+			<h2>相关</h2>
+			<div class="cards">
+				<a class="card" href="../guide/concepts/governance.html">
+					<span class="card__title">开关与审计概念页</span>
+					<span class="card__desc">功能开关与审计日志。</span>
+				</a>
+				<a class="card" href="../guide/reference/skills.html">
+					<span class="card__title">matex-setup-feature</span>
+					<span class="card__desc">让 AI 按规范把功能开关接进你的项目。</span>
+				</a>
+				<a class="card" href="index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">全部 19 个可运行示例。</span>
+				</a>
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="config.html">examples/config</a>：<code>feature:</code> 段背后那套 tag 与展开规则。</li>
+				<li><a href="auth.html">examples/auth</a>：翻转接口在生产上就该挂上这层守卫。</li>
+				<li><a href="lifecycle.html">examples/lifecycle</a>：另一种「不改代码改变行为」的机制——配置热更。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

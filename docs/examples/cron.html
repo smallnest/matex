@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>cron 示例 — matex</title>
+		<meta name="description" content="examples/cron：固定周期、cron 表达式与一次性任务；多副本下靠 redis 认领整个时间槽，保证每个槽只跑一次。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/cron">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>cron — 定时任务与选主</h1>
+			<p class="lede">
+				多副本部署时，一个定时任务应该在每个周期只跑一次，而不是每个副本各跑一次。
+				<code>pkg/core/cron</code> 的做法是：每个副本都起自己的定时器，到点时去抢一个以
+				job 命名的 redis 认领（claim），抢到的那个执行。这个示例注册了四个不同形态的 job，
+				并暴露一个计数接口，让「到底跑了几次」从外部看得见。
+			</p>
+
+			<h2>运行</h2>
+			<pre><code class="language-bash">go run ./examples/cron
+
+curl -s localhost:8084/api/v1/jobs     # 每个 job 跑了多少次、最后什么时候跑的
+curl -s localhost:8084/version         # 内置的构建信息端点</code></pre>
+			<p>
+				监听 <code>:8084</code>，<code>-conf</code> 默认指向
+				<code>examples/cron/config.yaml</code>。默认配置里 <code>redis</code> 段是注释掉的，
+				因此单独跑不需要 <code>make dev</code>——不配 redis 就是单副本模式，每个 job 直接跑。
+				要看选主效果需要 <code>make dev</code> 起 redis 并打开 <code>config.yaml</code> 里的
+				<code>redis:</code> 段。
+			</p>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>三种调度形态</b>：<code>Interval</code> 固定周期、<code>Schedule</code> cron 表达式、<code>At</code>/<code>Delay</code> 一次性任务。</li>
+				<li><b><code>RunOnStart</code></b>：<code>Interval</code> 专属，让 job 在启动时立刻跑一次，而不是等满第一个周期。</li>
+				<li><b>失败不会停循环</b>：<code>reconcile</code> 每第三次返回 error，下一轮照常触发。</li>
+				<li><b>单次运行有上限</b>：<code>cron.Config.Timeout</code>（示例配置是 <code>2s</code>）界定一次 run 的最长时长。</li>
+				<li><b>认领持有整个时间槽</b>：<code>Interval</code> 同时也是 claim 的 TTL，所以各副本定时器不同步也不会重复执行。</li>
+				<li><b>挂到 <code>env.Block</code> 上</b>：<code>verticle</code> 会在关闭基础设施之前先停掉 job。</li>
+			</ul>
+
+			<h2>注册四个 job</h2>
+			<p>
+				这段来自 <code>examples/cron/main.go</code> 的 <code>jobs</code> 方法。它是一个
+				收参数的方法而不是写死的字面量，就是为了让测试能在更短的时钟上构建同一组 job。
+				四个 job 正好对应三种调度形态。
+			</p>
+			<pre><code class="language-go">func (s *cronService) jobs(heartbeat, reconcile time.Duration, report string, notify time.Duration) []cron.Job {
+	return []cron.Job{
+		{
+			Name:     "heartbeat",
+			Interval: heartbeat,
+			// Run once at startup so the first counter bump is immediate.
+			RunOnStart: true,
+			Run: func(ctx context.Context) error {
+				s.stats.record("heartbeat")
+				obs.Info(ctx, "heartbeat")
+				return nil
+			},
+		},
+		{
+			Name:     "reconcile",
+			Interval: reconcile,
+			Run: func(context.Context) error {
+				// Every third run fails, to show that one bad run does not
+				// stop the loop — the next tick still happens.
+				if n := s.stats.record("reconcile"); n%3 == 0 {
+					return errors.New("reconcile: the batch was rejected")
+				}
+				return nil
+			},
+		},
+		{
+			Name:     "report",
+			Schedule: report,
+			Run: func(ctx context.Context) error {
+				s.stats.record("report")
+				obs.Info(ctx, "report generated")
+				return nil
+			},
+		},
+		{
+			Name:  "notify",
+			Delay: notify,
+			Run: func(ctx context.Context) error {
+				s.stats.record("notify")
+				obs.Info(ctx, "one-shot notify fired")
+				return nil
+			},
+		},
+	}
+}</code></pre>
+
+			<h2>装配与启动</h2>
+			<p>
+				同样来自 <code>examples/cron/main.go</code>。注意 <code>env.Redis()</code> 是
+				逗号-ok 形式：没配 redis 时 <code>rc</code> 为 nil、<code>ok</code> 为 false，
+				直接传给 <code>cron.Config.Redis</code> 就表示单副本模式，调用点不需要判空。
+			</p>
+			<pre><code class="language-go">	s.stats = newJobStats()
+	rc, ok := env.Redis()
+	s.redis = rc
+	s.sched = cron.New(cron.Config{
+		// nil when redis is not configured: one replica, no election needed.
+		Redis:   rc,
+		Timeout: s.cfg.JobTimeout,
+	})
+	s.sched.Add(s.jobs(s.cfg.HeartbeatInterval, s.cfg.ReconcileInterval, s.cfg.DailyReport, s.cfg.NotifyDelay)...)
+	obs.Info(ctx, "cron jobs registered",
+		"jobs", len(s.sched.Jobs()), "leader_election", ok)
+
+	// verticle starts this block and cancels it on shutdown, before the
+	// infrastructure it uses is closed.
+	env.Block("cron", s.sched.Run)</code></pre>
+
+			<h2>为什么认领要活满一整个槽</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    participant A as 副本 A<br/>(t=0,10,20…)
+    participant R as redis claim
+    participant B as 副本 B<br/>(t=5,15,25…)
+    A->>R: t=0 抢 claim（TTL = interval）
+    R-->>A: 抢到 → 执行
+    B->>R: t=5 抢 claim
+    R-->>B: 已被占用 → 跳过（不执行）
+    Note over R: t=10 claim 过期
+    A->>R: t=10 重新抢到 → 执行
+    B->>R: t=15 抢 claim
+    R-->>B: 已被占用 → 跳过
+				</pre>
+				<figcaption>
+					两个副本的定时器不同步。若认领在 job 跑完后立刻释放，
+					B 在 t=5 就能抢到并再跑一遍——每周期执行两次，选主形同虚设。
+					让认领活满一个 interval，语义就变成「这个周期已被占用」。
+				</figcaption>
+			</figure>
+			<p>
+				推论有三条：<code>Job.Interval</code> 同时是 claim 的 TTL，run 必须远小于 interval；
+				cron 表达式的 claim TTL 是「这个槽的长度」（下次触发减本次触发）；
+				一次性任务相反——它的 claim <b>永不过期</b>，所以跨副本最多执行一次，
+				代价是失败也不会自动重试。
+			</p>
+
+			<h2>验证</h2>
+			<p>跑大约 10 秒后看计数：</p>
+			<pre><code class="language-bash">curl -s localhost:8084/api/v1/jobs</code></pre>
+			<pre><code class="language-json">{
+  "code": 0,
+  "msg": "ok",
+  "data": {
+    "jobs": {
+      "heartbeat": { "runs": 48, "last": "2026-…T…Z" },
+      "reconcile": { "runs": 10, "last": "2026-…T…Z" },
+      "report":    { "runs": 2,  "last": "2026-…T…Z" },
+      "notify":    { "runs": 1,  "last": "2026-…T…Z" }
+    }
+  }
+}</code></pre>
+			<p>
+				具体数字随运行时长变化，但形状是固定的：<code>heartbeat</code> 按
+				<code>heartbeat_interval</code>（示例配成 <code>200ms</code>）增长、
+				<code>reconcile</code> 按 <code>reconcile_interval</code>（<code>1s</code>）增长、
+				<code>report</code> 每 5 秒加一（配置里 <code>daily_report: "@every 5s"</code>），
+				而 <code>notify</code> 只会出现一次。看选主效果：
+			</p>
+			<pre><code class="language-bash">go run ./examples/cron &amp;       # 副本 A
+go run ./examples/cron &amp;       # 副本 B（同一个 job 名 → 同一把 claim）
+sleep 2
+curl -s localhost:8084/api/v1/jobs   # 计数按 interval 增长，而不是两倍</code></pre>
+
+			<h2>测试</h2>
+			<p>
+				测试不需要 Docker：<code>redistest.Start(t)</code> 起进程内的 miniredis，
+				claim 就能工作。它钉住的具体事实：
+			</p>
+			<ul>
+				<li><code>TestJobsRunOnTheirIntervals</code>：把 interval 压到 5ms 后，
+					<code>heartbeat</code> 与 <code>reconcile</code> 的计数都至少到 2；
+					取消 ctx 后调度器必须停下。</li>
+				<li><code>TestRunOnStartBumpsImmediately</code>：interval 设成一小时时，
+					<code>heartbeat</code> 立刻是 1，而没有 <code>RunOnStart</code> 的
+					<code>reconcile</code> 仍然是 0。</li>
+				<li><code>TestJobFailureDoesNotStopTheLoop</code>：手动跑 6 次 <code>reconcile</code>，
+					恰好失败 2 次（每第三次），计数仍是 6——失败不掉 job。</li>
+				<li><code>TestLeaderElectionRunsOneInstancePerInterval</code>：两个副本共享 miniredis，
+					A 先抢到 claim，B 启动后抢不到；两个副本的 <code>heartbeat</code> 计数之和恰好是 <b>1</b>。</li>
+				<li><code>TestOneShotLeaderElection</code>：错峰启动的两个副本跑同一个一次性任务，
+					合计也恰好是 <b>1</b>。</li>
+				<li><code>TestConfigDefaults</code>：默认值是 <code>500ms</code> / <code>2s</code> /
+					<code>"@every 5s"</code> / <code>10s</code> / <code>5s</code>，
+					注册的 job 名字依次是 <code>heartbeat, reconcile, report, notify</code>，
+					且无 redis 段时 <code>svc.redis</code> 为 nil。</li>
+				<li><code>TestCronJobFiresOnItsSchedule</code>：表达式改成 <code>"@every 1s"</code>
+					（robfig 真实时钟能支持的最快档）后，<code>report</code> 在 3 秒内至少跑 2 次。</li>
+				<li><code>TestOneShotFiresExactlyOnce</code>：一次性任务跑完一次后保持沉默。</li>
+				<li><code>TestJobsEndpointReportsCounters</code>：接口返回的
+					<code>data.jobs</code> 里计数与 <code>last</code> 都对得上。</li>
+			</ul>
+			<pre><code class="language-bash">go test ./examples/cron</code></pre>
+
+			<h2>相关</h2>
+			<div class="cards">
+				<a class="card" href="../guide/concepts/service.html">
+					<span class="card__title">服务与生命周期</span>
+					<span class="card__desc">env.Block 为什么必须在 infra 关闭前停掉。</span>
+				</a>
+				<a class="card" href="../guide/reference/skills.html">
+					<span class="card__title">matex-setup-cron</span>
+					<span class="card__desc">让 AI 按规范把定时任务接进你的项目。</span>
+				</a>
+				<a class="card" href="index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">全部 19 个可运行示例。</span>
+				</a>
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="lifecycle.html">examples/lifecycle</a>：Block 与关闭顺序。</li>
+				<li><a href="observability.html">examples/observability</a>：job 的日志往哪走。</li>
+				<li><a href="resilience.html">examples/resilience</a>：单次运行失败时的重试与熔断。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

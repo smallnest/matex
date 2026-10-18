@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>开关与审计 — matex</title>
+		<meta name="description" content="matex 的功能开关（取值优先级、每请求读取）与审计日志（Event 字段、Record、SetSink 与包的边界）。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/governance">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>开关与审计</h1>
+			<p class="lede">
+				两个进程内的设施：<code>feature</code> 按名字读一个布尔值来切代码路径，
+				<code>audit</code> 把每个业务动作写成一条"谁、对什么、做了什么、结果如何"的记录。
+				两者都不持久化自己——开关靠外部驱动，审计靠 sink。
+			</p>
+
+			<h2>功能开关</h2>
+			<p>
+				<code>feature.Flag{Name, Default}</code> 声明一个开关，
+				<code>Register</code> 把默认值登记进去。用 <code>Flag.Enabled()</code> 读取时，
+				即便没人注册过，这个 <code>Flag</code> 也能用自己的 <code>Default</code> 回答。
+			</p>
+			<pre><code class="language-go">var (
+    flagNewCheckout = feature.Flag{Name: "new-checkout", Default: false}
+    flagBetaSearch  = feature.Flag{Name: "beta-search", Default: false}
+)
+
+func init() { feature.Register(flagNewCheckout, flagBetaSearch) }
+
+// checkout：按每次请求读开关，所以一次翻转对下一次调用就生效
+func (s *featureService) checkout(context.Context, *http.Request) (any, error) {
+    if flagNewCheckout.Enabled() {
+        return map[string]string{"path": "checkout-v2"}, nil
+    }
+    return map[string]string{"path": "checkout-v1"}, nil
+}</code></pre>
+			<p>
+				取值的优先级链是固定的，从高到低：
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    Q["feature.Enabled(name)<br/>（名字统一转小写）"] --> R{"runtime 里有？"}
+    R -->|是| V1["用它<br/>feature.Set"]
+    R -->|否| E{"环境变量有？<br/>FEATURE_&lt;NAME&gt;"}
+    E -->|"是且能解析成布尔"| V2["用它"]
+    E -->|"否 / 解析失败"| C{"feature: 配置段里有？"}
+    C -->|是| V3["用它"]
+    C -->|否| D{"flags 注册表里有？"}
+    D -->|是| V4["用 Register 的 Default"]
+    D -->|"否（无人注册）"| OFF["false：未注册即关闭"]
+    classDef win fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class V1,V2,V3,V4,OFF win
+				</pre>
+				<figcaption>
+					环境变量在<b>每次调用</b>时读，不是启动时读一次——测试用 <code>t.Setenv</code>，
+					运维也可以在 exec 之前 export。<code>FEATURE_&lt;NAME&gt;</code> 由名字大写后
+					把每个非字母数字字符换成 <code>_</code> 得到，所以 <code>new-checkout</code>
+					对应 <code>FEATURE_NEW_CHECKOUT</code>。
+				</figcaption>
+			</figure>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>优先级</th>
+							<th>来源</th>
+							<th>写法</th>
+							<th>适用</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td>1（最高）</td><td>运行时</td><td><code>feature.Set("beta-search", true)</code></td><td>管理接口 / 控制面板即时开关</td></tr>
+						<tr><td>2</td><td>环境变量</td><td><code>FEATURE_BETA_SEARCH=on</code></td><td>每个部署环境单独覆盖</td></tr>
+						<tr><td>3</td><td>配置段</td><td><code>feature: {beta-search: true}</code></td><td>随配置一起发布</td></tr>
+						<tr><td>4</td><td>注册表</td><td><code>feature.Register(feature.Flag{Default: …})</code></td><td>没被覆盖时的值</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				环境变量的值接受 <code>1 / true / on / yes / y / enabled</code> 与
+				<code>0 / false / off / no / n / disabled</code>（大小写与首尾空白都容忍）。
+				<b>无法解析的值会被忽略</b>，回落到下一层，而不是当成 false 静默生效。
+			</p>
+			<p>
+				<code>verticle.Run</code> 在初始化任何组件之前把框架的 <code>feature:</code> 段交给
+				<code>feature.Configure</code>，服务不用自己接。注意 <code>Configure</code> 是
+				<b>整体替换</b>配置层（不是合并），测试里可以用它隔离取值。
+			</p>
+			<div class="callout callout--warn">
+				<span class="callout__label">别把开关缓存在 struct 字段里</span>
+				包本身只保证"每次读都走一遍优先级链"。若在 <code>Setup</code> 里算一次存下来，
+				<code>Set</code> 就只对重启生效了。同理，开关只作用于<b>本进程</b>：
+				多副本要一致，就统一发布配置，或由控制面板对每个副本调 <code>Set</code>。
+			</div>
+			<p>
+				两条设计纪律：开关名用 kebab-case（<code>new-checkout</code>），让它和配置键、
+				环境变量名三者可互相推导；一个开关只保护一条路径，旧路径清理掉时把开关和旧分支一起删。
+			</p>
+
+			<h2>审计</h2>
+			<p>
+				<code>audit.Record</code> 把一条 <code>audit.Event</code> 记下来。字段是固定的那七个：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>字段</th>
+							<th>含义</th>
+							<th>谁填</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>At</code></td><td>发生时间</td><td>零值时由 <code>Record</code> 补 <code>time.Now()</code></td></tr>
+						<tr><td><code>TraceID</code></td><td>请求的 trace id</td><td>空值时由 <code>Record</code> 从 ctx 取（<code>obs.TraceID</code>）</td></tr>
+						<tr><td><code>Actor</code></td><td>谁做的：用户 id / 服务名 / <code>"system"</code></td><td>调用方</td></tr>
+						<tr><td><code>Action</code></td><td>做了什么，点分动词形式：<code>order.refund</code></td><td>调用方</td></tr>
+						<tr><td><code>Resource</code></td><td>对什么做的：<code>order/42</code></td><td>调用方</td></tr>
+						<tr><td><code>Result</code></td><td><code>audit.Success</code> 或 <code>audit.Failure</code></td><td>调用方</td></tr>
+						<tr><td><code>Detail</code></td><td>可选的结构化上下文（原因、变更字段），必须可 JSON 化</td><td>调用方</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as 调用方
+    participant M as 中间件 / handler
+    participant S as 业务存储
+    participant A as audit.Record
+    participant K as sink
+    C->>M: POST /orders/42/refund
+    M->>S: 读当前状态
+    S-->>M: 已退过款
+    Note over M: 判定之后、返回错误之前单独记一条
+    M->>A: Event{Action:"order.refund",<br/>Resource:"order/42", Result:Failure,<br/>Detail:{reason:"already refunded"}}
+    A->>A: 补 At 与 TraceID
+    A->>K: Write(ctx, Event) —— 同步调用
+    K-->>A: 返回（写失败必须上报，不许吞）
+    M-->>C: 409 {"code":40901}
+				</pre>
+				<figcaption>
+					失败同样入审计：409 是一次真实的业务事实，只记成功会让轨迹在最需要它的时候断掉。
+					记录发生在业务判定之后、返回错误之前，所以轨迹与调用方看到的结果一致。
+				</figcaption>
+			</figure>
+			<pre><code class="language-go">if done {
+    audit.Record(ctx, audit.Event{
+        Actor: actor, Action: "order.refund", Resource: resource, Result: audit.Failure,
+        Detail: map[string]string{"reason": "already refunded"},
+    })
+    return nil, errs.Conflict(40901, "order already refunded")
+}
+s.store.refunded[id] = true
+audit.Record(ctx, audit.Event{
+    Actor: actor, Action: "order.refund", Resource: resource, Result: audit.Success,
+})
+return map[string]any{"refunded": id}, nil</code></pre>
+
+			<h3>事件落到哪里</h3>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>sink</th>
+							<th>方式</th>
+							<th>适用</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>默认 <code>logSink</code></td>
+							<td>一条结构化日志 <code>obs.Info(ctx, "audit", …)</code>，字段 <code>audit_at</code> / <code>audit_actor</code> / <code>audit_action</code> / <code>audit_resource</code> / <code>audit_result</code> / <code>audit_detail</code>，外加 ctx 里的 trace id</td>
+							<td>已有日志管道（ELK / Loki），零配置</td>
+						</tr>
+						<tr>
+							<td>自定义 <code>Sink</code></td>
+							<td><code>audit.SetSink(s)</code>，<code>s.Write(ctx, Event)</code> 由 <code>Record</code> <b>同步</b>调用</td>
+							<td>审计表、只追加的 Kafka topic、WORM 对象存储</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				<code>audit.SetSink(nil)</code> 恢复默认的日志 sink（测试里常用）。
+				sink 的选择是<b>全局替换</b>：换成数据库 sink 后，日志里就不再有审计行了。
+			</p>
+			<pre><code class="language-go">// orderStore 同时是这个示例的业务存储和它的审计 sink
+func (o *orderStore) Write(_ context.Context, e audit.Event) {
+    o.mu.Lock()
+    defer o.mu.Unlock()
+    o.events = append(o.events, e)
+}</code></pre>
+
+			<h3>这个包保证什么，不保证什么</h3>
+			<div class="callout callout--note">
+				<span class="callout__label">保证：字段完整 + 时间戳 + trace id</span>
+				<code>Record</code> 会补上 <code>At</code> 和 <code>TraceID</code>，
+				并把事件交给 sink 一次。<b>不保证</b>的是轨迹不可篡改——顺序、保留期、
+				不可变性与访问控制都属于 sink 的职责。想让这条轨迹站得住，就把 sink 写得诚实：
+				同步写入，或者交给一个不会丢事件的队列；写失败要上报，不要吞掉。
+			</div>
+			<p>其余约定：</p>
+			<ul>
+				<li><b>每个结果都记</b>：成功和失败（4xx 拒绝、409 冲突）都是审计事实。</li>
+				<li><b>动作完成后立即写</b>，不要攒批，也不要丢进会丢事件的异步队列。</li>
+				<li><b><code>Detail</code> 不放秘密</b>：不放 token、密码、完整请求体，只放定位所需的字段。</li>
+				<li><code>Action</code> 用稳定的点分动词，改名会让历史查询断档；<code>Resource</code> 用 <code>类型/id</code>。</li>
+			</ul>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/feature.html">examples/feature</a>：配置选路径、运行期翻转、环境变量覆盖。</li>
+				<li><a href="../../examples/audit.html">examples/audit</a>：成功与失败都入审计，sink 可插拔，轨迹可读回。</li>
+				<li><a href="security.html">认证与安全</a>：翻转开关的管理接口本身要过认证。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

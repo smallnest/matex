@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>稳定性防护 — matex</title>
+		<meta name="description" content="matex 的四个防护工具：限流、幂等、熔断、重试，各自的作用点、失败策略与参数。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/resilience">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>稳定性防护</h1>
+			<p class="lede">
+				四个工具，两个作用点：限流与幂等挂在 HTTP 入站中间件上，熔断与重试包住某一次出站调用。
+				选哪个只看一个问题——你要保护的到底是自己、数据、下游，还是这一次请求的成败。
+			</p>
+
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>工具</th>
+							<th>包</th>
+							<th>作用点</th>
+							<th>防的是什么</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td>限流</td><td><code>pkg/core/ratelimit</code></td><td><code>httpx</code> 中间件（入站）</td><td>一个调用方打得太快——保护自己</td></tr>
+						<tr><td>幂等</td><td><code>pkg/core/idempotency</code></td><td><code>httpx</code> 中间件（入站）</td><td>同一个写请求来了两次——保护数据</td></tr>
+						<tr><td>熔断</td><td><code>pkg/core/breaker</code></td><td>包住出站调用</td><td>一直打一个已经挂掉的下游——保护它</td></tr>
+						<tr><td>重试</td><td><code>pkg/core/retry</code></td><td>包住出站调用</td><td>瞬时失败——把它藏起来</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>一条贯穿全部四件的规则：降级优先</h2>
+			<p>
+				防护组件自己故障时，<b>放行</b>，只记一条 warn。限流器连不上 redis、幂等存储读不出来，
+				都不会拒掉正常流量：丢掉限流和去重是坏事，但为此让所有请求一起失败更坏。
+			</p>
+			<pre><code class="language-go">// pkg/core/ratelimit: 限流器故障 → 放行
+ok, err := l.Allow(ctx, k)
+if err != nil {
+    obs.Warn(ctx, "rate limiter unavailable; letting the request through", "err", err)
+    return next(ctx, r)
+}
+
+// pkg/core/idempotency: 存储故障 → 不带保护地执行
+claimed, err := store.Begin(ctx, key, cfg.TTL)
+if err != nil {
+    obs.Warn(ctx, "idempotency store unavailable; running unguarded", "err", err)
+    return next(ctx, r)
+}</code></pre>
+			<p>
+				这条规则有<b>一个例外</b>，而且在中间件里写死了：重复请求重放阶段读存储失败，
+				返回 <code>500 {"code":50002}</code> 而不是放行。因为跑到这一步说明 key 已经被占住，
+				再执行一遍正是调用方要求你防止的事——这里失败关闭。
+			</p>
+
+			<h2>限流：加在路由的边缘</h2>
+			<p>
+				两种策略共用一个接口，选哪个是在回答"限谁的额度"：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>构造</th>
+							<th>算法</th>
+							<th>额度范围</th>
+							<th>代价</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>NewLocal(rate, burst)</code></td>
+							<td>进程内按 key 的令牌桶</td>
+							<td>每个实例各算各的：N 个副本就是 N × rate</td>
+							<td>空闲够久的 key 会被丢弃，IP 这种无界键空间撑不爆内存</td>
+						</tr>
+						<tr>
+							<td><code>NewRedis(client, limit, window)</code></td>
+							<td>固定窗口，Lua 脚本原子 incr + pexpire</td>
+							<td>整个集群共享一份计数</td>
+							<td>窗口边界最多能过 2 × limit，换来一次往返与原子性</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<pre><code class="language-go">srv.Use(ratelimit.Middleware(ratelimit.NewLocal(s.cfg.LoginRate, s.cfg.LoginBurst), ratelimit.ByIP))
+srv.Handle("POST", "/api/v1/login", s.login)</code></pre>
+			<p>
+				key 由 <code>KeyFunc</code> 给出：<code>ByIP</code>（用 <code>RemoteAddr</code>，
+				在负载均衡后面那是代理的地址）、<code>ByHeader("X-API-Key")</code>、
+				<code>ByRoute</code>、<code>ByIPAndRoute</code>，或者自己写一个。
+				返回 <code>""</code> 表示<b>这个请求不限流</b>。
+			</p>
+			<div class="callout callout--warn">
+				<span class="callout__label">ByIP 不默认信任 X-Forwarded-For</span>
+				要按真实客户端 IP 限流，得显式写 <code>ratelimit.ByHeader("X-Forwarded-For")</code>——
+				并且只在你确实控制边界网关时才这么做，否则调用方可以随便伪造这个头来绕过限流。
+			</div>
+			<p>
+				超限返回 <code>429 {"code":42901,"msg":"too many requests"}</code>，handler 完全不执行。
+			</p>
+
+			<h2>幂等：写操作的必备件</h2>
+			<p>
+				客户端送一个 <code>Idempotency-Key</code>。第一个请求占住这个 key 并执行，结果存下来；
+				带同一个 key 的后续请求重放那个结果，不再执行。
+			</p>
+			<pre><code class="language-go">srv.Use(idempotency.Middleware(idempotency.NewRedis(rc), idempotency.Config{}))
+srv.Handle("POST", "/api/v1/payments", s.pay)</code></pre>
+			<p>首轮结果决定后续请求看到什么：</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>首轮结果</th>
+							<th>同 key 的后续请求</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td>成功（含 204）</td><td>重放相同响应</td></tr>
+						<tr><td>4xx（确定性拒绝）</td><td>重放相同错误</td></tr>
+						<tr><td><b>5xx</b></td><td><b>释放 key</b>，允许重试成功</td></tr>
+						<tr><td>超时 / 取消</td><td>释放 key——副作用可能发生了也可能没有，不能让调用方在整个 TTL 内重放 504</td></tr>
+						<tr><td>首轮还在跑</td><td><code>409 {"code":40902}</code>，而不是并行跑第二遍</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				<code>Config</code> 的默认值：<code>Header</code> 为 <code>Idempotency-Key</code>，
+				<code>TTL</code> 为 24 小时，<code>Prefix</code> 为 <code>"idem:"</code>，
+				<code>Methods</code> 为 <code>POST</code> / <code>PATCH</code> / <code>DELETE</code>——
+				GET 本来就幂等，带 key 是噪音。
+			</p>
+			<div class="callout callout--note">
+				<span class="callout__label">重放的整数用 json.Number 解码</span>
+				存下来的 <code>Outcome.Data</code> 回读时走 <code>json.Decoder</code> 加
+				<code>UseNumber()</code>。普通 <code>Unmarshal</code> 会把超过 2<sup>53</sup> 的
+				uint64 id 悄悄四舍五入成 float64，回给调用方一个看着像真的、其实错了的值。
+			</div>
+			<p>
+				<code>NewMemory()</code> 只适合单实例与测试：多副本下每个实例只去重自己那份流量，
+				看起来生效、实际漏一半。生产用 <code>NewRedis(rc)</code>，<code>rc</code> 在
+				<code>Setup</code> 里从 <code>env.Redis()</code> 取。
+			</p>
+
+			<h2>熔断：停止打一个已经挂掉的下游</h2>
+			<p>三态机，与教科书写法一致：</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+stateDiagram-v2
+    [*] --> closed
+    closed --> open: 触发条件满足<br/>（连续失败 / 错误率滑窗超阈值）
+    open --> halfopen: 冷却期结束，放行一个探测
+    halfopen --> open: 探测失败，重新计时冷却
+    halfopen --> closed: 连续 Successes 次探测成功
+    note right of open
+        期间每次调用直接返回 ErrOpen
+        不再给下游加负载
+    end note
+    note right of halfopen
+        同一时刻只放一个探测
+        避免又变成一次小爆发
+    end note
+				</pre>
+				<figcaption>
+					冷却期用 <code>Cooldown</code>（默认 10s），关回条件用 <code>Successes</code>
+					（默认 2）。<code>OnStateChange</code> 在每次迁移时调用，指标从这里上报。
+				</figcaption>
+			</figure>
+
+			<h3>两种触发模型</h3>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>模型</th>
+							<th>配置</th>
+							<th>什么时候打开</th>
+							<th>适合</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>错误率滑窗</td>
+							<td><code>Ratio: 0.5, Window: 60s, MinSamples: 20</code></td>
+							<td>窗口内至少 <code>MinSamples</code> 次调用，且失败率 ≥ <code>Ratio</code></td>
+							<td>线上默认。稳态流量里几个 5xx 就能触发，低流量里的偶发抖动不会</td>
+						</tr>
+						<tr>
+							<td>连续失败</td>
+							<td><code>Failures: 5</code>（<code>Ratio</code> 留零）</td>
+							<td>连续 <code>Failures</code> 次失败</td>
+							<td>调用频次很低、没有"比率"可言的下游</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				滑窗用 10 个固定槽实现，每次调用 O(1)、内存有界；槽按 <code>Window / 10</code>
+				的宽度对齐，一次长空闲会把窗口整体清空。<code>Ratio &gt; 1</code> 会被夹到 1，
+				负值当作 0（即退回连续失败模型）。滑窗模型在<b>打开和关闭时都会清空窗口</b>：
+				恢复后的流量从零开始统计，打开前的旧失败不会在刚关上的瞬间把它再顶开。
+			</p>
+
+			<h3>什么算失败：按 errs 种类分类</h3>
+			<p>
+				默认 <code>IsFailure</code> 只看服务端错误：<code>errs.Status(err) &gt;= 500</code>。
+				非 matex 的普通 Go error 被 <code>errs</code> 映射成 500，所以也算失败。
+				400/404 这类客户端错误是调用方的问题，<b>不打开熔断</b>——否则一条写错参数的上游
+				就能把你的下游熔断掉。
+			</p>
+			<pre><code class="language-go">// pkg/core/breaker: 默认分类
+func defaultIsFailure(err error) bool {
+    if err == nil {
+        return false
+    }
+    status, _, _ := errs.Status(err)
+    return status >= 500
+}</code></pre>
+			<p>需要别的口径就传自己的 <code>IsFailure</code>。使用方式：</p>
+			<pre><code class="language-go">b := breaker.New(breaker.Config{Failures: 3, Successes: 1, Cooldown: 5 * time.Second})
+
+err := b.Do(ctx, func(ctx context.Context) error {
+    return payments.Charge(ctx, order)
+})
+if errors.Is(err, breaker.ErrOpen) {
+    return nil, errs.Unavailable(50302, "payment service is unavailable")
+}</code></pre>
+			<p>
+				<code>ErrOpen</code> 与"试过了但失败了"是两件事，用 <code>errors.Is</code> 区分。
+				带返回值时用泛型版本 <code>breaker.DoValue[T]</code>，<code>State()</code> 读当前状态。
+			</p>
+			<div class="callout callout--note">
+				<span class="callout__label">OnStateChange 在锁内调用</span>
+				回调运行期间熔断器持锁，所以只做记日志、打点这类短操作，<b>不要回调 Breaker 本身</b>。
+				熔断器不依赖 <code>obs</code>，指标（如 <code>breaker_state{name}</code> gauge）
+				在回调里自己上报。
+			</div>
+
+			<h2>重试：只对幂等操作，且必须在熔断外面</h2>
+			<p>
+				延迟是 <code>BaseDelay × Multiplier^(N-1)</code>，上限 <code>MaxDelay</code>，
+				再在 <code>[0, delay)</code> 上摊开——<b>全抖动</b>。同一瞬间失败的一批客户端若无抖动，
+				会在同一瞬间重试，把一个瞬时抖动放大成尖峰。默认值：<code>Attempts: 3</code>、
+				<code>BaseDelay: 100ms</code>、<code>Multiplier: 2</code>、<code>MaxDelay: 5s</code>。
+				默认 <code>Retryable</code> 只排除已取消或已超时的 ctx——睡一觉再试救不了它。
+			</p>
+			<pre><code class="language-go">// 出站调用：retry 在外，breaker 在内，包裹范围只有这一次调用
+payload, err := retry.DoValue(ctx, retry.Config{
+    Attempts:  3,
+    BaseDelay: 5 * time.Millisecond,
+    Retryable: func(err error) bool {
+        return !errors.Is(err, breaker.ErrOpen)   // 熔断了就别再重试
+    },
+}, func(ctx context.Context) (string, error) {
+    return breaker.DoValue(ctx, s.circuit, func(context.Context) (string, error) {
+        return s.downstream.call()
+    })
+})</code></pre>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    H[handler] --> R["retry.DoValue<br/>Attempts: 3"]
+    R --> B["breaker.DoValue"]
+    B -->|"circuit closed"| D[下游调用]
+    B -->|"circuit open"| EO["ErrOpen"]
+    EO --> R
+    R -.->|"Retryable 判 false<br/>立即停止"| H
+    D -->|"5xx / 传输错误"| R
+    D -->|"成功"| H
+    classDef stop fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class EO stop
+				</pre>
+				<figcaption>
+					每次尝试都过一遍熔断；熔断打开后重试循环立刻停，不再补上三次注定失败的调用。
+					若把顺序反过来（breaker 在外），一次熔断会被放大成三倍的调用量。
+				</figcaption>
+			</figure>
+			<p>两条必须同时满足的参数关系：</p>
+			<ul>
+				<li>
+					<b>熔断阈值 ≥ 重试次数</b>。阈值小于重试预算时，熔断器会在重试循环<b>中间</b>打开，
+					最后一次尝试连机会都没有。示例里 <code>Failures: 3</code> 对 <code>Attempts: 3</code>
+					是最紧的配置。
+				</li>
+				<li>
+					<b><code>Retryable</code> 要显式放行 <code>ErrOpen</code></b>。默认的
+					<code>Retryable</code> 只看 ctx，会把 <code>ErrOpen</code> 当成可重试的普通错误，
+					于是熔断一打开就是三次空转。
+				</li>
+			</ul>
+			<p>
+				还有一条纪律：<b>包裹范围要小</b>。熔断与重试只包住那一次出站调用，
+				不要包整个 handler——那样熔断器会统计到一堆与下游无关的失败。
+				重试只对幂等操作安全；写操作配 <code>idempotency</code>，不要赌第二次无害。
+			</p>
+
+			<h2>组合起来的顺序</h2>
+			<pre><code class="language-go">func (s *resilienceService) BuildRouter(srv *httpx.Server) error {
+    // Use 只护它之后注册的路由，所以防护按书写顺序叠加
+    srv.Use(ratelimit.Middleware(ratelimit.NewLocal(s.cfg.LoginRate, s.cfg.LoginBurst), ratelimit.ByIP))
+    srv.Handle("POST", "/api/v1/login", s.login)
+
+    srv.Use(idempotency.Middleware(idempotency.NewMemory(), idempotency.Config{}))
+    srv.Handle("POST", "/api/v1/payments", s.pay)
+    return nil
+}</code></pre>
+			<p>
+				入站防护的叠加语义由 <code>httpx.Server.Use</code> 决定：先注册的中间件在最外层。
+				所以限流先于幂等——被 429 挡掉的请求不会占住一个幂等 key。
+			</p>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/resilience.html">examples/resilience</a>：四个工具串在一条链路上，含"熔断打开后不再调用下游"的断言。</li>
+				<li><a href="http.html">HTTP 与路由</a>：<code>Use</code> 的累积语义与两个中间件槽。</li>
+				<li><a href="../reference/packages.html">包索引</a>：四个包的导出符号一览。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

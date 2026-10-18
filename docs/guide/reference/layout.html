@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>目录与约定 — matex</title>
+		<meta name="description" content="matex 的目录布局、每个目录放什么，以及由 depguard 与 make ci 强制的四条约定。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/reference/layout">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>目录与约定</h1>
+			<p class="lede">
+				布局不是审美问题：它决定了新代码该写在哪、依赖往哪个方向走、以及哪些规则可以交给
+				工具去拦。这页是目录表与四条硬约定的索引。
+			</p>
+
+			<h2>目录布局</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>路径</th>
+							<th>放什么</th>
+							<th>不放什么</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>cmd/&lt;service&gt;/</code></td>
+							<td>一个二进制一个部署单元。当前是 <code>cmd/demo/main.go</code>：解析 <code>-conf</code>，调一次 <code>verticle.Run</code></td>
+							<td>业务逻辑、装配代码</td>
+						</tr>
+						<tr>
+							<td><code>cmd/migrate/</code></td>
+							<td>迁移工具：<code>-driver</code> / <code>-dsn</code> / <code>-dir</code>，把 <code>migrations/*.sql</code> 应用到库里</td>
+							<td>—</td>
+						</tr>
+						<tr>
+							<td><code>internal/app/</code></td>
+							<td>实现 <code>verticle.Service</code>：<code>Name()</code> / <code>Setup()</code> / <code>BuildRouter()</code>，解码服务段、从 <code>Env</code> 取依赖、构造 domain、挂 <code>Block</code> 后台任务</td>
+							<td>业务规则（属于 domain）</td>
+						</tr>
+						<tr>
+							<td><code>internal/domain/&lt;name&gt;/</code></td>
+							<td>业务域三件套：<code>handler.go</code>（HTTP 边界：解析入参 → 调 service → 返回 payload 或 <code>errs</code>）、<code>service.go</code>（纯业务逻辑，依赖经 <code>Deps</code> 注入）、<code>dao.go</code>（数据访问，SQL 与行结构）</td>
+							<td>路由注册、封套/状态码/中间件等框架关注点</td>
+						</tr>
+						<tr>
+							<td><code>pkg/core/</code></td>
+							<td>可复用的基础设施，每个包单一职责：<code>config</code> / <code>db</code> / <code>redis</code> / <code>memcache</code> / <code>kafka</code> / <code>httpx</code> / <code>obs</code> / <code>errs</code> / <code>verticle</code> / <code>app</code> / <code>auth</code> / <code>ratelimit</code> / <code>breaker</code> / <code>retry</code> / <code>idempotency</code> / <code>cache</code> / <code>cron</code> / <code>feature</code> / <code>audit</code> / <code>llm</code> …</td>
+							<td>业务语义；也不 import <code>internal/</code></td>
+						</tr>
+						<tr>
+							<td><code>configs/</code></td>
+							<td>三份配置：<code>config.min.yaml</code>（零依赖，只有 http + log + 服务段）、<code>config.sqlite.yaml</code>（带纯 Go SQLite）、<code>config.yaml</code>（含 db/redis/memcache/kafka 段）</td>
+							<td>密钥明文——用 <code>${VAR:default}</code> 从环境变量取</td>
+						</tr>
+						<tr>
+							<td><code>migrations/*.sql</code></td>
+							<td>数据库迁移，按文件名序执行</td>
+							<td>修改已提交的迁移文件——只追加</td>
+						</tr>
+						<tr>
+							<td><code>examples/&lt;feature&gt;/</code></td>
+							<td>每个能力一个可运行示例：<code>main.go</code> + <code>README.md</code> + 测试（+ 需要 HTTP 形态时带 <code>config.yaml</code>）</td>
+							<td>只给片段不给跑法的"伪示例"</td>
+						</tr>
+						<tr>
+							<td><code>skills/</code></td>
+							<td>AI skill，<code>matex-</code> 前缀，每个能力一个目录（<code>SKILL.md</code>）</td>
+							<td>—</td>
+						</tr>
+						<tr>
+							<td><code>.claude-plugin/</code></td>
+							<td>skill 插件清单：<code>plugin.json</code>（<code>matex-skills</code> 大伞）与 <code>marketplace.json</code></td>
+							<td>—</td>
+						</tr>
+						<tr>
+							<td><code>docs/</code></td>
+							<td>本站静态站点源码与 <code>design.md</code>（逐项取舍说明）</td>
+							<td>—</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>依赖方向</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    CMD["cmd/&lt;service&gt;<br/>main：只调 verticle.Run"]
+    APP["internal/app/<br/>实现 verticle.Service<br/>装配 domain"]
+    DOM["internal/domain/&lt;name&gt;/<br/>handler · service · dao"]
+    CORE["pkg/core/*<br/>唯一的基础设施入口"]
+    DRV["第三方驱动<br/>pgx · go-sql-driver · modernc-sqlite<br/>go-redis · gomemcache · franz-go · grpc · rpcx"]
+    CMD --> APP
+    APP --> DOM
+    APP --> CORE
+    DOM --> CORE
+    CORE -.-> DRV
+    DOM -. "禁止（depguard 拦截）" .-> DRV
+    classDef core fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class CORE core
+    classDef bad fill:#fff,stroke:#999,stroke-dasharray: 4 3,color:#777
+    class DRV bad
+				</pre>
+				<figcaption>
+					实线是允许的调用方向，虚线是 <code>pkg/core</code> 内部的驱动依赖。
+					domain 到驱动的直连被 depguard 拦住——它不是靠 review 记住的纪律，是构建期错误。
+				</figcaption>
+			</figure>
+
+			<h2>四条强制约定</h2>
+			<p>
+				"约定"意味着违反时应该有东西报错。下面四条分别由 <code>.golangci.yml</code>、
+				类型签名与 <code>make ci</code> 承担。
+			</p>
+
+			<h3>1. 业务代码不 import 驱动库</h3>
+			<p>
+				单一基础设施入口。业务要用数据库就经 <code>pkg/core/db</code>，要 Redis 就经
+				<code>pkg/core/redis</code>——换驱动只改 <code>pkg/core</code>，业务一行不动。
+				<code>business-no-drivers</code> 规则覆盖 <code>**/internal/**</code>，
+				<code>examples-no-drivers</code> 覆盖示例（示例要示范正确写法）：
+			</p>
+			<pre><code class="language-yaml">business-no-drivers:
+  files:
+    - "**/internal/**"
+  deny:
+    - pkg: github.com/jackc/pgx
+      desc: use pkg/core/db
+    - pkg: github.com/go-sql-driver/mysql
+      desc: use pkg/core/db
+    - pkg: modernc.org/sqlite
+      desc: use pkg/core/db
+    - pkg: github.com/redis/go-redis
+      desc: use pkg/core/redis
+    - pkg: github.com/bradfitz/gomemcache
+      desc: use pkg/core/memcache
+    - pkg: github.com/twmb/franz-go
+      desc: use pkg/core/kafka</code></pre>
+			<div class="callout callout--note">
+				<span class="callout__label">唯一豁免</span>
+				kafka 包自身的测试与示例测试用 <code>franz-go/pkg/kfake</code> 跑进程内 broker，
+				让 Kafka 用例离线可跑。<code>kafka-test-fake-broker</code> 规则把豁免收窄到
+				测试文件，非测试代码仍不得 import franz-go。
+			</div>
+
+			<h3>2. 不用 Web 框架</h3>
+			<p>
+				路由与中间件用标准库：Go 1.22 的 ServeMux 原生支持方法路由与路径参数，
+				<code>pkg/core/httpx</code> 补齐统一封套、超时、trace、访问日志、指标与错误映射。
+				再引一个第三方路由只会多一份依赖面和一套分叉语义。<code>no-web-framework</code>
+				规则对 <b>所有</b> Go 文件生效：
+			</p>
+			<pre><code class="language-yaml">no-web-framework:
+  files:
+    - "**/*.go"
+  deny:
+    - pkg: github.com/gin-gonic/gin
+      desc: matex uses net/http via pkg/core/httpx
+    - pkg: github.com/labstack/echo
+      desc: matex uses net/http via pkg/core/httpx
+    - pkg: github.com/gofiber/fiber
+      desc: matex uses net/http via pkg/core/httpx
+    - pkg: github.com/go-chi/chi
+      desc: matex uses net/http via pkg/core/httpx
+    - pkg: github.com/gorilla/mux
+      desc: matex uses net/http via pkg/core/httpx</code></pre>
+
+			<h3>3. handler 签名固定</h3>
+			<pre><code class="language-go">func(ctx context.Context, r *http.Request) (any, error)</code></pre>
+			<p>
+				handler 不碰 <code>http.ResponseWriter</code>：返回 <code>nil</code> 即 204，
+				返回 <code>errs.*</code> 即对应状态码加 <code>{code,msg,data}</code> 封套。
+				签名固定换来三件事：handler 能直接单测（不需要构造响应记录器以外的任何东西）、
+				能被中间件统一包装、能统一加超时与日志。
+				需要原生控制（流式、自定义状态码、SSE、文件下载）时走 <code>HandleRaw</code>，
+				它是唯一的逃生口，且不经过封套。细节见 <a href="../concepts/http.html">HTTP 与路由</a>。
+			</p>
+
+			<h3>4. 每个能力都有离线可跑的示例</h3>
+			<p>
+				<code>examples/&lt;feature&gt;/</code> 一个目录一个能力，必须能<code>go run</code>、
+				必须有测试，且<b>离线可跑</b>：SQLite 用纯 Go 驱动（<code>modernc.org/sqlite</code>，
+				无 cgo）、Redis 用 <code>redistest</code>（miniredis）、Kafka 用
+				<code>kfake</code>、gRPC/rpcx 用进程内 server。所以 <code>make ci</code>
+				就能验证全部示例，不需要 Docker、不需要网络。
+			</p>
+			<pre><code class="language-bash">make example NAME=http        # 等价于 go run ./examples/http
+make test-short               # 含 sqlite / miniredis / kfake / 进程内 RPC 用例
+make ci                       # vet + test-short + build，示例一并被验证</code></pre>
+
+			<h2>一个部署单元 = 一个 cmd 二进制</h2>
+			<p>
+				<code>verticle.Service</code> 是部署单元的边界，而 <code>cmd/&lt;service&gt;/</code>
+				是它的落地形态：一个 <code>main</code> 包对应一个 <code>Name()</code>、一个进程、
+				一份配置段、一套日志与指标标签。要加第二个部署单元，复制 <code>cmd/demo</code>
+				与 <code>internal/app</code> 改名即可——<code>Name()</code> 决定去配置文件的哪一段
+				取自己的配置，框架段（<code>http</code>、<code>db</code>…）与它无关。
+			</p>
+			<pre><code class="language-go">// cmd/demo/main.go —— main 的全部内容
+func main() {
+    conf := flag.String("conf", "", "config file (default configs/config.yaml or $CONFIG_FILE)")
+    flag.Parse()
+
+    if err := verticle.Run(context.Background(), &amp;app.DemoService{}, verticle.WithConf(*conf)); err != nil {
+        fmt.Fprintln(os.Stderr, "fatal:", err)
+        os.Exit(1)
+    }
+}</code></pre>
+			<p>
+				由此推出两条经常被问到的推论：<b>不要在一个进程里塞两个服务</b>（配置段、日志标签、
+				指标前缀都会打架，生命周期也会互相拖累）；<b>不要给不同环境准备不同的 main</b>——
+				依赖是否存在是部署事实，删掉配置里那一段即可，代码不用改。
+			</p>
+			<div class="callout callout--tip">
+				<span class="callout__label">"配了才建，没配为 nil"</span>
+				<code>verticle.Run</code> 按配置初始化基础设施：配了 <code>db:</code> 段才有
+				<code>env.DB()</code>，没配就是 nil。一个只有 <code>http:</code> 段的最小配置也能起服务
+				（<code>configs/config.min.yaml</code> 就是），其余依赖随加随用。
+			</div>
+
+			<h2>新代码放哪</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>你要做的事</th>
+							<th>落到哪</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td>加一个新接口</td><td><code>internal/domain/&lt;name&gt;/handler.go</code> + 在 <code>BuildRouter</code> 注册</td></tr>
+						<tr><td>加一条业务规则</td><td><code>internal/domain/&lt;name&gt;/service.go</code></td></tr>
+						<tr><td>加一条 SQL</td><td><code>internal/domain/&lt;name&gt;/dao.go</code>；表结构改动写成 <code>migrations/000N_*.sql</code></td></tr>
+						<tr><td>加一个后台任务或消费者</td><td><code>internal/app</code> 的 <code>Setup</code> 里 <code>env.Block(...)</code></td></tr>
+						<tr><td>加一个横切能力（认证、限流…）</td><td>优先看 <code>pkg/core/</code> 是否已有；要新写就照该目录的包结构加，并补一个 example</td></tr>
+						<tr><td>加一段业务配置</td><td>服务段结构体加 <code>default:</code>/<code>env:</code>/<code>optional</code> tag，在 <code>configs/config.yaml</code> 的服务段写值</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>下一步</h2>
+			<ul>
+				<li><a href="commands.html">命令与部署</a>：Makefile 目标、CI 任务、Docker 镜像与本地依赖。</li>
+				<li><a href="packages.html">pkg/core 速查</a>：每个包的用途与开关。</li>
+				<li><a href="../../examples/http.html">examples/http</a>：按这套布局写出来的最小服务。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

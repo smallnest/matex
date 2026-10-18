@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>配置 — matex</title>
+		<meta name="description" content="matex 配置：struct tag 语义、${VAR} 展开、可选段、未知键告警与热更。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/config">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>配置</h1>
+			<p class="lede">
+				YAML 文件 + struct tag。<code>default</code> 给缺省值，<code>env</code> 允许环境变量覆盖，
+				<code>optional</code> 标记可缺省——三段语义都在 tag 上，不用记魔法字段名。
+			</p>
+
+			<h2>加载与拒绝</h2>
+			<pre><code class="language-go">var cfg AppConfig
+
+config.Load("configs/config.yaml", &amp;cfg)   // 从文件加载
+config.Parse(body, &amp;cfg)                   // 从 []byte
+config.ParseMap(raw, &amp;cfg)                 // 从 map（热更用它）
+
+if unknown := config.UnknownKeys(raw, &amp;cfg); len(unknown) &gt; 0 {
+    // 只告警不报错：未知键通常是拼写错误，但直接失败会挡住向前兼容的部署
+}</code></pre>
+			<div class="callout callout--note">
+				<span class="callout__label">未知键为什么只告警</span>
+				框架启动时会比对框架段的字段集合，把不认识的键用
+				<code>obs.Warn</code> 打出来。选择告警而非报错，是因为配置文件可能被更新的版本
+				写入过——直接拒绝启动会让回滚变危险。
+			</div>
+
+			<h2>tag 三段语义</h2>
+			<pre><code class="language-go">type Config struct {
+    HTTP struct {
+        Addr    string        `json:"addr" default:":8080"`
+        Timeout time.Duration `json:"timeout" default:"10s"`
+    } `json:"http"`
+
+    DB struct {
+        DSN   string `json:"dsn" env:"DB_DSN"`      // 环境变量优先于文件
+        Pool  int    `json:"pool" default:"16"`
+        Extra string `json:"extra" optional:""`     // 可以缺省
+    } `json:"db"`
+
+    Features []string `json:"features" default:"a,b"`  // 逗号分隔
+}</code></pre>
+
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>标记</th>
+							<th>含义</th>
+							<th>说明</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>json:"name"</code></td>
+							<td>YAML 键名</td>
+							<td>必写；嵌套结构靠它成段。</td>
+						</tr>
+						<tr>
+							<td><code>default:"…"</code></td>
+							<td>缺省值</td>
+							<td>按字段类型解析，<code>time.Duration</code> 支持 <code>"10s"</code> 这类写法。</td>
+						</tr>
+						<tr>
+							<td><code>env:"VAR"</code></td>
+							<td>环境变量覆盖</td>
+							<td>优先级最高，容器里改配置的首选。</td>
+						</tr>
+						<tr>
+							<td><code>optional:""</code></td>
+							<td>允许缺省</td>
+							<td>缺了不报错，零值交给业务判断。</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h3>环境变量展开</h3>
+			<p>
+				除了 tag 级覆盖，YAML 文本本身支持 <code>${VAR}</code> 与 <code>${VAR:default}</code>，
+				适合把整段 DSN 拼出来：
+			</p>
+			<pre><code class="language-yaml">db:
+  driver: postgres
+  dsn: ${DB_DSN:postgres://matex:matex@localhost:5432/matex?sslmode=disable}
+
+redis:
+  addr: ${REDIS_ADDR:localhost:6379}</code></pre>
+
+			<h2>配置文件的结构</h2>
+			<p>
+				框架段 + 每服务一段。服务段的 key 必须等于 <code>Service.Name()</code>——
+				这就是为什么 <code>Name()</code> 不是装饰。
+			</p>
+			<pre><code class="language-yaml">http:                      # 框架段：配了就建 HTTP server
+  addr: ":8080"
+  timeout: 10s
+  max_body: 33554432
+
+log:
+  level: info
+
+db:                        # 可选：不写这段就没有数据库
+  driver: postgres
+  dsn: ${DB_DSN:...}
+  max_open_conns: 16
+  slow_threshold: 200ms
+
+grpc:                      # 可选：还要实现 GRPCRegistrar 才会监听
+  addr: ":9090"
+  dial_timeout: 3s
+  health: true             # 内置 grpc.health.v1，默认开
+  reflection: false        # 默认关：它会公开服务面
+
+feature:                   # 功能开关的静态部分
+  new-checkout: false
+
+demo:                      # 服务段，key == DemoService.Name()
+  greeting: "hello"
+  consume: false</code></pre>
+
+			<h2>哪些段是必须的</h2>
+			<p>
+				严格来说只有 <code>http</code> 是值得配的（不配也能起，只是没有 HTTP 端口）。
+				其余全部可选，且"没配 = 不存在"：
+			</p>
+			<pre><code class="language-bash"># 只有 http + log + 服务段，零外部依赖
+$ cat configs/config.min.yaml
+
+# 加一段就多一个能力
+$ grep -c '^db:' configs/config.sqlite.yaml</code></pre>
+			<div class="callout callout--warn">
+				<span class="callout__label">环境变量不能凭空启用一段配置</span>
+				给 <code>DB_DSN</code> 但配置文件里没有 <code>db:</code> 段，服务不会连数据库。
+				段的<b>存在</b>是开关，环境变量只覆盖段内的值。
+			</div>
+
+			<h2>热更</h2>
+			<p>
+				框架用 fsnotify 监听配置文件（100ms 去抖），变化时把服务段交给实现了
+				<code>ConfigWatcher</code> 的服务。返回什么、怎么并发安全由服务决定：
+				见 <a href="service.html">服务与生命周期</a>。
+			</p>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="../../examples/config.html">examples/config</a>：tag 语义、<code>${VAR}</code>、环境覆盖。</li>
+				<li><a href="../../examples/lifecycle.html">examples/lifecycle</a>：热更回调与拒绝非法新配置。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

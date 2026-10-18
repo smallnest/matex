@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>缓存模式 — matex</title>
+		<meta name="description" content="pkg/core/cache：cache-aside 的 GetOrLoad、并发 miss 合并（防击穿）、TTL 抖动（防雪崩）、写后失效与命名空间 key。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/concepts/cache">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>缓存模式</h1>
+			<p class="lede">
+				<code>pkg/core/cache</code> 补的是 redis 客户端本身给不了的两个模式。
+				它们只在压力下暴露：一个热 key 到期时所有在途请求同时回源，一批一起写入的 key
+				又会在同一时刻过期。
+			</p>
+
+			<h2>两个失效模式</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>模式</th>
+							<th>现象</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><b>击穿 / 惊群</b>（stampede）</td>
+							<td>一个热 key 到期，N 个在途请求同时回源，DB 吃到本该被缓存挡下的那波流量。</td>
+						</tr>
+						<tr>
+							<td><b>同时过期</b>（synchronized expiry）</td>
+							<td>一批一起写入的 key 一起到期，按时钟周期性地制造上面那波流量。</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				<code>GetOrLoad</code> 一次解决两个：同一 key 的并发 miss 合并成<b>一次</b>回源；
+				每条 TTL 写入前都<b>随机摊开</b>。它不做本地多级缓存——本地副本会引入多实例失效问题，
+				而收益只是省一次网络往返。
+			</p>
+
+			<h2>读：GetOrLoad</h2>
+			<pre><code class="language-go">u, err := cache.GetOrLoad(ctx, s.redis, cache.Key("user", id),
+	cache.Config{TTL: 30 * time.Second, Jitter: 5 * time.Second},
+	func(ctx context.Context) (User, error) {
+		return dao.ByID(ctx, db, id)   // 回源：DB / 下游 / 计算
+	})</code></pre>
+			<p>一次调用做四件事：查缓存 → 命中就返回 → miss 时按 key 合并并发请求 → 回源结果按抖动后的 TTL 写回。</p>
+			<pre><code class="language-go">// DefaultTTL 是 Config.TTL 未设时用的值。
+const DefaultTTL = time.Minute
+
+type Config struct {
+	TTL    time.Duration // 基础存活时间
+	Jitter time.Duration // 每个 TTL 最多再随机减掉这么多，防止一起过期
+}</code></pre>
+			<div class="callout callout--tip">
+				<span class="callout__label">Jitter 取 TTL 的 10%~20%</span>
+				<code>Jitter &gt;= TTL</code> 时会被压到 <code>TTL/2</code>：在 redis 里
+				<b>0 过期等于立即删除</b>，不是"短暂缓存"。抖动绝不会把 TTL 抖到 0。
+			</div>
+			<p>几个不写进调用点的约定：</p>
+			<ul>
+				<li>
+					<b>client 为 nil 不是错误</b>：不配 redis 就直接回源、不缓存。调用点因此不用写
+					<code>if env.Redis != nil</code>。
+				</li>
+				<li><b>读缓存失败降级为 miss</b>：redis 抖动时记一条 warn、照常回源，请求不会因为缓存故障而失败。</li>
+				<li><b>回源失败不写缓存</b>：错误原样返回，下一次请求重新尝试。</li>
+				<li><b>写缓存失败只是慢</b>：值已经在手上，只记 warn，不影响正确性。</li>
+			</ul>
+
+			<h2>并发 miss 合并</h2>
+			<p>
+				合并由一个<b>进程级</b>的 <code>singleflight.Group</code> 完成——惊群是进程级事件，
+				所以这个组是全包共享的。<code>loads.Do(key, …)</code> 里先给排队者<b>再看一眼缓存</b>：
+				它们排队期间值可能已经被写入。
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant R1 as 请求 1（第一个）
+    participant R2 as 请求 2..N
+    participant G as singleflight.Group<br/>按 key 合并
+    participant C as redis
+    participant S as 回源（DB）
+    R1->>C: GET user:2
+    C-->>R1: miss
+    R2->>C: GET user:2
+    C-->>R2: miss
+    R1->>G: Do("user:2", fn)
+    R2->>G: Do("user:2", fn) — 排队等待
+    G->>C: 再看一眼（可能已被写入）
+    C-->>G: 仍然 miss
+    G->>S: load(ctx) —— 只调用一次
+    S-->>G: User
+    G->>C: SetJSON(key, v, 抖动后的 TTL)
+    G-->>R1: User
+    G-->>R2: 同一个 User（共享结果，不重复回源）
+				</pre>
+				<figcaption>
+					N 个并发 miss 只有一次回源。合并键是字面 key 字符串，所以 key 必须带命名空间。
+				</figcaption>
+			</figure>
+			<div class="callout callout--warn">
+				<span class="callout__label">回源跑在第一个调用者的 ctx 下</span>
+				第一个调用者放弃时，这一组合并的请求会一起失败。这是刻意的：另一种做法是让一个调用者
+				早就跑掉的请求继续占着数据库连接。所以<b>别把 <code>GetOrLoad</code> 挂在一个随时取消的
+				短 ctx 上</b>。
+			</div>
+
+			<h2>写：Invalidate</h2>
+			<p>
+				写完 DB 之后删掉对应的 key，而不是更新它。<b>删除</b>是关键：
+			</p>
+			<pre><code class="language-go">if err := cache.Invalidate(ctx, s.redis, cache.Key("user", id)); err != nil {
+	obs.Warn(ctx, "invalidate failed", "id", id, "err", err)
+}</code></pre>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    W1["写者 A<br/>UPDATE user 1"] --> DB[("源数据")]
+    DB --> INV["cache.Invalidate<br/>DEL user:1"]
+    R["后续读<br/>GetOrLoad"] -->|miss| DB
+    DB --> R
+    R --> SET["写回缓存<br/>新值"]
+    classDef ok fill:#eef7ef,stroke:#3f7d3f,color:#2b2722
+    class INV,R,SET ok
+				</pre>
+				<figcaption>
+					删缓存后，下一次读必然 miss 并回源拿到新值——任何交错顺序都不会留下旧值。
+				</figcaption>
+			</figure>
+			<p>
+				对比"写 DB + 写缓存"：两个并发写者可以交错成"A 写 DB、B 写 DB、B 写缓存、A 写缓存"，
+				缓存里最终留下 A 的<b>旧</b>值。删除没有这个窗口——缓存要么是空的（会回源），要么是某次
+				回源的结果。<b>失效失败不要让写请求失败</b>，但要记 warn：它意味着在 TTL 内可能读到旧值。
+				所以 TTL 应该被当成"最坏情况下的脏读窗口"来设定。
+			</p>
+
+			<h2>Key：必须带命名空间</h2>
+			<pre><code class="language-go">cache.Key("user", 42)            // "user:42"
+cache.Key("order", id, "items")  // "order:9:items"</code></pre>
+			<p>
+				缓存 key 和服务的其它 redis 数据共用一个库，而且 <code>GetOrLoad</code> 是按<b>字面 key</b>
+				合并的——两个功能都用 <code>"1"</code> 会互相串。命名空间不是风格问题，是正确性问题。
+			</p>
+
+			<h2>在服务里怎么用</h2>
+			<pre><code class="language-go">func (s *cacheService) Setup(_ context.Context, env *verticle.Env) error {
+	if err := env.DecodeService(&amp;s.cfg); err != nil {
+		return err
+	}
+	if rc, ok := env.Redis(); ok {   // 逗号-ok：没配 redis 就留 nil
+		s.redis = rc
+	}
+	s.users = newUserStore()
+	return nil
+}</code></pre>
+			<pre><code class="language-yaml"># 服务段（key = Service.Name()）
+cache:
+  ttl: 30s          # 基础存活时间
+  jitter: 5s        # 每个 key 的 TTL 再随机减掉最多 5s（防同时过期）</code></pre>
+			<p>四条约定：</p>
+			<ul>
+				<li><b>回源范围要小</b>：只包住那一次查询，别把整个 handler 塞进 <code>load</code>。</li>
+				<li><b>TTL 是业务答案</b>，不是拍脑袋的数字：它等于"这份数据可以有多旧"。</li>
+				<li><b>有写路径就要有对应的 Invalidate</b>：只写不删的缓存最终会变成 bug 来源。</li>
+				<li><b>不加本地多级缓存</b>，除非有压测数据支撑。</li>
+			</ul>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li>
+					<a href="../../examples/cache.html">examples/cache</a>：hit/miss 对比、
+					<code>/stats</code> 看回源次数、并发 miss 合并成一次回源。
+				</li>
+				<li><a href="database.html">数据库</a>：<code>load</code> 回源通常就是一次 DAO 查询。</li>
+				<li><a href="testing.html">离线测试</a>：<code>redistest.Start(t)</code> 起一个 miniredis。</li>
+				<li><a href="../reference/packages.html">包参考</a>：<code>pkg/core/cache</code> / <code>pkg/core/redis</code>。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

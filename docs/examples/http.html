@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>http 示例 — matex</title>
+		<meta name="description" content="examples/http：零 Web 框架的服务器——handler 返回 (any, error)、统一响应封套、错误映射、两个中间件槽与 HandleRaw。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/http">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>http — Web 层与路由</h1>
+			<p class="lede">
+				没有框架，只有标准库 <code>net/http</code> 加一层约定：handler 签名是
+				<code>func(ctx, *http.Request) (any, error)</code>，永远不碰 <code>ResponseWriter</code>。
+				这个示例把公开路由、受保护路由、路径参数、请求体解析、错误映射与逃生舱
+				<code>HandleRaw</code> 都放在一个 6 行左右的 <code>BuildRouter</code> 里，
+				看完你能照它搭出自己的服务骨架。
+			</p>
+
+			<h2>运行</h2>
+			<pre><code class="language-bash">go run ./examples/http        # = go run ./examples/http -conf examples/http/config.yaml</code></pre>
+			<p>
+				没有外部依赖，不需要 <code>make dev</code>。监听 <code>:8080</code>
+				（<code>config.yaml</code> 里的 <code>http.addr</code>），<code>-conf</code>
+				默认指向 <code>examples/http/config.yaml</code>。同端口还挂着一批内置端点：
+				<code>/healthz</code>、<code>/readyz</code>、<code>/metrics</code>、<code>/version</code>。
+			</p>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>路由语法</b>：<code>srv.Handle("GET", "/api/v1/echo/{name}", …)</code>，路径参数用 <code>r.PathValue("name")</code> 读。</li>
+				<li><b>返回值的固定映射</b>：<code>data, nil</code> → 200 封套；<code>nil, nil</code> → 204；<code>nil, errs.…</code> → 对应状态码；普通 error → 500。</li>
+				<li><b>两个中间件槽</b>：<code>Use</code> 在封套内部（能读 ctx、能返回 errs），<code>UseOuter</code> 在 mux 外部（能改响应头、覆盖探针路由）。</li>
+				<li><b><code>Use</code> 只护它之后注册的路由</b>：公开与受保护的边界就是书写顺序。</li>
+				<li><b>ctx 传递</b>：中间件往 ctx 里塞的值，路由 handler 里读得到。</li>
+				<li><b><code>HandleRaw</code> 逃生舱</b>：需要自定义状态码、响应头或流式输出时不走封套。</li>
+				<li><b>JSON 请求体解析</b>：<code>httpx.ReadJSON(r, &amp;req)</code>。</li>
+			</ul>
+
+			<h2>路由注册：公开在前，中间件在后</h2>
+			<p>
+				下面是 <code>examples/http/main.go</code> 的 <code>BuildRouter</code> 全文。
+				注意中间的注释分界线——<code>srv.Use(withTag, s.requireAPIKey)</code>
+				之后注册的两条路由才需要 API key，之前的三条加上 raw 路由都是公开的。
+			</p>
+			<pre><code class="language-go">func (s *httpService) BuildRouter(srv *httpx.Server) error {
+	// Outer middleware wraps the mux itself, so its header lands on every
+	// response — including HandleRaw routes and the builtin probes.
+	srv.UseOuter(serverHeader("matex/http-demo"))
+
+	// Public routes: registered before any Use, so nothing guards them.
+	srv.Handle("GET", "/api/v1/echo/{name}", s.echo)
+	srv.Handle("GET", "/api/v1/nothing", nothing)
+	srv.Handle("GET", "/api/v1/errors/{kind}", fail)
+	// Escape hatch: full control over status/headers/body.
+	srv.HandleRaw("GET /raw/plain", rawPlain)
+
+	// Everything below this line runs through both middleware, outermost
+	// first: tag the request, then demand the API key.
+	srv.Use(withTag, s.requireAPIKey)
+	srv.Handle("POST", "/api/v1/users", createUser)
+	srv.Handle("GET", "/api/v1/admin/whoami", whoami)
+	return nil
+}</code></pre>
+
+			<h2>两个中间件写着不一样的样子</h2>
+			<p>
+				同一份文件里两种中间件的对照。重点是签名与它们能拿到的东西：
+				<code>Use</code> 那侧没有 <code>ResponseWriter</code>，拒绝请求就是返回一个
+				<code>errs</code> 值；<code>UseOuter</code> 那侧是原生 <code>http.Handler</code>，
+				所以能改响应头，也因此能覆盖探针路由。
+			</p>
+			<pre><code class="language-go">// serverHeader is an outer middleware: it needs the ResponseWriter, so it
+// lives outside the mux rather than in the envelope chain.
+func serverHeader(v string) httpx.OuterMiddleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Served-By", v)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// withTag is an envelope middleware: it enriches the request context so
+// the handler can read the value. No ResponseWriter in sight.
+func withTag(next httpx.HandlerFunc) httpx.HandlerFunc {
+	return func(ctx context.Context, r *http.Request) (any, error) {
+		return next(context.WithValue(ctx, tagKey{}, r.Header.Get("X-Tag")), r)
+	}
+}</code></pre>
+			<p>
+				守卫中间件同样只有几行，它把「未配置即关闭」当作约定：
+				配置里 <code>api_key</code> 为空字符串时检查被跳过。
+			</p>
+			<pre><code class="language-go">func (s *httpService) requireAPIKey(next httpx.HandlerFunc) httpx.HandlerFunc {
+	return func(ctx context.Context, r *http.Request) (any, error) {
+		if s.cfg.APIKey != "" &amp;&amp; r.Header.Get("X-API-Key") != s.cfg.APIKey {
+			return nil, errs.Unauthorized(40101, "missing or invalid X-API-Key")
+		}
+		return next(ctx, r)
+	}
+}</code></pre>
+
+			<h2>请求在链上的位置</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    REQ([请求]) --> G["guard<br/>panic 恢复 · max_body"]
+    G --> SH["SecureHeaders<br/>默认安全响应头"]
+    SH --> OUT["UseOuter<br/>X-Served-By"]
+    OUT --> MUX{{ServeMux 路由匹配}}
+    MUX --> W["wrapper<br/>trace id · 超时 · 封套"]
+    W --> MW["Use<br/>withTag → requireAPIKey"]
+    MW --> H["handler<br/>echo / createUser / whoami"]
+    H --> RESP([封套响应])
+    MUX -.-> RAW["HandleRaw<br/>不走封套"]
+    OUT -.-> P["/healthz /readyz /metrics /version"]
+    classDef slot fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class OUT,MW slot
+				</pre>
+				<figcaption>
+					橙色是两个可插拔位置。示例用的 <code>X-Served-By</code> 挂在 <code>UseOuter</code> 上，
+					所以连 <code>/healthz</code> 和 <code>/raw/plain</code> 都带它；
+					<code>withTag</code>/<code>requireAPIKey</code> 在封套内，只管它们之后注册的业务路由。
+				</figcaption>
+			</figure>
+
+			<h2>验证</h2>
+			<p>示例仓库里给出的 curl 与预期可以一一对上：</p>
+			<pre><code class="language-bash">curl -i localhost:8080/api/v1/echo/world
+# 200 {"code":0,"msg":"ok","data":{"greeting":"Hello, world!"}}
+
+curl -i localhost:8080/api/v1/nothing
+# 204，无响应体
+
+curl -i localhost:8080/api/v1/errors/notfound
+# 404 {"code":40401,"msg":"user 42 not found","data":null}
+
+curl -i -X POST localhost:8080/api/v1/users -d '{"name":"alice"}'
+# 401 {"code":40101,"msg":"missing or invalid X-API-Key",...}
+
+curl -i -X POST localhost:8080/api/v1/users -H 'X-API-Key: demo-key' -d '{"name":"alice"}'
+# 200 {"code":0,"msg":"ok","data":{"email":"","id":1,"name":"alice"}}
+
+curl -i localhost:8080/api/v1/admin/whoami -H 'X-API-Key: demo-key' -H 'X-Tag: alice'
+# 200 data 里有 "tag":"alice" —— 中间件塞进 ctx 的值被 handler 读到了
+
+curl -i localhost:8080/raw/plain
+# 202 text/plain，"raw handler: full control over status/headers/body"</code></pre>
+			<p>
+				<code>/api/v1/errors/{kind}</code> 接受的 kind 值就是 <code>errs</code> 的那些类别：
+				<code>invalid</code>、<code>unauthorized</code>、<code>forbidden</code>、<code>notfound</code>、
+				<code>conflict</code>、<code>ratelimited</code>、<code>internal</code>、<code>unavailable</code>、
+				<code>timeout</code>；其他值返回 <code>400 {"code":40000}</code>。
+				另外请求头 <code>X-Request-ID</code> 会被透传并写回响应头，不传则自动生成。
+			</p>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> 用 <code>srv.Handler()</code> 拿到底层 <code>http.Handler</code>，
+				走完整 wrapper 但不占端口。它钉住的具体行为：
+			</p>
+			<ul>
+				<li>表驱动的 <code>TestRoutes</code> 覆盖 17 个用例，包括：echo 用路径参数得到
+					<code>"greeting":"hi world!"</code>（测试里句柄前缀是 <code>"hi "</code>）；
+					<code>/api/v1/nothing</code> 返回 204；带错 key 与不带 key 都是
+					<code>401 "code":40101</code>；坏 JSON body 是 <code>400 "code":40002</code>；
+					缺 <code>name</code> 是 <code>400 "code":40001</code>；
+					<code>notfound/conflict/unavailable/timeout</code> 分别是
+					404/409/503/504 且带各自的 code；未知 kind 是 <code>400 "code":40000</code>。</li>
+				<li>每个用例都断言 <code>X-Served-By == "matex/http-demo"</code>，
+					证明 <code>UseOuter</code> 覆盖了全部路由。</li>
+				<li>用例里有一个 <code>noTrace</code> 标记：<code>HandleRaw</code> 路由与
+					ServeMux 直接应答的未匹配路由（<code>/nope</code> 404、错误方法 405）
+					没有 <code>X-Request-ID</code>，因为它们绕过了 wrapper。</li>
+				<li><code>TestTraceIDIsEchoed</code>：请求头带 <code>X-Request-ID: trace-abc</code>，
+					响应头原样回 <code>trace-abc</code>。</li>
+				<li><code>TestBuiltinProbes</code>：<code>/healthz</code> 与 <code>/readyz</code> 都是 200。</li>
+				<li><code>TestOuterMiddlewareCoversProbes</code>：给一个裸 <code>httpx.New</code>
+					挂上 outer 中间件后，<code>/healthz</code> 也带 <code>X-Served-By</code>。</li>
+			</ul>
+			<pre><code class="language-bash">go test ./examples/http</code></pre>
+
+			<h2>相关</h2>
+			<div class="cards">
+				<a class="card" href="../guide/concepts/http.html">
+					<span class="card__title">HTTP 与路由概念页</span>
+					<span class="card__desc">封套、中间件槽、安全响应头、CORS 与内置端点的完整规则。</span>
+				</a>
+				<a class="card" href="../guide/concepts/errors.html">
+					<span class="card__title">错误模型</span>
+					<span class="card__desc">handler 返回的 errs 值如何变成状态码。</span>
+				</a>
+				<a class="card" href="index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">全部 19 个可运行示例。</span>
+				</a>
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="errors.html">examples/errors</a>：Kind 与业务 code 的取值规则。</li>
+				<li><a href="auth.html">examples/auth</a>：用 <code>Use</code> 的累积语义做分级授权。</li>
+				<li><a href="observability.html">examples/observability</a>：trace id、访问日志与指标从哪来。</li>
+				<li><a href="resilience.html">examples/resilience</a>：限流与幂等中间件挂进同一个槽。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

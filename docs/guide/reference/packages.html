@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>pkg/core 速查 — matex</title>
+		<meta name="description" content="matex pkg/core 的 25 个包：用途、是否 opt-in、关键 API 一页速查。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/reference/packages">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>pkg/core 速查</h1>
+			<p class="lede">
+				25 个包，全部有包级文档注释与直接测试。<b>opt-in</b> 指需要配置文件里存在对应段
+				（或代码里显式挂载），否则整个包是 no-op 或干脆不存在。
+			</p>
+
+			<h2>驱动与编排</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>包</th>
+							<th>用途</th>
+							<th>开关</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>verticle</code></td>
+							<td>服务抽象：<code>Service</code>（Name/Setup/BuildRouter）与 <code>Run</code> 驱动的完整生命周期</td>
+							<td>入口</td>
+						</tr>
+						<tr>
+							<td><code>app</code></td>
+							<td>生命周期容器：HTTP server、后台 Block、逆序清理栈、信号驱动优雅退出</td>
+							<td>由 verticle 使用</td>
+						</tr>
+						<tr>
+							<td><code>config</code></td>
+							<td>YAML 加载、<code>${VAR}</code> 展开、struct tag 默认值与逐字段环境覆盖</td>
+							<td>始终</td>
+						</tr>
+						<tr>
+							<td><code>errs</code></td>
+							<td>错误模型：每个错误带 Kind（→ HTTP 状态）、业务 Code、消息</td>
+							<td>始终</td>
+						</tr>
+						<tr>
+							<td><code>obs</code></td>
+							<td>可观测性：slog 结构化日志、Prometheus 指标、OpenTelemetry 链路</td>
+							<td>日志/指标始终；tracing 需 <code>trace.enabled</code></td>
+						</tr>
+						<tr>
+							<td><code>httpx</code></td>
+							<td>Web 层：无框架的 <code>net/http</code> server、封套 handler 约定、两个中间件槽、默认安全头</td>
+							<td>始终（HTTP 默认形态）</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>存储与消息</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>包</th>
+							<th>用途</th>
+							<th>开关</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>db</code></td>
+							<td>database/sql 之上的 SQL 访问：pgx / mysql / sqlite 三驱动、可移植 <code>?</code> 占位符、泛型扫描、事务、慢查询日志、错误映射</td>
+							<td><code>db:</code> 段</td>
+						</tr>
+						<tr>
+							<td><code>redis</code></td>
+							<td>go-redis 封装：初始化、JSON 助手、<code>TryLock</code> 锁、<code>Claim</code> 槽位占领、脚本</td>
+							<td><code>redis:</code> 段</td>
+						</tr>
+						<tr>
+							<td><code>memcache</code></td>
+							<td>gomemcache 封装 + JSON 助手</td>
+							<td><code>memcache:</code> 段</td>
+						</tr>
+						<tr>
+							<td><code>kafka</code></td>
+							<td>franz-go 封装：同步/异步生产者、at-least-once 消费循环、可选死信队列</td>
+							<td><code>kafka:</code> 段</td>
+						</tr>
+						<tr>
+							<td><code>cache</code></td>
+							<td>cache-aside 模式：single-flight 回源 + TTL 抖动，防击穿与防雪崩</td>
+							<td>调用处（需 redis 客户端）</td>
+						</tr>
+						<tr>
+							<td><code>grpcx</code></td>
+							<td>gRPC server（绑定监听、健康服务、reflection、优雅关停）与 fail-fast 拨号器</td>
+							<td><code>grpc:</code> 段 + 实现 <code>GRPCRegistrar</code></td>
+						</tr>
+						<tr>
+							<td><code>rpcx</code></td>
+							<td>rpcx server 与客户端助手，链路传播内置</td>
+							<td><code>rpcx:</code> 段 + 实现 <code>RPCXRegistrar</code></td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>韧性与治理</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>包</th>
+							<th>用途</th>
+							<th>开关</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>ratelimit</code></td>
+							<td>按调用方限流：本地令牌桶或 redis 固定窗口；<code>ByIP</code>/<code>ByHeader</code>/<code>ByRoute</code></td>
+							<td>代码内</td>
+						</tr>
+						<tr>
+							<td><code>idempotency</code></td>
+							<td>同一 <code>Idempotency-Key</code> 的重复请求只写一次，回放上次响应</td>
+							<td><code>Use</code> + store</td>
+						</tr>
+						<tr>
+							<td><code>breaker</code></td>
+							<td>三态熔断：连续失败计数或错误率滑动窗口，可按 errs 分类计失败</td>
+							<td>代码内</td>
+						</tr>
+						<tr>
+							<td><code>retry</code></td>
+							<td>瞬时失败的指数退避重试，带全抖动</td>
+							<td>代码内</td>
+						</tr>
+						<tr>
+							<td><code>cron</code></td>
+							<td>多副本下不重复执行的定时任务（redis 选主）</td>
+							<td>代码内（选主需 redis）</td>
+						</tr>
+						<tr>
+							<td><code>auth</code></td>
+							<td>Bearer token 验签（HMAC 密钥或 JWKS/OIDC），把调用方作为 <code>Principal</code> 放进 ctx</td>
+							<td><code>auth:</code> 段 + 挂 middleware</td>
+						</tr>
+						<tr>
+							<td><code>feature</code></td>
+							<td>进程内功能开关：运行时 &gt; 环境变量 &gt; 配置 &gt; 注册默认</td>
+							<td><code>feature:</code> 段</td>
+						</tr>
+						<tr>
+							<td><code>audit</code></td>
+							<td>审计事件：谁对什么做了什么、结果如何，sink 可插拔</td>
+							<td>代码内（可选 <code>SetSink</code>）</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>AI 与测试基座</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>包</th>
+							<th>用途</th>
+							<th>开关</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>llm</code></td>
+							<td>统一 LLM 客户端：四种线协议 + 规范请求/响应；另有 System One（Jev）决策问答</td>
+							<td>代码内</td>
+						</tr>
+						<tr>
+							<td><code>dbtest</code></td>
+							<td>测试用已迁移数据库：默认每测试一个 SQLite 文件，自动执行仓库迁移</td>
+							<td>仅测试（<code>DB_TEST_DRIVER</code>/<code>DSN</code> 可切真库）</td>
+						</tr>
+						<tr>
+							<td><code>redistest</code></td>
+							<td>测试用 Redis：默认进程内 miniredis，<code>REDIS_TEST_ADDR</code> 可切真实例</td>
+							<td>仅测试</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>为什么要一页列完</h2>
+			<p>
+				这份表本身就是一条约束：<b>基础设施的入口数量是有限的、可枚举的</b>。
+				当你想加一个"顺手 import 一下"的驱动时，问题不是"能不能"，而是"它该属于这里哪一行"。
+				如果没有合适的一行，说明它应该待在业务包里，或者根本不该进来。
+			</p>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    BIZ["internal/ 业务代码"] --> V["verticle · app"]
+    BIZ --> HX["httpx · errs · obs · config"]
+    BIZ --> ST["db · redis · memcache · kafka"]
+    BIZ --> GO["auth · ratelimit · breaker · retry<br/>idempotency · cache · cron · feature · audit"]
+    BIZ --> AI["llm"]
+    ST --> DRV["第三方驱动"]
+    HX --> DRV2["prometheus · otel · slog"]
+    classDef core fill:#fdf6f0,stroke:#c8641f,color:#2b2722
+    class V,HX,ST,GO,AI core
+				</pre>
+				<figcaption>
+					业务代码只认这五组入口。驱动与观测库被关在 <code>pkg/core</code> 内部，
+					由 depguard 保证不泄漏到业务侧。
+				</figcaption>
+			</figure>
+
+			<h2>下一步</h2>
+			<ul>
+				<li><a href="layout.html">目录与约定</a>：每个目录该放什么。</li>
+				<li><a href="../index.html">文档总览</a>：按能力读的入口。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

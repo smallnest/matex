@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>errors 示例 — matex</title>
+		<meta name="description" content="examples/errors：Kind → HTTP 状态、业务 code 约定、Wrap 把 cause 留在日志里、非 matex 错误一律 500。" />
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/errors">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>errors — 错误模型</h1>
+			<p class="lede">
+				一个错误由三部分组成：<b>Kind</b>（映射成 HTTP 状态）、<b>业务 code</b>（客户端用来分支的常量）、
+				<b>消息</b>（给人的话）。这个示例把三者的每一种组合都跑一遍，你会看到错误在穿越
+				<code>fmt.Errorf</code> 包装后仍然能被识别，而数据库的原始报错永远进不了响应体。
+			</p>
+
+			<h2>运行</h2>
+			<pre><code class="language-bash">go run ./examples/errors</code></pre>
+			<p>纯库演示：没有外部依赖，不监听端口，也不需要 <code>make dev</code>。</p>
+
+			<h2>它演示了什么</h2>
+			<ul>
+				<li><b>九个 Kind 各映射一个状态码</b>：从 <code>invalid_argument → 400</code> 到 <code>timeout → 504</code>。</li>
+				<li><b>快捷构造</b>：<code>errs.NotFound(40401, "user %d not found", 42)</code> 这类函数是写 handler 时的默认选择。</li>
+				<li><b><code>errs.Status(err)</code> 返回三个值</b>：<code>(status, code, msg)</code>，就是 HTTP 层渲染响应所需的全部。</li>
+				<li><b>包装可穿透</b>：<code>errs.Wrap</code> 或普通 <code>fmt.Errorf("…: %w", err)</code> 包过之后，<code>errs.Status</code> 仍取得到 Kind/code。</li>
+				<li><b>cause 只进日志</b>：<code>Wrap</code> 的 <code>Error()</code> 含 cause，但响应只回 <code>msg</code>。</li>
+				<li><b>兜底</b>：非 matex 错误统一 <code>500 / 50000 / "internal error"</code>，内部细节不外泄。</li>
+			</ul>
+
+			<h2>Kind 到状态码</h2>
+			<p>
+				下面这段来自 <code>examples/errors/main.go</code>，它构造了全部九个 Kind 并逐个打印
+				<code>HTTPStatus()</code>。这张表就是 HTTP 层的映射依据。
+			</p>
+			<pre><code class="language-go">fmt.Println("Kind                → HTTP")
+for _, c := range kinds() {
+	fmt.Printf("  %-18s → %d\n", c.name, c.kind.HTTPStatus())
+}
+
+// ── 2. 快捷构造 + Status 提取 ─────────────────────────────────────
+fmt.Println("\nerrs.Status(err) → (status, code, msg)")
+for _, err := range constructors() {
+	status, code, msg := errs.Status(err)
+	fmt.Printf("  %-3d %-6d %s\n", status, code, msg)
+}</code></pre>
+			<p>
+				它打印出的九行对应关系是：<code>400 / 401 / 403 / 404 / 409 / 429 / 500 / 503 / 504</code>。
+			</p>
+
+			<h2>包装后取出的仍然是同一件事</h2>
+			<p>
+				这段同样来自 <code>examples/errors/main.go</code>。要点有两个：普通的
+				<code>fmt.Errorf("handler: %w", base)</code> 也能被穿透；
+				而 <code>*errs.Error</code> 上的 <code>Cause</code> 字段是留给日志的，
+				不出现在客户端拿到的 <code>msg</code> 里。
+			</p>
+			<pre><code class="language-go">base := errs.Wrap(errs.KindNotFound, 40401, errors.New("sql: no rows in result set"), "user 42 not found")
+wrapped := fmt.Errorf("handler: %w", base) // 普通 %w 包装也能被穿透
+status, code, msg := errs.Status(wrapped)
+fmt.Printf("  穿透 fmt.Errorf: status=%d code=%d msg=%q\n", status, code, msg)
+if e, ok := errors.AsType[*errs.Error](wrapped); ok {
+	fmt.Printf("  取出 *errs.Error: Kind=%d Cause=%v（只进日志）\n", e.Kind, e.Cause)
+}
+
+dbErr := errs.Wrap(errs.KindConflict, 40901,
+	errors.New(`pq: duplicate key value violates unique constraint "users_name_key"`), "创建用户失败")
+status, code, msg = errs.Status(dbErr)
+fmt.Printf("  Wrap(cause)    : Error()=%q\n", dbErr.Error())</code></pre>
+
+			<h2>验证</h2>
+			<p>示例不提供 HTTP 接口，看标准输出即可。形状如下（取自 <code>main.go</code> 的打印格式）：</p>
+			<pre><code class="language-text">Kind                → HTTP
+  invalid_argument   → 400
+  unauthorized       → 401
+  forbidden          → 403
+  not_found          → 404
+  conflict           → 409
+  rate_limited       → 429
+  internal           → 500
+  unavailable        → 503
+  timeout            → 504
+
+errs.Status(err) → (status, code, msg)
+  400 40001  name is required
+  401 40101  token expired
+  ...
+
+包装（errs.Wrap / fmt.Errorf %w）:
+  穿透 fmt.Errorf: status=404 code=40401 msg="user 42 not found"
+  取出 *errs.Error: Kind=4 Cause=sql: no rows in result set（只进日志）
+  Wrap(cause)    : Error()="创建用户失败: pq: duplicate key value violates unique constraint \"users_name_key\""
+                   对客户端只回: status=409 code=40901 msg="创建用户失败"
+
+code=0 时回退为 状态码*100:
+  KindConflict, code=0 → code=40900 msg="已存在"
+
+非 matex 错误:
+  status=500 code=50000 msg="internal error"</code></pre>
+			<p>
+				这里最值得记住的是最后两行：<code>code</code> 传 0 时回退为
+				<code>状态码 × 100</code>（409 → 40900），而普通错误被兜成
+				<code>500 / 50000 / "internal error"</code>——<code>"internal detail nobody should see"</code>
+				这句话没有出现在响应里。
+			</p>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    E["任意 error"] --> Q{"是 *errs.Error 吗？<br/>(穿透 %w 链)"}
+    Q -- 是 --> K["取 Kind<br/>→ HTTP 状态"]
+    K --> C{"code 为 0？"}
+    C -- 是 --> F["code = 状态码 × 100"]
+    C -- 否 --> U["用业务 code"]
+    Q -- 否 --> D["500 / 50000<br/>internal error"]
+    F --> R["响应<br/>{code, msg, data:null}"]
+    U --> R
+    D --> R
+    X["cause（SQL、内部细节）"] -.->|只进日志| L["日志"]
+    classDef bad fill:#fdf0f0,stroke:#a33,color:#2b2722
+    class X,L bad
+				</pre>
+				<figcaption>
+					<code>errs.Status</code> 的全部决策。cause 有一条独立的出口通向上游日志，
+					从不进入响应体。
+				</figcaption>
+			</figure>
+
+			<h2>测试</h2>
+			<p><code>main_test.go</code> 断言的是这些具体事实：</p>
+			<ul>
+				<li><code>TestKindStatusMapping</code>：九个 Kind 各自映射到 400/401/403/404/409/429/500/503/504，一个都不能偏。</li>
+				<li><code>TestStatusThroughWrapping</code>：被 <code>%w</code> 包过之后，
+					<code>errs.Status</code> 仍返回 <code>(404, 40401, "user 42 not found")</code>。</li>
+				<li><code>TestCodeFallback</code>：<code>KindConflict</code> 配 <code>code=0</code> → <code>40900</code>。</li>
+				<li><code>TestWrapKeepsCauseOutOfResponse</code>：<code>Error()</code> 恰好是
+					<code>"创建用户失败: pq: duplicate key"</code>，而 <code>Status</code> 给出的是
+					<code>(409, 40901, "创建用户失败")</code>——cause 没漏进去；
+					同时 <code>errors.Is(err, cause)</code> 为真。</li>
+				<li><code>TestPlainErrorIsInternal</code>：普通错误 → <code>(500, 50000, "internal error")</code>。</li>
+			</ul>
+			<pre><code class="language-bash">go test ./examples/errors</code></pre>
+
+			<h2>相关</h2>
+			<div class="cards">
+				<a class="card" href="../guide/concepts/errors.html">
+					<span class="card__title">错误模型概念页</span>
+					<span class="card__desc">Error 的结构、构造方式与在 handler 里的用法。</span>
+				</a>
+				<a class="card" href="index.html">
+					<span class="card__title">示例索引</span>
+					<span class="card__desc">全部 19 个可运行示例。</span>
+				</a>
+			</div>
+
+			<h2>相关示例</h2>
+			<ul>
+				<li><a href="http.html">examples/http</a>：errs 值怎么被渲染成 <code>{code,msg,data}</code> 封套。</li>
+				<li><a href="resilience.html">examples/resilience</a>：幂等中间件按 4xx/5xx 分流，靠的正是 Kind。</li>
+				<li><a href="observability.html">examples/observability</a>：cause 最终去哪了——结构化日志。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

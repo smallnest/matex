@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>命令与部署 — matex</title>
+		<meta name="description" content="Makefile 全部目标、GitHub Actions 的两个 job、distroless 多阶段 Dockerfile 与 docker-compose 本地依赖。" />
+		<link rel="stylesheet" href="../../assets/site.css" />
+	</head>
+	<body data-page="guide/reference/commands">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>命令与部署</h1>
+			<p class="lede">
+				日常只有六条命令：<code>make run-min</code> 起服务、<code>make test-short</code> 跑测试、
+				<code>make ci</code> 交付前自检。其余目标与部署形态在这页列全。
+			</p>
+
+			<h2>Makefile 目标</h2>
+			<p>
+				<code>make</code> 不带参数（默认目标 <code>help</code>）会从 Makefile 里抽出所有
+				带 <code>##</code> 注释的目标打印出来——下面这张表与它同源。
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>目标</th>
+							<th>做什么</th>
+							<th>什么时候用</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>make help</code></td><td>列出全部目标（默认目标）</td><td>忘了目标名时</td></tr>
+						<tr><td><code>make build</code></td><td><code>go build ./...</code>，编译全部包但不产出文件</td><td>确认改动能编译</td></tr>
+						<tr><td><code>make bins</code></td><td>编译 <code>bin/&lt;SERVICE&gt;</code>（默认 <code>demo</code>）与 <code>bin/migrate</code></td><td>要拿到可执行文件时</td></tr>
+						<tr><td><code>make run</code></td><td><code>go run ./cmd/$(SERVICE) -conf configs/config.yaml</code></td><td>用完整配置跑（需要 db/redis 等已就绪）</td></tr>
+						<tr><td><code>make run-min</code></td><td>用 <code>configs/config.min.yaml</code> 跑，零依赖</td><td>只想看服务能不能起</td></tr>
+						<tr><td><code>make run-sqlite</code></td><td>用 <code>configs/config.sqlite.yaml</code> 跑（纯 Go SQLite）</td><td>要数据库但不想起 Docker，需先 <code>make migrate DRIVER=sqlite DSN=file:matex.db</code></td></tr>
+						<tr><td><code>make example NAME=http</code></td><td><code>go run ./examples/$(NAME)</code></td><td>跑某个能力示例，<code>NAME</code> 取 <code>examples/</code> 下的目录名</td></tr>
+						<tr><td><code>make migrate</code></td><td><code>go run ./cmd/migrate -driver $(DRIVER) -dsn "$(DSN)"</code>，默认 <code>DRIVER=postgres</code></td><td>建表/改表；<code>-driver</code> 可切 <code>mysql</code> / <code>sqlite</code></td></tr>
+						<tr><td><code>make dev</code></td><td><code>docker compose -f docker-compose.dev.yml up -d</code></td><td>本地起 postgres/mysql/redis/memcache/kafka</td></tr>
+						<tr><td><code>make dev-down</code></td><td>停掉上面的 compose 栈</td><td>收工</td></tr>
+						<tr><td><code>make fmt</code></td><td><code>gofmt -w</code> 全部 <code>*.go</code>（排除 <code>gen/</code>）</td><td>提交前</td></tr>
+						<tr><td><code>make vet</code></td><td><code>go vet ./...</code></td><td>静态检查，比 lint 快</td></tr>
+						<tr><td><code>make lint</code></td><td><code>golangci-lint run</code>（含 depguard 一致性守卫）</td><td>本地跑与 CI 相同的 lint；未安装先 <code>make tools</code></td></tr>
+						<tr><td><code>make test</code></td><td><code>go test -race -count=1 ./...</code>，全量测试</td><td>交付前完整验证</td></tr>
+						<tr><td><code>make test-short</code></td><td><code>go test -short -race -count=1 ./...</code>，含 sqlite / miniredis / kfake / 进程内 RPC 用例</td><td>日常改动的首选；仍带竞态检测</td></tr>
+						<tr><td><code>make cover</code></td><td>生成 <code>coverage.out</code> 并打开 HTML 覆盖率报告</td><td>看覆盖缺口</td></tr>
+						<tr><td><code>make ci</code></td><td><code>vet</code> + <code>test-short -race</code> + <code>build</code>，与 CI 一致的校验</td><td><b>交付前必跑</b></td></tr>
+						<tr><td><code>make tools</code></td><td><code>go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0</code></td><td>装 lint，版本与 CI 对齐</td></tr>
+						<tr><td><code>make tidy</code></td><td><code>go mod tidy</code></td><td>增删依赖后</td></tr>
+						<tr><td><code>make docker TAG=v1</code></td><td><code>docker build -t $(SERVICE):latest .</code></td><td>打镜像</td></tr>
+						<tr><td><code>make clean</code></td><td>删除 <code>bin/</code> 与 <code>coverage.out</code></td><td>清理产物</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout callout--note">
+				<span class="callout__label">三个变量</span>
+				<code>SERVICE</code>（默认 <code>demo</code>）决定 <code>run</code> / <code>bins</code> /
+				<code>docker</code> 操作哪个二进制；<code>DRIVER</code>（默认 <code>postgres</code>）
+				与 <code>DSN</code> 供 <code>migrate</code> 使用；<code>TAG</code> 供
+				<code>docker</code> 使用。用法如 <code>make migrate DRIVER=sqlite DSN=file:matex.db</code>。
+			</div>
+
+			<h2>make ci：交付前的自检</h2>
+			<pre><code class="language-bash">ci: ## 与 CI 一致的校验
+	go vet ./...
+	go test -short -race -count=1 ./...
+	go build ./...</code></pre>
+			<p>
+				三步的顺序与 CI 的 <code>test</code> job 完全一致（CI 的那份见下）。<code>-short</code>
+				并没有把数据库用例跳掉——matex 的测试基座默认用纯 Go SQLite 与 miniredis，
+				所以 <code>test-short</code> 在无 Docker、无网络的环境里仍覆盖 DB 路径。
+				只有需要真实中间件的用例（<code>DB_TEST_DRIVER</code> / <code>DB_TEST_DSN</code>
+				指向真库的）才留在 <code>make test</code> 里。
+			</p>
+
+			<h2>GitHub Actions</h2>
+			<p>工作流 <code>.github/workflows/ci.yml</code>，触发条件是所有 push 与 pull_request，两个 job：</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>Job</th>
+							<th>步骤</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><code>lint</code></td>
+							<td>
+								<code>actions/checkout@v4</code> →
+								<code>actions/setup-go@v5</code>（<code>go-version-file: go.mod</code>，开缓存）→
+								<code>go mod download</code> →
+								<code>golangci/golangci-lint-action@v9</code>，<code>version: v2.14.0</code>
+							</td>
+						</tr>
+						<tr>
+							<td><code>test</code></td>
+							<td>
+								同前两步 → <code>go vet ./...</code> →
+								<code>go test -short -race -count=1 ./...</code> →
+								<code>go build ./...</code>
+							</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<p>
+				lint 与 test 并行跑，两者都在 <code>ubuntu-latest</code> 上，都不需要 service
+				container——这是"离线可跑"的直接收益：CI 里没有 postgres、没有 redis，
+				测试照样跑完。<code>make tools</code> 装的 golangci-lint 版本（v2.14.0）与 CI 一致，
+				避免本地过、CI 不过这类假故障。
+			</p>
+
+			<h2>Docker 镜像</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart LR
+    subgraph build["构建阶段 golang:1.27.1-trixie"]
+        COPY1["COPY go.mod go.sum<br/>然后 go mod download"]
+        COPY2["COPY . ."]
+        BUILD["CGO_ENABLED=0<br/>go build -ldflags 压缩符号<br/>-o /out/demo ./cmd/demo"]
+        COPY1 --> COPY2 --> BUILD
+    end
+    subgraph run["运行阶段 distroless/static-debian12:nonroot"]
+        BIN["/demo（静态二进制）"]
+        CFG["/configs/config.yaml<br/>来自 configs/config.min.yaml"]
+        EXP["EXPOSE 8080<br/>ENTRYPOINT /demo -conf /configs/config.yaml"]
+        BIN --> EXP
+        CFG --> EXP
+    end
+    BUILD -->|"COPY --from=build"| BIN
+                </pre>
+				<figcaption>
+					多阶段：构建镜像里带完整 Go 工具链，运行镜像只留一个静态二进制加一份最小配置。
+					<code>CGO_ENABLED=0</code> 是这个组合成立的前提——纯 Go 构建产出的静态二进制
+					才能跑在 distroless 的 static 镜像上，且 <code>modernc.org/sqlite</code> 不需要 cgo。
+				</figcaption>
+			</figure>
+			<p>关键几行：</p>
+			<pre><code class="language-bash">FROM golang:1.27.1-trixie AS build
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/demo ./cmd/demo
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/demo /demo
+COPY configs/config.min.yaml /configs/config.yaml
+EXPOSE 8080
+ENTRYPOINT ["/demo", "-conf", "/configs/config.yaml"]</code></pre>
+			<ul>
+				<li>
+					<b><code>:nonroot</code></b>：以非 root 用户运行，无 shell、无包管理器，
+					镜像里没有可被利用的额外工具。
+				</li>
+				<li>
+					<b><code>-ldflags="-s -w"</code></b>：去掉符号表与调试信息，缩小体积。
+				</li>
+				<li>
+					<b>配置进镜像</b>：<code>configs/config.min.yaml</code> 被复制成
+					<code>/configs/config.yaml</code>，所以镜像开箱即起（只监听 8080，不连任何外部服务）。
+				</li>
+			</ul>
+			<div class="callout callout--warn">
+				<span class="callout__label">镜像默认是最小配置</span>
+				镜像是"配了才建"的：只有配置里出现 <code>db:</code> / <code>redis:</code> /
+				<code>memcache:</code> / <code>kafka:</code> 段，对应基础设施才会被初始化。
+				因此<b>光给环境变量不会打开 db/redis</b>——必须让
+				<code>/configs/config.yaml</code> 里存在那些段。接真实依赖时挂一份完整配置覆盖它：
+				<pre><code class="language-bash">docker run -p 8080:8080 \
+  -v "$PWD/configs/config.yaml:/configs/config.yaml:ro" \
+  matex:latest</code></pre>
+				镜像里的配置用 <code>${DB_DSN:…}</code> 这类占位符，所以仍可由环境变量提供 DSN 等值；
+				但段的<b>存在与否</b>只能由配置文件决定。
+			</div>
+
+			<h2>本地依赖：docker-compose.dev.yml</h2>
+			<p><code>make dev</code> 起这一栈，<code>make dev-down</code> 停掉：</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>服务</th>
+							<th>镜像</th>
+							<th>端口</th>
+							<th>凭据 / 说明</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>postgres</code></td><td><code>postgres:16</code></td><td>5432</td><td>user/password/db 都是 <code>matex</code>；数据卷 <code>pgdata</code></td></tr>
+						<tr><td><code>mysql</code></td><td><code>mysql:8.0</code></td><td>3306</td><td>root 密码 <code>matex</code>，库与用户 <code>matex</code>；DSN 记得带 <code>parseTime=true</code>，数据卷 <code>mysqldata</code></td></tr>
+						<tr><td><code>redis</code></td><td><code>redis:7</code></td><td>6379</td><td>无密码</td></tr>
+						<tr><td><code>memcached</code></td><td><code>memcached:1.6</code></td><td>11211</td><td>—</td></tr>
+						<tr><td><code>kafka</code></td><td><code>bitnami/kafka:3.7</code></td><td>9092</td><td>KRaft 单节点（无 Zookeeper）；advertised listener 是 <code>localhost:9092</code></td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>起完依赖之后的典型顺序：</p>
+			<pre><code class="language-bash">make dev                     # 起 postgres/mysql/redis/memcache/kafka
+make migrate DSN=postgres://matex:matex@localhost:5432/matex?sslmode=disable
+make run                     # 用 configs/config.yaml 起服务</code></pre>
+			<p>
+				想拉远端镜像时 <code>make dev</code> 需要网络；但跑测试与跑示例不需要它——
+				那是 matex 刻意保留的性质。
+			</p>
+
+			<h2>下一步</h2>
+			<ul>
+				<li><a href="layout.html">目录与约定</a>：代码该放哪、四条强制约定是什么。</li>
+				<li><a href="../concepts/testing.html">离线测试</a>：<code>dbtest</code> / <code>redistest</code> 的用法与真库切换。</li>
+				<li><a href="../../examples/lifecycle.html">examples/lifecycle</a>：优雅退出与就绪门，部署时的探针语义。</li>
+			</ul>
+		</main>
+		<script src="../../assets/mermaid.min.js" defer></script>
+		<script src="../../assets/search-index.js" defer></script>
+		<script src="../../assets/site.js" defer></script>
+	</body>
+</html>

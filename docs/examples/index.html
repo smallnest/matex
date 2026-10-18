@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>示例 — matex</title>
+		<meta
+			name="description"
+			content="matex 的 19 个可运行示例：每个能力一个目录，全部离线可跑并带测试。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/index">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>示例</h1>
+			<p class="lede">
+				<code>pkg/core/*</code> 的每项能力配一个<b>可运行</b>示例。除需要真实中间件的几个
+				（<code>make dev</code> 起）外，全部离线可跑：不需要 Docker、不需要网络。
+				每个示例都有测试，所以 <code>make ci</code> 会一并验证它们。
+			</p>
+
+			<div class="callout callout--note">
+				<span class="callout__label">统一跑法</span>
+				<code>make example NAME=http</code> 等价于 <code>go run ./examples/http</code>。
+				用 HTTP 形态的示例各自带一份 <code>config.yaml</code>，<code>-conf</code> 默认指向它。
+			</div>
+
+			<h2>开始与基础</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>示例</th>
+							<th>能力</th>
+							<th>外部依赖</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><a href="config.html">config</a></td>
+							<td>配置加载：tag（<code>default</code>/<code>env</code>/<code>optional</code>）、<code>${VAR}</code> 展开、环境覆盖</td>
+							<td>无</td>
+						</tr>
+						<tr>
+							<td><a href="errors.html">errors</a></td>
+							<td>错误模型：Kind → 状态码、业务 code、Wrap 不泄露细节</td>
+							<td>无</td>
+						</tr>
+						<tr>
+							<td><a href="http.html">http</a></td>
+							<td>路由、handler 约定、响应封套、错误映射、中间件槽、<code>HandleRaw</code></td>
+							<td>无</td>
+						</tr>
+						<tr>
+							<td><a href="lifecycle.html">lifecycle</a></td>
+							<td><code>Block</code>、<code>Closer</code>、配置热更、就绪门、优雅退出</td>
+							<td>无</td>
+						</tr>
+						<tr>
+							<td><a href="observability.html">observability</a></td>
+							<td>结构化日志、相关 id、Prometheus 指标、OpenTelemetry 链路</td>
+							<td>无</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>数据与集成</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>示例</th>
+							<th>能力</th>
+							<th>外部依赖</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><a href="database.html">database</a></td>
+							<td>三驱动、<code>?</code> 占位符、泛型扫描、<code>WithTx</code>、<code>Querier</code>（DAO 进出事务）</td>
+							<td>默认纯 Go SQLite</td>
+						</tr>
+						<tr>
+							<td><a href="cache.html">cache</a></td>
+							<td>cache-aside、并发 miss 合并（防击穿）、TTL 抖动（防雪崩）、写后失效</td>
+							<td>Redis</td>
+						</tr>
+						<tr>
+							<td><a href="redis.html">redis</a></td>
+							<td>JSON 缓存读写、<code>TryLock</code> 分布式锁</td>
+							<td>Redis</td>
+						</tr>
+						<tr>
+							<td><a href="memcache.html">memcache</a></td>
+							<td>JSON 缓存、TTL、<code>Touch</code></td>
+							<td>Memcached（测试用进程内假服务）</td>
+						</tr>
+						<tr>
+							<td><a href="kafka.html">kafka</a></td>
+							<td>同步/异步生产者、消费者循环、死信队列</td>
+							<td>Kafka</td>
+						</tr>
+						<tr>
+							<td><a href="grpc.html">grpc</a></td>
+							<td>服务注册、客户端拨号、内置健康服务与 reflection 开关</td>
+							<td>无</td>
+						</tr>
+						<tr>
+							<td><a href="rpcx.html">rpcx</a></td>
+							<td>无 IDL 的服务注册与客户端调用</td>
+							<td>无</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>生产治理</h2>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>示例</th>
+							<th>能力</th>
+							<th>外部依赖</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><a href="resilience.html">resilience</a></td>
+							<td>限流、幂等、熔断（连续失败或错误率滑窗）、退避重试</td>
+							<td>无</td>
+						</tr>
+						<tr>
+							<td><a href="auth.html">auth</a></td>
+							<td>Bearer 验签（HMAC/JWKS）、分级授权、<code>Principal</code> 进 ctx</td>
+							<td>无</td>
+						</tr>
+						<tr>
+							<td><a href="cron.html">cron</a></td>
+							<td>固定周期 / cron 表达式 / 一次性任务，多副本选主每槽只跑一次</td>
+							<td>无（选主需 Redis）</td>
+						</tr>
+						<tr>
+							<td><a href="feature.html">feature</a></td>
+							<td>功能开关：配置 / 环境变量 / 运行时 <code>Set</code> 三层覆盖</td>
+							<td>无</td>
+						</tr>
+						<tr>
+							<td><a href="audit.html">audit</a></td>
+							<td>审计日志：谁对什么做了什么、结果如何，sink 可插拔</td>
+							<td>无</td>
+						</tr>
+						<tr>
+							<td><a href="llm.html">llm</a></td>
+							<td>四协议互转、流式/非流式、可选重试、Jev 决策问答</td>
+							<td>无（httptest 假上游）</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>端口占用</h2>
+			<p>
+				多数示例默认监听 <code>:8080</code>，所以一次只跑一个；其余用独立端口避免冲突：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>端口</th>
+							<th>示例</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr><td><code>:8080</code></td><td>http · observability · lifecycle · redis · memcache · kafka · grpc · rpcx</td></tr>
+						<tr><td><code>:8081</code></td><td>auth</td></tr>
+						<tr><td><code>:8082</code></td><td>resilience</td></tr>
+						<tr><td><code>:8083</code></td><td>cache</td></tr>
+						<tr><td><code>:8084</code></td><td>cron</td></tr>
+						<tr><td><code>:8085</code></td><td>feature</td></tr>
+						<tr><td><code>:8086</code></td><td>audit</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2>离线验证</h2>
+			<pre><code class="language-bash">go test ./examples/...     # 全部离线：SQLite / miniredis / kfake / 进程内 gRPC·rpcx</code></pre>
+			<div class="callout callout--tip">
+				<span class="callout__label">示例和业务代码同一套规矩</span>
+				示例同样<b>只经 <code>pkg/core/*</code> 访问基础设施，不直接 import 驱动库</b>，
+				由 depguard 的 <code>examples-no-drivers</code> 强制。唯一的豁免是 kafka 测试用的
+				kfake——它是测试替身，不是驱动。
+			</div>
+
+			<h2>示例之外</h2>
+			<ul>
+				<li><a href="../guide/quickstart.html">快速开始</a>：把服务跑起来，再看示例。</li>
+				<li><a href="../guide/reference/skills.html">AI Skills</a>：让 AI 按规范把能力接进你的项目。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>
