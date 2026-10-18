@@ -15,7 +15,12 @@ matex 的 gRPC 由 verticle 统一管理生命周期：配置 `grpc:` 段即创�
 grpc:
   addr: ":9090"        # gRPC 监听地址；留空/删除即禁用 server
   dial_timeout: 3s     # client 拨号超时
+  health: true         # 标准 grpc.health.v1 健康服务（默认开）
+  reflection: false    # grpcurl/grpcui 免 proto；等于公开服务面，默认关
 ```
+
+`health`/`reflection` 由 grpcx 注册，业务**不要**再自己 `healthpb.RegisterHealthServer`
+或 `reflection.Register`（重复注册会 panic）。
 
 ### 2. 定义 proto 并生成
 
@@ -53,7 +58,8 @@ func (s *DemoService) Setup(ctx context.Context, env *verticle.Env) error {
 
 - gRPC server 与 HTTP server 是**同一个进程的两个 listener**，由 verticle 一起启动、一起优雅退出（GracefulStop，超时强停）。
 - 服务内通信默认**明文**（insecure，集群内网）。要 TLS 时给 `env.GRPCClient` 传 `grpc.WithTransportCredentials(...)`。
-- `RegisterGRPC` 只在 `grpc.addr` 非空时被调用；未实现该接口则打 warning。
+- `RegisterGRPC` 只在 `grpc.addr` 非空时被调用；未实现该接口则打 warning，**且不监听端口**（避免空端口被探活误判为健康）。
+- 健康状态：监听后报 `SERVING`，关停时先转 `NOT_SERVING` 再排空。K8s 可用 `grpc_health_probe` 或原生 gRPC 探针。
 - client 连接在 `Setup` 里初始化（fail-fast：`grpc.dial_timeout` 内连不上就启动失败）。
 - **链路追踪自动生效**：unary 与 stream 都内置 `traceparent` 传播，业务代码零改动；要加自己的 unary 拦截器请用 `grpc.ChainUnaryInterceptor` 组合，避免替换掉内置的追踪拦截器。
 
@@ -62,5 +68,5 @@ func (s *DemoService) Setup(ctx context.Context, env *verticle.Env) error {
 ```sh
 make run-min                                  # 无 grpc 段，纯 HTTP
 make run                                      # 配置了 grpc 段，同时起 8080 + 9090
-grpcurl -plaintext localhost:9090 list        # reflection 已注册可列出服务
+grpcurl -plaintext localhost:9090 list        # 示例配置打开了 reflection
 ```

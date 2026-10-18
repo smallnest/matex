@@ -1,13 +1,15 @@
 // Command grpc demonstrates pkg/core/grpcx:
 //
 //   - a gRPC server created by verticle.Run from the `grpc:` section
-//   - service registration through the GRPCRegistrar hook
+//   - the standard health service and reflection, registered by grpcx itself
+//     (config `health` / `reflection`) — no RegisterGRPC needed here
+//   - service registration through the GRPCRegistrar hook (shown below)
 //   - a fail-fast client dialed in Setup via env.GRPCClient (closed
 //     automatically on shutdown)
 //
-// The service registered here is the standard gRPC health service, so the
-// example needs no .proto/protoc. In a real project you register generated
-// code instead:
+// Because grpcx provides the health service, the example needs no
+// .proto/protoc. In a real project you register generated code instead,
+// by implementing RegisterGRPC:
 //
 //	func (s *Service) RegisterGRPC(g *grpc.Server) {
 //		pb.RegisterGreeterServer(g, s)   // 生成的代码
@@ -17,6 +19,7 @@
 //
 //	go run ./examples/grpc                       # http :8080 + grpc :9090
 //	grpcurl -plaintext localhost:9090 grpc.health.v1.Health/Check
+//	grpcurl -plaintext localhost:9090 list       # reflection is on in config.yaml
 //
 // To exercise the client path, start a second instance (or any peer that
 // serves grpc.health.v1) and set that instance's `grpcdemo.target` to the
@@ -32,10 +35,7 @@ import (
 	"net/http"
 	"os"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/reflection"
 
 	"github.com/smallnest/matex/pkg/core/errs"
 	"github.com/smallnest/matex/pkg/core/httpx"
@@ -50,7 +50,6 @@ type grpcConfig struct {
 
 type grpcService struct {
 	cfg    grpcConfig
-	health *health.Server
 	client healthpb.HealthClient
 }
 
@@ -60,9 +59,6 @@ func (s *grpcService) Setup(ctx context.Context, env *verticle.Env) error {
 	if err := env.DecodeService(&s.cfg); err != nil {
 		return err
 	}
-
-	s.health = health.NewServer()
-	s.health.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 
 	// A peer client. Dialing here is deliberate: an unreachable
 	// dependency should fail the startup, not the first request.
@@ -75,14 +71,6 @@ func (s *grpcService) Setup(ctx context.Context, env *verticle.Env) error {
 		obs.Info(ctx, "grpc client ready", "target", s.cfg.Target)
 	}
 	return nil
-}
-
-// RegisterGRPC is called by verticle.Run before serving, and only when the
-// `grpc:` section is configured. Register every generated service here.
-func (s *grpcService) RegisterGRPC(g *grpc.Server) {
-	healthpb.RegisterHealthServer(g, s.health)
-	// Server reflection: grpcurl/grpcui work without the .proto files.
-	reflection.Register(g)
 }
 
 func (s *grpcService) BuildRouter(srv *httpx.Server) error {

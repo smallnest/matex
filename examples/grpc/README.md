@@ -21,14 +21,30 @@ go test ./examples/grpc        # 进程内起 server + dial，离线可跑
 // 1) 实现 verticle.GRPCRegistrar：注册生成的 service
 func (s *Service) RegisterGRPC(g *grpc.Server) {
     pb.RegisterGreeterServer(g, s)
-    reflection.Register(g)        // 可选：让 grpcurl 免 proto
+    // 健康服务与 reflection 不用自己注册：grpcx 按配置提供（见下）
 }
 
 // 2) 实现 grpc 方法（生成代码的接口）
 func (s *Service) Say(ctx context.Context, req *pb.SayRequest) (*pb.SayReply, error) { … }
 ```
 
-`grpc:` 段配了地址才会创建 server；没配就不起 gRPC，HTTP 照常工作。
+`grpc:` 段配了地址才会创建 server；没配就不起 gRPC，HTTP 照常工作。服务实现了
+`GRPCRegistrar` 才监听端口——只配地址没实现接口会告警且不监听。
+
+### 健康检查与 reflection（grpcx 内置）
+
+```yaml
+grpc:
+  addr: ":9090"
+  health: true        # 默认开：标准 grpc.health.v1，K8s gRPC 探针 / 负载均衡直接可用
+  reflection: false   # 默认关：开了 grpcurl/grpcui 免 proto（等于公开服务面）
+```
+
+- 监听后才报 `SERVING`，`Shutdown` 时先转 `NOT_SERVING` 再排空在途调用：探针看到的
+  "健康"与实际能接流量同一时刻。
+- 直接 `grpcx.New` 的场合，依赖异常时可以调 `srv.SetServing(name, healthpb.HealthCheckResponse_NOT_SERVING)`
+  让负载均衡先摘流量。
+- 本示例的 config.yaml 打开了 reflection，方便 `grpcurl list`。
 
 ## 客户端
 

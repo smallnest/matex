@@ -69,6 +69,7 @@ err = xc.Call(ctx, "Greet", &GreetArgs{Name: "world"}, reply)
 - `RPCXClient` 默认 Failtry + RandomSelect + DefaultOption；需要 Failover/自定义重试时用 `RPCXClientWith` 自建。
 - client 由 verticle 在关闭时 `Close`，无需手动管理。
 - 服务发现：单实例直连用 `RPCXClient`；多实例/动态寻址用 `RPCXClientWith` + etcd/consul discovery（rpcx 原生支持）。
+- 实现了 `RPCXRegistrar` 才监听端口；只配地址不实现接口会告警且不监听。健康检查走 HTTP 的 `/healthz` `/readyz`。
 - **链路追踪自动生效**：服务端 plugin + 客户端包装都内置 `traceparent` 传播，业务代码零改动。已知限制：handler 内 `obs.StartSpan` 的子 span 不会自动挂在 RPC server span 下（OTel ctx 键不能从外部写入），跨进程的 client→server 父子链完整。
 
 ## gRPC vs rpcx 怎么选

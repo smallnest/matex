@@ -9,6 +9,8 @@ http:
 grpc:
   addr: ":9090"
   dial_timeout: 3s
+  health: true        # 标准 grpc.health.v1 健康服务（默认开），K8s gRPC 探针直接可用
+  reflection: true    # grpcurl/grpcui 免 proto；生产上按需关闭
 
 log:
   level: info
