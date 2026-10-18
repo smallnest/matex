@@ -3,11 +3,16 @@ package cache
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	goredis "github.com/redis/go-redis/v9"
+
+	"github.com/smallnest/matex/pkg/core/redis"
 	"github.com/smallnest/matex/pkg/core/redistest"
 )
 
@@ -258,5 +263,34 @@ func TestKey(t *testing.T) {
 		if got := Key(c.parts...); got != c.want {
 			t.Errorf("Key(%v) = %q, want %q", c.parts, got, c.want)
 		}
+	}
+}
+
+// A transient redis failure must degrade to loading from the source, not
+// fail the request: the cache is an optimization, never a dependency.
+func TestReadFailureFallsBackToTheSource(t *testing.T) {
+	if os.Getenv("REDIS_TEST_ADDR") != "" {
+		t.Skip("needs miniredis to be stopped mid-test")
+	}
+	mr := miniredis.RunT(t)
+	rc := redis.New(goredis.NewClient(&goredis.Options{Addr: mr.Addr()}))
+
+	loads := 0
+	load := func(context.Context) (string, error) {
+		loads++
+		return "from-source", nil
+	}
+
+	if v, err := GetOrLoad(t.Context(), rc, "k", Config{TTL: time.Minute}, load); err != nil || v != "from-source" {
+		t.Fatalf("first call: %q %v", v, err)
+	}
+
+	mr.Close() // redis is now unreachable
+	v, err := GetOrLoad(t.Context(), rc, "k", Config{TTL: time.Minute}, load)
+	if err != nil {
+		t.Fatalf("a redis outage must not fail the read: %v", err)
+	}
+	if v != "from-source" || loads != 2 {
+		t.Fatalf("v = %q, loads = %d; want the loader to run again", v, loads)
 	}
 }

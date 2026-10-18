@@ -23,6 +23,7 @@ package idempotency
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -128,7 +129,15 @@ func Middleware(store Store, cfg Config) httpx.Middleware {
 			}
 
 			data, err := next(ctx, r)
-			outcome := classify(data, err)
+			// A timeout or canceled attempt is released, not stored: the
+			// effect may or may not have happened, so a retry must stay free
+			// to try instead of replaying 504 for the whole TTL. classify
+			// already releases plain 5xx the same way; errors.Is also catches
+			// a cancellation buried under a non-5xx errs wrap.
+			var outcome *Outcome
+			if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+				outcome = classify(data, err)
+			}
 			if ferr := store.Finish(ctx, key, outcome, cfg.TTL); ferr != nil {
 				obs.Warn(ctx, "storing the idempotent outcome failed", "err", ferr)
 			}

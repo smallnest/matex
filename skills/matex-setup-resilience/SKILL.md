@@ -74,6 +74,17 @@ if errors.Is(err, breaker.ErrOpen) {
 `retry` 默认全抖动（把延迟摊到 `[0, d)`），不要关掉：同一瞬间失败的一批客户端若无抖动
 会在同一瞬间重试。
 
+## 5. 数据库约束冲突
+
+唯一键冲突（postgres 23505 / mysql 1062 / sqlite 2067）由 `pkg/core/db` 映射成
+`errs.KindConflict`（409），不用自己判断驱动错误：
+
+```go
+if _, err := s.dao.Create(ctx, s.db, in); err != nil && errs.KindOf(err) == errs.KindConflict {
+	return nil, errs.Conflict(40901, "name already exists")
+}
+```
+
 ## 约定（必须遵守）
 
 - **降级优先**：限流器/幂等存储故障时放行 + 记 warn，绝不因为防护组件挂掉而拒绝正常流量。

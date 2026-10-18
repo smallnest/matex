@@ -39,8 +39,13 @@ resp, err := c.Chat(ctx, llm.Request{Messages: []llm.Message{{Role: "user", Cont
 
 // 流式：统一事件
 ch, err := c.ChatStream(ctx, req)
-for ev := range ch { /* EventText / EventToolCall / EventUsage / EventDone */ }
+defer llm.StopStream(ch) // 提前退出也能释放连接与 goroutine
+for ev := range ch { /* EventText / EventToolCall / EventUsage / EventDone / EventError */ }
 ```
+
+超时语义：`WithTimeout`（默认 60s）约束整次非流式调用；流式调用只用它约束
+**等到响应头**（time-to-first-byte），响应体开始流动后由 `ctx` 决定何时结束——
+慢但持续的流不会被从中间截断，调用方仍可用自己的 deadline 限时。
 
 ## 四种协议的转换
 
@@ -96,6 +101,7 @@ out, err := jc.Decide(ctx, llm.DecideRequest{
   （tool_result 并入 user 消息）。
 - **Gemini**：role 为 `user`/`model`；`functionResponse` 需要函数名，自动从
   之前的 assistant 调用按 `ToolCallID` 解析，兜底取 `Message.Name`。
+- **中断**：`StopStream(ch)` 排空并结束流；不消费的流不会永久占用连接。
 - **错误**：统一映射到 `errs`（400→Invalid、401→Unauthorized、429→RateLimited、
   5xx→Unavailable、超时→Timeout），上游错误体节选进消息。
 

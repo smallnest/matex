@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/smallnest/matex/pkg/core/errs"
 )
@@ -663,3 +664,61 @@ func conv(t *testing.T, f func() ([]byte, error)) []byte {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// A stream that keeps flowing must outlive http.Client.Timeout (which, left
+// on the client, would cut it mid-body); the timeout still guards
+// time-to-first-byte.
+func TestStreamIsNotCutByClientTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := range 5 {
+			_, _ = fmt.Fprint(w, sseData(`{"choices":[{"delta":{"content":"x"}}]}`))
+			w.(http.Flusher).Flush()
+			if i < 4 {
+				time.Sleep(60 * time.Millisecond)
+			}
+		}
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	c := New(WithBaseURL(srv.URL), WithModel("m"), WithTimeout(100*time.Millisecond))
+	ch, err := c.ChatStream(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer StopStream(ch)
+	ticks := 0
+	start := time.Now()
+	for ev := range ch {
+		switch ev.Kind {
+		case EventText:
+			ticks++
+		case EventError:
+			t.Fatalf("stream cut after %d chunks at %v (~300ms > 100ms timeout): %v", ticks, time.Since(start), ev.Err)
+		}
+	}
+	if ticks != 5 {
+		t.Fatalf("received %d of 5 chunks", ticks)
+	}
+}
+
+func TestStreamStillTimesOutWaitingForHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	c := New(WithBaseURL(srv.URL), WithModel("m"), WithTimeout(100*time.Millisecond))
+	start := time.Now()
+	_, err := c.ChatStream(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err == nil {
+		t.Fatal("a server that never sends headers must time out")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("waited %v for headers", time.Since(start))
+	}
+}

@@ -45,7 +45,7 @@ func (c *Client) SetJSON(key string, v any, ttl time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("memcache: marshal %s: %w", key, err)
 	}
-	if err := c.mc.Set(&gomc.Item{Key: key, Value: b, Expiration: int32(ttl.Seconds())}); err != nil {
+	if err := c.mc.Set(&gomc.Item{Key: key, Value: b, Expiration: seconds(ttl)}); err != nil {
 		return fmt.Errorf("memcache: set %s: %w", key, err)
 	}
 	return nil
@@ -66,6 +66,17 @@ func GetJSON[T any](c *Client, key string) (v T, ok bool, err error) {
 	return v, true, nil
 }
 
+// seconds converts a TTL to memcached's unit. The protocol is whole
+// seconds, and truncating (500ms → 0) would mean "never expires"; a
+// positive TTL therefore rounds up to at least one second. Zero and
+// negative TTLs keep their meaning (0 = never expire).
+func seconds(ttl time.Duration) int32 {
+	if ttl > 0 && ttl < time.Second {
+		return 1
+	}
+	return int32(ttl.Seconds())
+}
+
 // Delete removes a key (missing keys are not an error).
 func (c *Client) Delete(key string) error {
 	err := c.mc.Delete(key)
@@ -80,7 +91,7 @@ func (c *Client) Delete(key string) error {
 
 // Touch extends the TTL of a key.
 func (c *Client) Touch(key string, ttl time.Duration) error {
-	if err := c.mc.Touch(key, int32(ttl.Seconds())); err != nil {
+	if err := c.mc.Touch(key, seconds(ttl)); err != nil {
 		return fmt.Errorf("memcache: touch %s: %w", key, err)
 	}
 	return nil

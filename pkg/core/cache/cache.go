@@ -69,6 +69,17 @@ func (c Config) ttl() time.Duration {
 // across the process by design: a stampede is a process-wide event.
 var loads singleflight.Group
 
+// read fetches key, turning a cache failure into a miss on the caller's
+// side: a transient redis error must not fail the request when the value
+// can be loaded. The failure is logged so the outage stays visible.
+func read[T any](ctx context.Context, c *redis.Client, key string) (T, bool, error) {
+	v, ok, err := redis.GetJSON[T](ctx, c, key)
+	if err != nil {
+		obs.Warn(ctx, "cache read failed; loading from source", "key", key, "err", err)
+	}
+	return v, ok, err
+}
+
 // GetOrLoad returns the cached value for key, or calls load once, stores the
 // result and returns it.
 //
@@ -82,14 +93,15 @@ func GetOrLoad[T any](ctx context.Context, c *redis.Client, key string, cfg Conf
 	if c == nil {
 		return load(ctx)
 	}
-	if v, ok, err := redis.GetJSON[T](ctx, c, key); err == nil && ok {
-		return v, nil
+	hit, ok, readErr := read[T](ctx, c, key)
+	if readErr == nil && ok {
+		return hit, nil
 	}
 
 	res, err, _ := loads.Do(key, func() (any, error) {
 		// Whoever waited for the group deserves a second look: the value may
 		// have been written while they were queued.
-		if v, ok, err := redis.GetJSON[T](ctx, c, key); err == nil && ok {
+		if v, ok, err := read[T](ctx, c, key); err == nil && ok {
 			return v, nil
 		}
 		v, err := load(ctx)

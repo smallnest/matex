@@ -32,11 +32,14 @@ import (
 	"log/slog"
 	"time"
 
-	// Drivers register themselves with database/sql. Blank-imported here so
-	// pkg/core/db is the single place that decides which drivers ship.
-	_ "github.com/go-sql-driver/mysql" // "mysql"
-	_ "github.com/jackc/pgx/v5/stdlib" // "pgx"
-	_ "modernc.org/sqlite"             // "sqlite" (pure Go, CGO_ENABLED=0)
+	// Drivers register themselves with database/sql. pkg/core/db is the
+	// single place that decides which drivers ship and that may see their
+	// concrete error types for classification. mysql (not blank) also needs
+	// its *MySQLError for driverCode below; the other two are side-effect
+	// imports only.
+	mysql "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "modernc.org/sqlite"
 
 	"github.com/smallnest/matex/pkg/core/errs"
 )
@@ -410,7 +413,11 @@ func logSlow(ctx context.Context, op string, start time.Time, slow time.Duration
 	}
 }
 
-// wrapErr turns driver errors into errs kinds (timeout / internal).
+// wrapErr turns driver errors into errs kinds (timeout / unavailable /
+// conflict / internal). Business code never imports a driver (depguard), so
+// this is the only place that can recognize a unique-constraint violation;
+// mapping it to KindConflict lets a handler answer 409 without knowing which
+// database is behind the pool.
 func wrapErr(err error) error {
 	if err == nil {
 		return nil
@@ -418,7 +425,34 @@ func wrapErr(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return errs.Wrap(errs.KindTimeout, 50400, err, "db timeout")
 	}
+	if errors.Is(err, context.Canceled) {
+		return errs.Wrap(errs.KindUnavailable, 50300, err, "db unavailable")
+	}
+	if driverCode(err) != "" {
+		return errs.Wrap(errs.KindConflict, 40901, err, "db constraint violation")
+	}
 	return errs.InternalWrap(50000, err, "db error")
+}
+
+// driverCode extracts a unique-violation code from the driver's error.
+// Postgres (23505) and SQLite (2067, the extended SQLITE_CONSTRAINT_UNIQUE)
+// expose their codes through methods, so they are matched structurally;
+// MySQL exposes Number only as a field, so it is matched by concrete type.
+// The business never sees these: wrapErr maps the code to KindConflict.
+func driverCode(err error) string {
+	var sqlState interface{ SQLState() string }
+	if errors.As(err, &sqlState) && sqlState.SQLState() == "23505" {
+		return "23505"
+	}
+	var me *mysql.MySQLError
+	if errors.As(err, &me) && me.Number == 1062 {
+		return "1062"
+	}
+	var lite interface{ Code() int }
+	if errors.As(err, &lite) && lite.Code() == 2067 {
+		return "2067"
+	}
+	return ""
 }
 
 func truncate(s string, n int) string {

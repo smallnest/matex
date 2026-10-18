@@ -496,6 +496,12 @@ func makeReady(svc Service, env *Env) func(ctx context.Context) error {
 				return fmt.Errorf("redis: %w", err)
 			}
 		}
+		// memcache has no ping; an unread key proves the server answers.
+		if env.memcache != nil {
+			if _, _, err := memcache.GetJSON[struct{}](env.memcache, "matex:readyz"); err != nil {
+				return fmt.Errorf("memcache: %w", err)
+			}
+		}
 		if rc, ok := svc.(ReadyChecker); ok {
 			return rc.Ready(ctx)
 		}

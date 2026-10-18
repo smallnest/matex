@@ -231,3 +231,28 @@ func TestSetJSONRejectsUnencodableValue(t *testing.T) {
 		t.Fatal("SetJSON must fail on a value json cannot encode")
 	}
 }
+
+func TestSubSecondTTLRoundsUpInsteadOfNeverExpiring(t *testing.T) {
+	f := newFakeMemcached(t)
+	mc := f.open()
+
+	if err := mc.SetJSON("k", 1, 500*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	got := f.item["k"].expiry
+	f.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("expiry = %d s, want 1 (truncating to 0 would never expire)", got)
+	}
+
+	if err := mc.Touch("k", 10*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	got = f.item["k"].expiry
+	f.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("touch expiry = %d s, want 1", got)
+	}
+}

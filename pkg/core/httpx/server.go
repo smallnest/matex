@@ -49,6 +49,14 @@ type Config struct {
 	// costs CPU on the serving process. Enable it only where the endpoint is
 	// reachable by operators alone (a sidecar port, an internal network).
 	Pprof bool `json:"pprof" default:"false"`
+	// ReadHeaderTimeout caps how long a client may take to send its request
+	// headers: without it a slowloris client holds a connection forever.
+	// ReadTimeout is deliberately unset — it would also cap body uploads
+	// of legitimate large requests; drain slow uploads with an outer
+	// middleware if a route needs it.
+	ReadHeaderTimeout time.Duration `json:"read_header_timeout" default:"10s"`
+	// IdleTimeout closes keep-alive connections nobody is using.
+	IdleTimeout time.Duration `json:"idle_timeout" default:"120s"`
 }
 
 // HandlerFunc is the matex handler signature.
@@ -98,7 +106,11 @@ func New(cfg Config, opts ...Option) *Server {
 	if s.cfg.Pprof {
 		mountPprof(s.mux)
 	}
-	s.http = &http.Server{Addr: cfg.Addr}
+	s.http = &http.Server{
+		Addr:              cfg.Addr,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
+	}
 	s.rebuildHandler()
 	return s
 }
@@ -171,22 +183,31 @@ func (s *Server) wrap(h HandlerFunc) http.HandlerFunc {
 
 		// Continue the caller's trace and open a server span. Both are
 		// no-ops unless tracing is enabled, so this costs nothing by default.
-		ctx, span := obs.StartHTTPSpan(r.Context(), r)
+		spanCtx, span := obs.StartHTTPSpan(r.Context(), r)
 		defer func() { obs.EndHTTPSpan(span, sw.code) }()
 
 		// Correlation id precedence: what the caller sent, else the trace
 		// id, else a fresh one. Echoing it back lets a client correlate
 		// without a trace backend.
 		traceID := r.Header.Get("X-Request-ID")
+		if len(traceID) > maxTraceIDLen {
+			// An oversized id would ride along in every log line.
+			traceID = traceID[:maxTraceIDLen]
+		}
 		if traceID == "" {
-			traceID = obs.TraceID(ctx)
+			traceID = obs.TraceID(spanCtx)
 		}
 		if traceID == "" {
 			traceID = newTraceID()
 		}
 		w.Header().Set("X-Request-ID", traceID)
-		ctx = obs.WithTraceID(ctx, traceID)
-		ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+		// ctx is detached from the connection: derived from
+		// r.Context() it would fire on a client disconnect and be reported
+		// as a timeout. Detached, the handler keeps running after we answer,
+		// so its effect (and idempotency outcome) completes instead of being
+		// killed mid-write, and a duplicated request replays the truth.
+		ctx, cancel := context.WithTimeout(
+			context.WithoutCancel(obs.WithTraceID(spanCtx, traceID)), s.cfg.Timeout)
 		defer cancel()
 
 		type result struct {
@@ -212,6 +233,12 @@ func (s *Server) wrap(h HandlerFunc) http.HandlerFunc {
 			} else {
 				writeData(sw, res.data)
 			}
+		case <-r.Context().Done():
+			// The client went away: nobody reads a response, and the
+			// handler has been told so through its request context. Logged
+			// as 499 (a status that is never sent, nginx's convention) rather
+			// than 504, which would blame the server for a slow client.
+			sw.code = 499
 		case <-ctx.Done():
 			s.writeError(ctx, sw, errs.Timeout(50400, "request timeout"))
 		}
@@ -256,11 +283,19 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// statusWriter records the status code (and stays write-through).
+// maxTraceIDLen bounds an echoed X-Request-ID (W3C trace ids are 32 hex
+// chars; anything longer is not a correlation id).
+const maxTraceIDLen = 128
+
+// statusWriter records the status code (and stays write-through). Streaming
+// answers don't come through it: they use HandleRaw, which registers the
+// handler directly on the mux and so never enters wrap's timeout select.
 type statusWriter struct {
 	http.ResponseWriter
 	code int
 }
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *statusWriter) WriteHeader(code int) {
 	w.code = code

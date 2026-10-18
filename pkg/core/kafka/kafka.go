@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -90,6 +91,17 @@ type Message struct {
 // -once); retry semantics belong to the handler.
 type Handler func(ctx context.Context, m *Message) error
 
+// handle runs the handler, converting a panic into an error: a bug in one
+// message must not take the consumer (and every group member) down.
+func handle(ctx context.Context, h Handler, m *Message) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+		}
+	}()
+	return h(ctx, m)
+}
+
 // RunConsumer consumes group/topics until ctx is cancelled. It commits
 // synchronously after each poll batch (commits survive shutdown by
 // using a detached context).
@@ -129,7 +141,7 @@ func RunConsumer(ctx context.Context, cfg Config, group string, topics []string,
 				Value:     r.Value,
 				Time:      r.Timestamp,
 			}
-			if err := h(ctx, m); err != nil {
+			if err := handle(ctx, h, m); err != nil {
 				obs.Error(ctx, "kafka: handle failed",
 					"topic", r.Topic, "partition", r.Partition, "offset", r.Offset, "err", err)
 			}

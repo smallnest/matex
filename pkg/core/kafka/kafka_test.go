@@ -177,3 +177,41 @@ func consumeOne(ctx context.Context, t *testing.T, cfg kafka.Config, group, topi
 	}()
 	return got
 }
+
+func TestHandlerPanicDoesNotStopTheConsumer(t *testing.T) {
+	const topic = "t.panic"
+	cl := newCluster(t, topic)
+	cfg := kafka.Config{Brokers: cl.ListenAddrs()}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	second := make(chan struct{}, 1)
+	go func() {
+		calls := 0
+		_ = kafka.RunConsumer(ctx, cfg, "g-panic", []string{topic},
+			func(context.Context, *kafka.Message) error {
+				calls++
+				if calls == 1 {
+					panic("handler bug")
+				}
+				second <- struct{}{}
+				return nil
+			})
+	}()
+
+	p, err := kafka.NewProducer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	for _, v := range []string{"a", "b"} {
+		if err := p.SendSync(ctx, topic, nil, []byte(v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-second:
+	case <-ctx.Done():
+		t.Fatal("consumer died after a handler panic; later messages were never handled")
+	}
+}

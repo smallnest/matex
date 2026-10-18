@@ -26,6 +26,11 @@ func (d *DB) ApplyMigrations(ctx context.Context, dir string) error {
 	if _, err := d.Exec(ctx, create); err != nil {
 		return fmt.Errorf("migrate: ensure table: %w", err)
 	}
+	if release, ok, err := d.lockMigrations(ctx); err != nil {
+		return err
+	} else if ok {
+		defer release()
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("migrate: read dir %s: %w", dir, err)
@@ -57,6 +62,39 @@ func (d *DB) ApplyMigrations(ctx context.Context, dir string) error {
 	}
 	return nil
 }
+
+// lockMigrations serializes migration runs across replicas that boot at
+// the same moment: without it both read "not applied" and both execute the
+// DDL, and the loser fails to start. Postgres uses an advisory lock on the
+// pool connection; pgx's stdlib is per-query, but migrations run on a
+// single *sql.Conn, so the session that took the lock is the one released.
+// MySQL and SQLite get no lock (SQLite is a test driver; MySQL needs a
+// different mechanism) — the tracked-state check and DDL that tolerates
+// IF NOT EXISTS still make the common case safe.
+func (d *DB) lockMigrations(ctx context.Context) (release func(), ok bool, err error) {
+	if d.driver != Postgres {
+		return nil, false, nil
+	}
+	conn, err := d.sql.Conn(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("migrate: lock connection: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(?)`, migrationLockKey); err != nil {
+		_ = conn.Close()
+		return nil, false, fmt.Errorf("migrate: advisory lock: %w", err)
+	}
+	return func() {
+		// Unlock explicitly so a pooled connection is never reused holding
+		// the lock; closing would also drop the session, but costs the conn.
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_, _ = conn.ExecContext(uctx, `SELECT pg_advisory_unlock(?)`, migrationLockKey)
+		_ = conn.Close()
+	}, true, nil
+}
+
+// migrationLockKey is an arbitrary stable key for pg_advisory_lock.
+const migrationLockKey = 0x6d61746578 // "matex"
 
 func (d *DB) applyFile(ctx context.Context, name, body string) error {
 	return d.WithTx(ctx, func(ctx context.Context, tx *Tx) error {

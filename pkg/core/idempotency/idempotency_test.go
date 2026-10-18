@@ -169,6 +169,29 @@ func TestServerErrorsReleaseTheKey(t *testing.T) {
 	}
 }
 
+// TestCancellationReleasesTheKey: a handler that observes cancellation must
+// not pin the key — the side effect may or may not have happened, so the
+// retry has to be free to try.
+func TestCancellationReleasesTheKey(t *testing.T) {
+	var attempt int32
+	h := newHarness(t, NewMemory(), Config{}, func(_ context.Context, _ *http.Request) (any, error) {
+		if atomic.AddInt32(&attempt, 1) == 1 {
+			return nil, context.Canceled
+		}
+		return map[string]string{"id": "payment-1"}, nil
+	})
+
+	if rec := h.do(http.MethodPost, "abc"); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("first: code %d, want 503", rec.Code)
+	}
+	if rec := h.do(http.MethodPost, "abc"); rec.Code != http.StatusOK {
+		t.Fatalf("retry: code %d; the key was not released", rec.Code)
+	}
+	if got := h.callCount(); got != 2 {
+		t.Fatalf("handler ran %d times, want 2", got)
+	}
+}
+
 func TestNilResultIsReplayedAs204(t *testing.T) {
 	h := newHarness(t, NewMemory(), Config{}, func(context.Context, *http.Request) (any, error) {
 		return nil, nil

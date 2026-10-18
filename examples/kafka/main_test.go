@@ -11,8 +11,8 @@ import (
 )
 
 // kfake is a broker that runs in-process, so Kafka behaviour can be tested
-// with no Docker and no network. It is the one place an example is allowed
-// to import a driver-level package (see .golangci.yml).
+// with no Docker and no network. Example tests are exempt from the
+// franz-go ban (see .golangci.yml); non-test code is not.
 func TestProduceAndConsume(t *testing.T) {
 	const (
 		topic = "matex.test.events"

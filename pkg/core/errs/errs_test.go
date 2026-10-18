@@ -1,6 +1,7 @@
 package errs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -51,5 +52,21 @@ func TestErrorString(t *testing.T) {
 	w := Wrap(KindInternal, 50000, errors.New("x"), "boom")
 	if w.Error() != "boom: x" {
 		t.Fatalf("Error(): %q", w.Error())
+	}
+}
+
+// A handler that returns ctx.Err() must not be reported as an internal
+// failure: cancellation and deadline are distinct outcomes.
+func TestBareContextErrorsKeepTheirMeaning(t *testing.T) {
+	status, code, _ := Status(context.DeadlineExceeded)
+	if status != 504 || code != 50400 || KindOf(context.DeadlineExceeded) != KindTimeout {
+		t.Fatalf("deadline: %d %d %v", status, code, KindOf(context.DeadlineExceeded))
+	}
+	status, code, _ = Status(fmt.Errorf("load user: %w", context.Canceled))
+	if status != 503 || code != 50300 || KindOf(context.Canceled) != KindUnavailable {
+		t.Fatalf("canceled: %d %d %v", status, code, KindOf(context.Canceled))
+	}
+	if status, _, _ := Status(errors.New("boom")); status != 500 {
+		t.Fatalf("plain error status = %d, want 500", status)
 	}
 }

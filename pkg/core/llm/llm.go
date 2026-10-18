@@ -207,9 +207,23 @@ func WithModel(m string) Option { return func(c *Client) { c.model = m } }
 // speak.
 func WithProtocol(p Protocol) Option { return func(c *Client) { c.protocol = p } }
 
-// WithTimeout sets the HTTP client timeout (default 60s). Ignored when
-// WithHTTPClient is used.
-func WithTimeout(d time.Duration) Option { return func(c *Client) { c.hc = &http.Client{Timeout: d} } }
+// WithTimeout sets the HTTP client timeout (default 60s) and, for
+// streaming calls, the response-header (time-to-first-byte) timeout. Ignored
+// when WithHTTPClient is used.
+func WithTimeout(d time.Duration) Option {
+	return func(c *Client) { c.hc = timeoutClient(d) }
+}
+
+// timeoutClient bounds every call by d, the whole exchange included.
+// Streaming calls clear it (a long stream is progress, not a stall) and
+// rely on the transport's ResponseHeaderTimeout instead, which spans the
+// whole header wait — exactly what the client timeout protected against.
+func timeoutClient(d time.Duration) *http.Client {
+	return &http.Client{
+		Timeout:   d,
+		Transport: &http.Transport{ResponseHeaderTimeout: d},
+	}
+}
 
 // WithMaxTokens sets the default max tokens, used when a Request carries none.
 func WithMaxTokens(n int) Option { return func(c *Client) { c.maxTokens = n } }
@@ -228,7 +242,7 @@ func New(opts ...Option) *Client {
 		o(c)
 	}
 	if c.hc == nil {
-		c.hc = &http.Client{Timeout: defaultTimeout}
+		c.hc = timeoutClient(defaultTimeout)
 	}
 	if c.protocol == "" {
 		c.protocol = inferProtocol(c.baseURL)
@@ -300,7 +314,11 @@ func (c *Client) ChatStream(ctx context.Context, req Request) (<-chan Event, err
 	if err != nil {
 		return nil, errs.InternalWrap(0, err, "llm: build request")
 	}
-	resp, err := c.do(ctx, a, req, body)
+	// The caller's ctx (with its own deadline) bounds the whole stream; the
+	// client timeout applies only to the wait for response headers. The body
+	// is not cut by the timeout: while bytes flow there is progress, and a
+	// slow answer must not be truncated mid-stream.
+	resp, err := c.postFor(ctx, a.path(req), a.headers(c), body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -311,6 +329,15 @@ func (c *Client) ChatStream(ctx context.Context, req Request) (<-chan Event, err
 		a.stream(ctx, newSSE(resp.Body), ch)
 	}()
 	return ch, nil
+}
+
+// StopStream stops a stream returned by ChatStream and drains it, so the
+// reading goroutine unblocks even when nobody else is consuming the channel.
+// Call it with a defer right after ChatStream; it is also what an abandoned
+// stream needs to release its connection and goroutine.
+func StopStream(ch <-chan Event) {
+	for range ch {
+	}
 }
 
 // fill applies the client defaults a Request does not carry.
@@ -332,6 +359,12 @@ func (c *Client) do(ctx context.Context, a adapter, req Request, body []byte) (*
 // post POSTs body to baseURL+path and returns the upstream response on 2xx;
 // non-2xx and transport failures map to errs kinds.
 func (c *Client) post(ctx context.Context, path string, headers http.Header, body []byte) (*http.Response, error) {
+	return c.postFor(ctx, path, headers, body, false)
+}
+
+// postFor is post with a streaming flag: a stream is cut only by ctx, never by
+// http.Client.Timeout — a long stream is progress, not a stall.
+func (c *Client) postFor(ctx context.Context, path string, headers http.Header, body []byte, stream bool) (*http.Response, error) {
 	if c.baseURL == "" {
 		return nil, errs.Invalid(0, "llm: base URL is required (WithBaseURL)")
 	}
@@ -346,7 +379,13 @@ func (c *Client) post(ctx context.Context, path string, headers http.Header, bod
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.hc.Do(httpReq)
+	httpClient := c.hc
+	if stream && httpClient.Timeout > 0 {
+		hc := *httpClient
+		hc.Timeout = 0
+		httpClient = &hc
+	}
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return nil, transportErr(err)
 	}

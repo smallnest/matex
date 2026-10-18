@@ -9,6 +9,7 @@
 package errs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
@@ -95,13 +96,28 @@ func Status(err error) (httpStatus, code int, msg string) {
 		}
 		return e.Kind.HTTPStatus(), c, e.Msg
 	}
+	// A bare context error keeps its meaning instead of turning into a
+	// generic 500: callers that return ctx.Err() get a truthful status.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return KindTimeout.HTTPStatus(), KindTimeout.HTTPStatus() * 100, "request timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return KindUnavailable.HTTPStatus(), KindUnavailable.HTTPStatus() * 100, "request canceled"
+	}
 	return 500, 50000, "internal error"
 }
 
-// KindOf returns the Kind of err (KindInternal for non-matex errors).
+// KindOf returns the Kind of err (KindInternal for non-matex errors,
+// KindTimeout/KindUnavailable for a bare context error).
 func KindOf(err error) Kind {
 	if e, ok := errors.AsType[*Error](err); ok {
 		return e.Kind
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return KindTimeout
+	}
+	if errors.Is(err, context.Canceled) {
+		return KindUnavailable
 	}
 	return KindInternal
 }

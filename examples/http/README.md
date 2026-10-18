@@ -36,7 +36,13 @@ type HandlerFunc func(ctx context.Context, r *http.Request) (any, error)
 | `nil, errors.New("…")` | `500 {"code":50000,"msg":"internal error"}`（不泄露细节） |
 
 框架统一处理的还有：**panic → 500**、**超时 → 504/50400**、**X-Request-ID**（透传或生成，
-写回响应头并进日志）、访问日志、`http_server_*` 指标、`max_body` 限流。
+写回响应头并进日志，超过 128 字节截断）、访问日志、`http_server_*` 指标、`max_body` 限流。
+
+超时的语义：handler 的 ctx 只受 `http.timeout` 约束，**客户端断开不会让它变成 504**
+（日志记 499）；超时后 handler 不被杀死，会跑完自己的副作用——这样幂等中间件记下的结果
+就是真实结果，重复请求重放它而不是被 409 挡住。客户端读头与空闲连接有 socket 级超时
+（`read_header_timeout` / `idle_timeout`）。流式响应走 `HandleRaw`（原样交给 `net/http`，
+不经 timeout 封套），由调用方的 ctx 决定何时结束。
 
 ## 路由
 
