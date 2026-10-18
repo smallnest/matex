@@ -131,8 +131,8 @@ func TestOnlyOneInstanceRunsAnInterval(t *testing.T) {
 	instanceA.Add(job)
 	instanceB.Add(job)
 
-	instanceA.runOnce(ctx, job)
-	instanceB.runOnce(ctx, job)
+	instanceA.runOnce(ctx, job, job.Interval)
+	instanceB.runOnce(ctx, job, job.Interval)
 
 	if got := runs.Load(); got != 1 {
 		t.Fatalf("the job ran %d times in one interval, want exactly 1", got)
@@ -154,7 +154,7 @@ func TestClaimSkippedWhenRedisIsDown(t *testing.T) {
 
 	instance := New(Config{Redis: down})
 	instance.Add(job)
-	instance.runOnce(context.Background(), job)
+	instance.runOnce(context.Background(), job, job.Interval)
 
 	if got := runs.Load(); got != 0 {
 		t.Fatalf("ran %d times without a leader claim", got)
@@ -170,8 +170,8 @@ func TestNoRedisRunsUnconditionally(t *testing.T) {
 
 	instance := New(Config{})
 	instance.Add(job)
-	instance.runOnce(context.Background(), job)
-	instance.runOnce(context.Background(), job)
+	instance.runOnce(context.Background(), job, job.Interval)
+	instance.runOnce(context.Background(), job, job.Interval)
 
 	// Without redis there is no leader election by design: one replica is
 	// assumed.
@@ -181,14 +181,20 @@ func TestNoRedisRunsUnconditionally(t *testing.T) {
 }
 
 func TestAddRejectsInvalidJobs(t *testing.T) {
+	run := func(context.Context) error { return nil }
 	cases := []struct {
 		name string
 		job  Job
 	}{
-		{"no name", Job{Interval: time.Second, Run: func(context.Context) error { return nil }}},
-		{"no interval", Job{Name: "x", Run: func(context.Context) error { return nil }}},
-		{"zero interval", Job{Name: "x", Interval: 0, Run: func(context.Context) error { return nil }}},
+		{"no name", Job{Interval: time.Second, Run: run}},
+		{"no schedule at all", Job{Name: "x", Run: run}},
+		{"zero interval", Job{Name: "x", Interval: 0, Run: run}},
 		{"no run", Job{Name: "x", Interval: time.Second}},
+		{"interval and schedule", Job{Name: "x", Interval: time.Second, Schedule: "@daily", Run: run}},
+		{"at and delay", Job{Name: "x", At: time.Now(), Delay: time.Second, Run: run}},
+		{"bad cron expression", Job{Name: "x", Schedule: "not a cron", Run: run}},
+		{"run on start on a cron job", Job{Name: "x", Schedule: "@daily", RunOnStart: true, Run: run}},
+		{"run on start on a one-shot", Job{Name: "x", Delay: time.Second, RunOnStart: true, Run: run}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -244,5 +250,86 @@ func TestRunBlocksUntilCancelled(t *testing.T) {
 	case <-returned:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+// stepSchedule fires every d — a fake clock for the cron loop. robfig's real
+// schedules are minute-granular (its "@every" rounds up to a second), which
+// would make this test crawl; robfig's Next is already tested upstream, so
+// here we exercise our own loop against a schedule that ticks fast.
+type stepSchedule struct{ d time.Duration }
+
+func (s stepSchedule) Next(t time.Time) time.Time { return t.Add(s.d) }
+
+// TestCronJobRunsOnItsSchedule drives the cron loop: the job fires at each
+// scheduled time, and the slot claim (hold) is derived from the schedule.
+func TestCronJobRunsOnItsSchedule(t *testing.T) {
+	var runs atomic.Int32
+	s := New(Config{})
+	s.Add(Job{Name: "report", Schedule: "@hourly", Run: func(context.Context) error {
+		runs.Add(1)
+		return nil
+	}})
+	// In-package test: swap in a fast clock without touching Add's validation
+	// (which still sees a valid, parsed Schedule).
+	s.jobs[0].schedule = stepSchedule{5 * time.Millisecond}
+
+	start(t, s)
+	waitFor(t, func() bool { return runs.Load() >= 3 })
+}
+
+// TestOneShotRunsAtItsDelay: a Delay job fires once, then stays quiet.
+func TestOneShotRunsAtItsDelay(t *testing.T) {
+	var runs atomic.Int32
+	s := New(Config{})
+	s.Add(Job{Name: "notify", Delay: 5 * time.Millisecond, Run: func(context.Context) error {
+		runs.Add(1)
+		return nil
+	}})
+
+	start(t, s)
+	waitFor(t, func() bool { return runs.Load() == 1 })
+	time.Sleep(20 * time.Millisecond)
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("ran %d times, want exactly 1", got)
+	}
+}
+
+// TestOneShotAtInThePastRunsImmediately: a one-shot whose time has passed is
+// due at start.
+func TestOneShotAtInThePastRunsImmediately(t *testing.T) {
+	var runs atomic.Int32
+	s := New(Config{})
+	s.Add(Job{Name: "late", At: time.Now().Add(-time.Minute), Run: func(context.Context) error {
+		runs.Add(1)
+		return nil
+	}})
+
+	start(t, s)
+	waitFor(t, func() bool { return runs.Load() == 1 })
+}
+
+// TestOneShotRunsOnceAcrossInstances pins the at-most-once contract: the
+// winner's claim never expires (hold 0), so the loser — waking later, like a
+// replica with an offset start — finds the slot permanently held.
+func TestOneShotRunsOnceAcrossInstances(t *testing.T) {
+	rc := redistest.Start(t)
+	ctx := context.Background()
+	var runs atomic.Int32
+	job := Job{Name: "shared-once", Delay: 5 * time.Millisecond, Run: func(context.Context) error {
+		runs.Add(1)
+		return nil
+	}}
+
+	instanceA, instanceB := New(Config{Redis: rc}), New(Config{Redis: rc})
+	instanceA.Add(job)
+	instanceB.Add(job)
+
+	instanceA.runOnce(ctx, job, 0)
+	time.Sleep(10 * time.Millisecond)
+	instanceB.runOnce(ctx, job, 0)
+
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("the one-shot ran %d times across two replicas, want 1", got)
 	}
 }

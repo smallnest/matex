@@ -14,7 +14,7 @@
 | [resilience](resilience/) | `ratelimit`/`idempotency`/`breaker`/`retry`：限流、幂等、熔断、退避重试 | 无 | `go run ./examples/resilience` |
 | [observability](observability/) | `obs`：结构化日志、相关 id（trace id / X-Request-ID）、Prometheus 指标、OpenTelemetry 链路 | 无 | `go run ./examples/observability` |
 | [lifecycle](lifecycle/) | `verticle`/`app`：`Block`、`Closer`、配置热更、优雅退出 | 无 | `go run ./examples/lifecycle` |
-| [cron](cron/) | `cron`：定时任务，多副本下 redis 选主保证每周期只跑一次 | 无（选主需 Redis） | `go run ./examples/cron` |
+| [cron](cron/) | `cron`：定时任务——固定周期 / cron 表达式 / 一次性，多副本下 redis 选主保证每槽只跑一次 | 无（选主需 Redis） | `go run ./examples/cron` |
 | [redis](redis/) | `redis`：缓存读写、`TryLock` 分布式锁 | Redis | `make dev && go run ./examples/redis` |
 | [memcache](memcache/) | `memcache`：JSON 缓存、TTL、`Touch` | Memcached | `make dev && go run ./examples/memcache` |
 | [kafka](kafka/) | `kafka`：生产者（同步/异步）+ 消费者循环 | Kafka | `make dev && go run ./examples/kafka` |

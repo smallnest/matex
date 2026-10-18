@@ -11,6 +11,7 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/redis/go-redis/v9 v9.22.0
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/smallnest/rpcx v1.9.4
 	github.com/twmb/franz-go v1.22.1
 	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260906002741-ab55e0424097
@@ -80,7 +81,6 @@ require (
 	github.com/smallnest/gordma v0.3.0 // indirect
 	github.com/smallnest/quick v0.2.0 // indirect
 	github.com/soheilhy/cmux v0.1.5 // indirect
-	github.com/stretchr/testify v1.12.1 // indirect
 	github.com/templexxx/cpufeat v0.0.0-20180724012125-cef66df7f161 // indirect
 	github.com/templexxx/xor v0.0.0-20191217153810-f85b25db303b // indirect
 	github.com/tinylib/msgp v1.2.5 // indirect
@@ -102,7 +102,6 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
-	google.golang.org/genproto v0.0.0-20261005182115-fad411399dd8 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20261005182115-fad411399dd8 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260928230214-8a89bd6388cc // indirect
 	google.golang.org/protobuf v1.36.12 // indirect

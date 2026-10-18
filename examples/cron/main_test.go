@@ -17,7 +17,12 @@ import (
 
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	waitForWithin(t, 2*time.Second, cond)
+}
+
+func waitForWithin(t *testing.T, d time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -45,10 +50,11 @@ func newService(t *testing.T) (*cronService, http.Handler) {
 }
 
 // fastScheduler builds the same job set on a short clock: the config default
-// is meant for watching, not for tests.
+// is meant for watching, not for tests. The cron and one-shot jobs keep
+// their config timings, so they stay quiet inside the fast interval tests.
 func fastScheduler(svc *cronService, interval time.Duration) {
 	svc.sched = cron.New(cron.Config{})
-	svc.sched.Add(svc.jobs(interval, interval)...)
+	svc.sched.Add(svc.jobs(interval, interval, svc.cfg.DailyReport, svc.cfg.NotifyDelay)...)
 }
 
 func TestJobsRunOnTheirIntervals(t *testing.T) {
@@ -80,7 +86,7 @@ func TestJobsRunOnTheirIntervals(t *testing.T) {
 func TestRunOnStartBumpsImmediately(t *testing.T) {
 	svc, _ := newService(t)
 	svc.sched = cron.New(cron.Config{})
-	svc.sched.Add(svc.jobs(time.Hour, time.Hour)...)
+	svc.sched.Add(svc.jobs(time.Hour, time.Hour, svc.cfg.DailyReport, svc.cfg.NotifyDelay)...)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -102,7 +108,7 @@ func TestRunOnStartBumpsImmediately(t *testing.T) {
 // error, and the schedule keeps going.
 func TestJobFailureDoesNotStopTheLoop(t *testing.T) {
 	svc, _ := newService(t)
-	jobs := svc.jobs(time.Hour, time.Hour)
+	jobs := svc.jobs(time.Hour, time.Hour, svc.cfg.DailyReport, svc.cfg.NotifyDelay)
 	reconcile := jobs[1]
 
 	var failures int
@@ -132,12 +138,12 @@ func TestLeaderElectionRunsOneInstancePerInterval(t *testing.T) {
 	replicaA.redis = rc
 	replicaB.redis = rc
 
-	stopA := startScheduler(t, replicaA, time.Minute)
+	stopA := startScheduler(t, replicaA, replicaA.jobs(time.Minute, time.Minute, replicaA.cfg.DailyReport, replicaA.cfg.NotifyDelay)...)
 	defer stopA()
 	// Wait for A to have taken the claim.
 	waitFor(t, func() bool { return replicaA.stats.count("heartbeat") == 1 })
 
-	stopB := startScheduler(t, replicaB, time.Minute)
+	stopB := startScheduler(t, replicaB, replicaB.jobs(time.Minute, time.Minute, replicaB.cfg.DailyReport, replicaB.cfg.NotifyDelay)...)
 	defer stopB()
 	// Give B's startup run a chance to try — and fail — the claim.
 	time.Sleep(50 * time.Millisecond)
@@ -148,12 +154,39 @@ func TestLeaderElectionRunsOneInstancePerInterval(t *testing.T) {
 	}
 }
 
-// startScheduler runs the service's jobs in the background with the given
-// interval and returns a stop func that waits for it to unwind.
-func startScheduler(t *testing.T, svc *cronService, interval time.Duration) func() {
+// TestOneShotLeaderElection: two replicas scheduling the same one-shot on
+// offset start times still run it once. The winner's claim never expires, so
+// the replica that starts later finds the slot permanently held.
+func TestOneShotLeaderElection(t *testing.T) {
+	rc := redistest.Start(t)
+
+	replicaA, _ := newService(t)
+	replicaB, _ := newService(t)
+	replicaA.redis = rc
+	replicaB.redis = rc
+
+	stopA := startScheduler(t, replicaA, replicaA.jobs(time.Minute, time.Minute, "@every 1h", 5*time.Millisecond)...)
+	defer stopA()
+	// Wait for A's one-shot to have fired and claimed the slot for good.
+	waitFor(t, func() bool { return replicaA.stats.count("notify") == 1 })
+
+	stopB := startScheduler(t, replicaB, replicaB.jobs(time.Minute, time.Minute, "@every 1h", 5*time.Millisecond)...)
+	defer stopB()
+	// Give B's one-shot a chance to fire — and fail — the claim.
+	time.Sleep(50 * time.Millisecond)
+
+	total := replicaA.stats.count("notify") + replicaB.stats.count("notify")
+	if total != 1 {
+		t.Fatalf("two replicas ran the one-shot %d times, want 1", total)
+	}
+}
+
+// startScheduler runs the given jobs in the background and returns a stop
+// func that waits for it to unwind.
+func startScheduler(t *testing.T, svc *cronService, jobs ...cron.Job) func() {
 	t.Helper()
 	svc.sched = cron.New(cron.Config{Redis: svc.redis})
-	svc.sched.Add(svc.jobs(interval, interval)...)
+	svc.sched.Add(jobs...)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -209,18 +242,72 @@ func TestConfigDefaults(t *testing.T) {
 	svc, _ := newService(t)
 	if svc.cfg.HeartbeatInterval != 500*time.Millisecond ||
 		svc.cfg.ReconcileInterval != 2*time.Second ||
+		svc.cfg.DailyReport != "@every 5s" ||
+		svc.cfg.NotifyDelay != 10*time.Second ||
 		svc.cfg.JobTimeout != 5*time.Second {
 		t.Fatalf("defaults not applied: %+v", svc.cfg)
 	}
-	names := make([]string, 0, 2)
+	names := make([]string, 0, 4)
 	for _, j := range svc.sched.Jobs() {
 		names = append(names, j.Name)
 	}
-	if len(names) != 2 || names[0] != "heartbeat" || names[1] != "reconcile" {
+	want := []string{"heartbeat", "reconcile", "report", "notify"}
+	if len(names) != len(want) {
 		t.Fatalf("registered jobs = %v", names)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("registered jobs = %v", names)
+		}
 	}
 	// No redis means no leader election, which is the single-replica case.
 	if svc.redis != nil {
 		t.Fatal("redis should be nil without a redis section")
 	}
+}
+
+// TestCronJobFiresOnItsSchedule drives the cron-expression job end to end.
+// "@every 1s" is the fastest cadence robfig's real clock supports; the config
+// default ("@every 5s") would not fire inside a test.
+func TestCronJobFiresOnItsSchedule(t *testing.T) {
+	svc, _ := newService(t)
+	svc.sched = cron.New(cron.Config{})
+	svc.sched.Add(svc.jobs(time.Hour, time.Hour, "@every 1s", time.Hour)...)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = svc.sched.Run(ctx)
+	}()
+
+	waitForWithin(t, 3*time.Second, func() bool { return svc.stats.count("report") >= 2 })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the scheduler did not stop on cancellation")
+	}
+}
+
+// TestOneShotFiresExactlyOnce: a one-shot runs once, then stays quiet.
+func TestOneShotFiresExactlyOnce(t *testing.T) {
+	svc, _ := newService(t)
+	svc.sched = cron.New(cron.Config{})
+	svc.sched.Add(svc.jobs(time.Hour, time.Hour, "@every 1h", 5*time.Millisecond)...)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = svc.sched.Run(ctx)
+	}()
+
+	waitFor(t, func() bool { return svc.stats.count("notify") == 1 })
+	time.Sleep(20 * time.Millisecond)
+	if got := svc.stats.count("notify"); got != 1 {
+		t.Fatalf("one-shot ran %d times, want exactly 1", got)
+	}
+	cancel()
+	<-done
 }

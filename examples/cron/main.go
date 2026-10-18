@@ -1,11 +1,14 @@
-// Command cron demonstrates pkg/core/cron: periodic jobs that run once per
-// deployment rather than once per replica.
+// Command cron demonstrates pkg/core/cron: scheduled jobs that run once per
+// deployment rather than once per replica. Three schedule kinds are shown:
+// a fixed interval (heartbeat), a cron expression (report, "@every 5s" in
+// the config so the demo shows it firing), and a one-shot (notify, 10s after
+// start).
 //
 // Every instance ticks; the instance that wins a redis claim for the job's
-// interval is the one that runs it. With no redis configured (a single
-// replica) the jobs simply run — `make dev` + the redis section in
-// config.yaml is what makes the leader election visible: start two copies
-// and watch each job's counter advance once per interval, not twice.
+// slot is the one that runs it. With no redis configured (a single replica)
+// the jobs simply run — `make dev` + the redis section in config.yaml is
+// what makes the leader election visible: start two copies and watch each
+// job's counter advance once per slot, not twice.
 //
 // Run:
 //
@@ -37,7 +40,12 @@ import (
 type cronConfig struct {
 	HeartbeatInterval time.Duration `json:"heartbeat_interval" default:"500ms"`
 	ReconcileInterval time.Duration `json:"reconcile_interval" default:"2s"`
-	JobTimeout        time.Duration `json:"job_timeout" default:"5s"`
+	// DailyReport is a cron expression. The "@every 5s" default keeps the
+	// demo visible; a production service would write "0 9 * * *" (or the
+	// 5-field expression of its choice) here.
+	DailyReport string        `json:"daily_report" default:"@every 5s"`
+	NotifyDelay time.Duration `json:"notify_delay" default:"10s"` // one-shot: once, 10s after start
+	JobTimeout  time.Duration `json:"job_timeout" default:"5s"`
 }
 
 type cronService struct {
@@ -61,7 +69,7 @@ func (s *cronService) Setup(ctx context.Context, env *verticle.Env) error {
 		Redis:   rc,
 		Timeout: s.cfg.JobTimeout,
 	})
-	s.sched.Add(s.jobs(s.cfg.HeartbeatInterval, s.cfg.ReconcileInterval)...)
+	s.sched.Add(s.jobs(s.cfg.HeartbeatInterval, s.cfg.ReconcileInterval, s.cfg.DailyReport, s.cfg.NotifyDelay)...)
 	obs.Info(ctx, "cron jobs registered",
 		"jobs", len(s.sched.Jobs()), "leader_election", ok)
 
@@ -71,10 +79,10 @@ func (s *cronService) Setup(ctx context.Context, env *verticle.Env) error {
 	return nil
 }
 
-// jobs is the job set this service runs. It is a method taking its intervals
+// jobs is the job set this service runs. It is a method taking the timings
 // so tests can build the same jobs on a short clock instead of duplicating
-// them.
-func (s *cronService) jobs(heartbeat, reconcile time.Duration) []cron.Job {
+// them: report takes a cron expression, notify a one-shot delay.
+func (s *cronService) jobs(heartbeat, reconcile time.Duration, report string, notify time.Duration) []cron.Job {
 	return []cron.Job{
 		{
 			Name:     "heartbeat",
@@ -96,6 +104,30 @@ func (s *cronService) jobs(heartbeat, reconcile time.Duration) []cron.Job {
 				if n := s.stats.record("reconcile"); n%3 == 0 {
 					return errors.New("reconcile: the batch was rejected")
 				}
+				return nil
+			},
+		},
+		{
+			// A cron-expression job. In tests the expression is "@every 1s"
+			// so the job actually fires; with the config default the first
+			// fire comes at the next 5-second boundary.
+			Name:     "report",
+			Schedule: report,
+			Run: func(ctx context.Context) error {
+				s.stats.record("report")
+				obs.Info(ctx, "report generated")
+				return nil
+			},
+		},
+		{
+			// A one-shot job: fires once, notify after start, then stops.
+			// The redis claim for it never expires, so across replicas it
+			// still runs exactly once (whichever replica wins the claim).
+			Name:  "notify",
+			Delay: notify,
+			Run: func(ctx context.Context) error {
+				s.stats.record("notify")
+				obs.Info(ctx, "one-shot notify fired")
 				return nil
 			},
 		},

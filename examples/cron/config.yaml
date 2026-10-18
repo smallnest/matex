@@ -15,4 +15,8 @@ log:
 cron:
   heartbeat_interval: 200ms   # 演示用：跑得频繁，便于观察
   reconcile_interval: 1s
+  # cron 表达式 job：@every 5s 便于演示（每 5s 跑一次）；生产写标准表达式如 "0 9 * * *"
+  daily_report: "@every 5s"
+  # 一次性 job：启动后 10s 跑一次，之后不再跑（多副本下也只会跑一次）
+  notify_delay: 10s
   job_timeout: 2s             # 单次运行的上限

@@ -23,7 +23,7 @@ matex 取**中间偏简**：不做"全家桶"，也不做"迁移专用"，而是
 | 链路追踪 | `obs`：OpenTelemetry span + W3C 传播 + OTLP 导出（配 `trace:` 段启用） |
 | 稳定性防护 | `ratelimit`（本地令牌桶 / redis 固定窗口）、`breaker`、`retry`（全抖动退避）、`idempotency` |
 | 缓存模式 | `cache`：cache-aside + 并发 miss 合并（防击穿）+ TTL 抖动（防雪崩） |
-| 定时任务 | `cron`：多副本 redis 选主，claim 持有整个 interval |
+| 定时任务 | `cron`：固定周期 / cron 表达式 / 一次性任务，多副本 redis 选主（claim 持整个槽；一次性永久占用 at-most-once） |
 | 运维端点 | `/version`（build info）、`/debug/pprof/*`（`http.pprof` 开启） |
 | 测试基座 | dbtest（默认纯 Go SQLite + 自动迁移，可切真库）、redistest（miniredis） |
 | 一致性守卫 | depguard 两条规则（业务禁驱动库、禁 Web 框架） |
@@ -53,7 +53,7 @@ matex 取**中间偏简**：不做"全家桶"，也不做"迁移专用"，而是
 | 幂等 `idempotency` | `Use` + `Idempotency-Key` | 网关无从判断"这两个请求是同一笔业务" |
 | 链路 `obs` tracing | `trace.enabled` | 跨服务因果链，网关只覆盖入口 |
 | 缓存模式 `cache` | 调用处 | 防击穿/防雪崩是数据访问层的职责 |
-| 定时任务 `cron` | `env.Block` | 网关不跑定时任务；多副本选主要业务语义（claim 持有整个 interval） |
+| 定时任务 `cron` | `env.Block` | 网关不跑定时任务；多副本选主要业务语义（claim 持整个槽） |
 | pprof | `http.pprof` | 排障必需，但 heap 里可能有凭证，故默认关且只该在受信网络暴露 |
 
 共同约定：**防护组件自身故障时放行**（限流器、幂等存储出错都只记 warn 不拒流量）——

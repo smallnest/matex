@@ -66,7 +66,7 @@ skills/                   AI skill（matex-* 前缀）
 | `examples/observability` | 日志 / 相关 id / Prometheus / OpenTelemetry 链路 | 无 |
 | `examples/resilience` | 限流 / 幂等 / 熔断 / 退避重试 | 无 |
 | `examples/lifecycle` | 生命周期：Block、Closer、配置热更、优雅退出 | 无 |
-| `examples/cron` | 定时任务：多副本 redis 选主，每周期只跑一次 | 无（选主需 Redis） |
+| `examples/cron` | 定时任务：固定周期 / cron 表达式 / 一次性，多副本 redis 选主每槽只跑一次 | 无（选主需 Redis） |
 | `examples/redis` | 缓存读写、`TryLock` 分布式锁 | Redis |
 | `examples/memcache` | JSON 缓存、TTL、Touch | Memcached |
 | `examples/kafka` | 生产者（同步/异步）+ 消费者循环 | Kafka |
