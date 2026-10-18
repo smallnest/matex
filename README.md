@@ -71,9 +71,9 @@ skills/                   AI skill（matex-* 前缀）
 | `examples/redis` | 缓存读写、`TryLock` 分布式锁 | Redis |
 | `examples/memcache` | JSON 缓存、TTL、Touch | Memcached（测试离线） |
 | `examples/kafka` | 生产者（同步/异步）+ 消费者循环 + 死信队列 | Kafka |
-| `examples/grpc` | gRPC 服务注册 + 客户端拨号（链路追踪自动跨进程传播） | 无 |
+| `examples/grpc` | gRPC 服务注册 + 客户端拨号；内置健康服务（`health`）/ reflection 开关；追踪自动跨进程传播 | 无 |
 | `examples/rpcx` | rpcx 服务注册 + 客户端调用（无 IDL，追踪自动传播） | 无 |
-| `examples/llm` | 统一 LLM 客户端：四协议互转 + 流式 + Jev 决策问答 | 无（假上游，离线） |
+| `examples/llm` | 统一 LLM 客户端：四协议互转 + 流式 + 可选重试 + Jev 决策问答 | 无（假上游，离线） |
 | `examples/feature` | 功能开关：配置 / 环境变量 / 运行时 `Set` 三层覆盖 | 无 |
 | `examples/audit` | 审计日志：谁对什么做了什么、结果如何，sink 可插拔 | 无 |
 
