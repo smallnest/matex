@@ -21,6 +21,9 @@ import (
 type Config struct {
 	Brokers  []string `json:"brokers" optional:""`
 	ClientID string   `json:"client_id" default:"matex"`
+	// DLQTopic is where RunConsumerDLQ parks messages the handler could not
+	// process. Empty disables the dead letter queue.
+	DLQTopic string `json:"dlq_topic" optional:""`
 }
 
 // Producer sends records. Create one per service and reuse it.
@@ -89,6 +92,9 @@ type Message struct {
 // Handler processes one message. Return an error to log-and-continue:
 // records are committed after the handler returns regardless (at-least
 // -once); retry semantics belong to the handler.
+//
+// RunConsumerDLQ intercepts the error instead: the message goes to the dead
+// letter queue before the batch is committed.
 type Handler func(ctx context.Context, m *Message) error
 
 // handle runs the handler, converting a panic into an error: a bug in one
@@ -105,7 +111,74 @@ func handle(ctx context.Context, h Handler, m *Message) (err error) {
 // RunConsumer consumes group/topics until ctx is cancelled. It commits
 // synchronously after each poll batch (commits survive shutdown by
 // using a detached context).
+//
+// A handler error is logged and the record is still committed: a poison
+// message must not wedge its partition. Use RunConsumerDLQ to keep such
+// messages instead of dropping them.
 func RunConsumer(ctx context.Context, cfg Config, group string, topics []string, h Handler) error {
+	return consume(ctx, cfg, group, topics, h, nil)
+}
+
+// DLQRecord is what RunConsumerDLQ writes to the dead letter topic: the
+// untouched message plus enough provenance to replay it.
+type DLQRecord struct {
+	SourceTopic     string    `json:"source_topic"`
+	SourcePartition int32     `json:"source_partition"`
+	SourceOffset    int64     `json:"source_offset"`
+	SourceTime      time.Time `json:"source_time"`
+	Key             []byte    `json:"key,omitempty"`
+	Value           []byte    `json:"value"`
+	Error           string    `json:"error"`
+}
+
+// RunConsumerDLQ is RunConsumer with a dead letter queue: when the handler
+// fails, the message is published to cfg.DLQTopic through dlq — with its
+// key, value and source coordinates — and only then is the batch
+// committed. An empty DLQTopic degrades to RunConsumer's log-and-continue;
+// dlq is then ignored and may be nil.
+//
+// If publishing to the DLQ itself fails, the message is logged and the
+// batch is still committed: blocking the partition forever on a broken DLQ
+// is worse than losing one record that was already logged.
+func RunConsumerDLQ(ctx context.Context, cfg Config, group string, topics []string, h Handler, dlq *Producer) error {
+	var deadLetter func(context.Context, *Message, error)
+	if cfg.DLQTopic != "" && dlq != nil {
+		deadLetter = func(c context.Context, m *Message, err error) {
+			deadLetterMessage(c, dlq, cfg.DLQTopic, m, err)
+		}
+	}
+	return consume(ctx, cfg, group, topics, h, deadLetter)
+}
+
+// deadLetterMessage publishes m to topic. It keeps the original key, so a
+// DLQ consumer preserving the partition order sees the same sequence.
+func deadLetterMessage(ctx context.Context, dlq *Producer, topic string, m *Message, cause error) {
+	rec := DLQRecord{
+		SourceTopic:     m.Topic,
+		SourcePartition: m.Partition,
+		SourceOffset:    m.Offset,
+		SourceTime:      m.Time,
+		Key:             m.Key,
+		Value:           m.Value,
+		Error:           cause.Error(),
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		obs.Error(ctx, "kafka: marshal dead letter", "topic", m.Topic, "offset", m.Offset, "err", err)
+		return
+	}
+	if err := dlq.SendSync(ctx, topic, m.Key, b); err != nil {
+		obs.Error(ctx, "kafka: dead letter publish failed; record is dropped",
+			"topic", m.Topic, "offset", m.Offset, "dlq", topic, "err", err)
+		return
+	}
+	obs.Warn(ctx, "kafka: message moved to the dead letter queue",
+		"dlq", topic, "topic", m.Topic, "partition", m.Partition, "offset", m.Offset)
+}
+
+// consume is the shared loop. deadLetter, when set, is called with every
+// handler error before the batch is committed.
+func consume(ctx context.Context, cfg Config, group string, topics []string, h Handler, deadLetter func(context.Context, *Message, error)) error {
 	if len(cfg.Brokers) == 0 {
 		return fmt.Errorf("kafka: brokers are required")
 	}
@@ -144,6 +217,9 @@ func RunConsumer(ctx context.Context, cfg Config, group string, topics []string,
 			if err := handle(ctx, h, m); err != nil {
 				obs.Error(ctx, "kafka: handle failed",
 					"topic", r.Topic, "partition", r.Partition, "offset", r.Offset, "err", err)
+				if deadLetter != nil {
+					deadLetter(ctx, m, err)
+				}
 			}
 		}
 		if len(records) > 0 {

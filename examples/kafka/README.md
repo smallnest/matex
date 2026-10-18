@@ -47,6 +47,13 @@ env.Block("consumer", func(ctx context.Context) error {
 - 起始位点是 `AtStart`（`ConsumeResetOffset`）：新组会把 topic 里的历史消息全部读一遍。
 - 幂等要自己做：at-least-once 意味着**可能重复**。用 key 去重或写库用唯一约束。
 
+### 死信队列
+
+`kafka.RunConsumerDLQ(ctx, cfg, group, topics, h, dlq)` 在 handler 返回 error 时，
+把消息以 `kafka.DLQRecord`（源 topic/partition/offset、key、value、error）写进
+`cfg.DLQTopic`，写完再提交本批。`DLQTopic` 为空时行为与 `RunConsumer` 相同。
+DLQ 消费者自己也是一个 `RunConsumer`，用它告警或重放。
+
 ## 何时不用 kafka
 
 只需要进程内解耦的话，一个带缓冲的 channel 就够了。引入 kafka 的门槛是：

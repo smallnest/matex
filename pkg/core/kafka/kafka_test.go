@@ -2,6 +2,8 @@ package kafka_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -213,5 +215,111 @@ func TestHandlerPanicDoesNotStopTheConsumer(t *testing.T) {
 	case <-second:
 	case <-ctx.Done():
 		t.Fatal("consumer died after a handler panic; later messages were never handled")
+	}
+}
+
+// TestRunConsumerDLQPacksFailedMessages: a handler error sends the record to
+// the dead letter topic with its provenance, while good records still flow.
+func TestRunConsumerDLQPacksFailedMessages(t *testing.T) {
+	const topic, dlqTopic = "t.dlq", "t.dlq.dead"
+	cl := newCluster(t, topic, dlqTopic)
+	cfg := kafka.Config{Brokers: cl.ListenAddrs(), DLQTopic: dlqTopic}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	dlq, err := kafka.NewProducer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(dlq.Close)
+
+	seen := make(chan string, 1)
+	go func() {
+		var ok int
+		_ = kafka.RunConsumerDLQ(ctx, cfg, "g-dlq", []string{topic},
+			func(_ context.Context, m *kafka.Message) error {
+				if string(m.Value) == "bad" {
+					return errors.New("cannot parse")
+				}
+				ok++
+				if ok == 2 {
+					seen <- "both good"
+				}
+				return nil
+			}, dlq)
+	}()
+	dead := consumeOne(ctx, t, cfg, "g-dlq-observer", dlqTopic)
+
+	p, err := kafka.NewProducer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	for _, v := range []string{"bad", "good-1", "good-2"} {
+		if err := p.SendSync(ctx, topic, []byte("k-"+v), []byte(v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	select {
+	case m := <-dead:
+		if string(m.Key) != "k-bad" {
+			t.Fatalf("DLQ key = %q, want the source key", m.Key)
+		}
+		var rec kafka.DLQRecord
+		if err := json.Unmarshal(m.Value, &rec); err != nil {
+			t.Fatalf("DLQ value is not a DLQRecord: %v (%s)", err, m.Value)
+		}
+		if rec.SourceTopic != topic || string(rec.Value) != "bad" || rec.Error != "cannot parse" {
+			t.Fatalf("DLQ record = %+v", rec)
+		}
+	case <-ctx.Done():
+		t.Fatal("the failed record never reached the DLQ")
+	}
+	select {
+	case <-seen:
+	case <-ctx.Done():
+		t.Fatal("the consumer stopped or the good records were lost")
+	}
+}
+
+// TestRunConsumerDLQWithoutTopicBehavesLikeRunConsumer: an empty DLQTopic
+// keeps the log-and-continue contract, so wiring DLQ in accidentally cannot
+// change a service's behavior.
+func TestRunConsumerDLQWithoutTopicBehavesLikeRunConsumer(t *testing.T) {
+	const topic = "t.dlq.off"
+	cl := newCluster(t, topic)
+	cfg := kafka.Config{Brokers: cl.ListenAddrs()}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	second := make(chan struct{}, 1)
+	go func() {
+		calls := 0
+		_ = kafka.RunConsumerDLQ(ctx, cfg, "g-dlq-off", []string{topic},
+			func(context.Context, *kafka.Message) error {
+				calls++
+				if calls == 1 {
+					return errors.New("first fails")
+				}
+				second <- struct{}{}
+				return nil
+			}, nil)
+	}()
+
+	p, err := kafka.NewProducer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	for _, v := range []string{"a", "b"} {
+		if err := p.SendSync(ctx, topic, nil, []byte(v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-second:
+	case <-ctx.Done():
+		t.Fatal("a handler error stopped the consumer")
 	}
 }

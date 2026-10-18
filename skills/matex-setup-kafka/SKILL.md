@@ -58,12 +58,34 @@ if s.cfg.Consume {
 
 handler 签名：`func(ctx context.Context, m *kafka.Message) error`。返回 error 会 log 并继续（至少一次语义；重试语义在 handler 内实现）。consumer 提交语义：每批 poll 后同步提交，关闭时用 detached context 兜底提交。
 
+### 死信队列（DLQ）
+
+handler 失败的"毒消息"要留证据、可重放时，用 `RunConsumerDLQ`：
+
+```yaml
+kafka:
+  brokers: ${KAFKA_BROKERS:localhost:9092}
+  dlq_topic: my.events.dlq      # 留空则不启用 DLQ
+```
+
+```go
+env.Block("my-consumer", func(ctx context.Context) error {
+	dlq, _ := env.RequireKafka() // 业务不必再建一个生产者
+	return kafka.RunConsumerDLQ(ctx, env.KafkaCfg, "my-group", []string{"my.events"}, s.foo.Handle, dlq)
+})
+```
+
+- 失败消息以 `kafka.DLQRecord` JSON（源 topic/partition/offset/时间、key、value、error）写入 `dlq_topic`，**原 key 保留**，写完才提交本批。
+- `dlq_topic` 为空时行为与 `RunConsumer` 完全一致（log 后提交）。
+- DLQ 自己也写不进去时：log error 并照常提交 —— 不能为了一条消息卡死整个 partition。
+- DLQ 消费者同样是一个 `RunConsumerDLQ`/`RunConsumer`，handler 里按需告警或重放。
+
 ## 约定
 
 - topic 名集中常量（如 `helloworld.TopicGreetings`）。
 - consumer group 名稳定、按服务命名（`<service>-<用途>`）。
 - `Send` 用于可丢事件（日志/通知），关键数据用 `SendSync`。
-- 消费者错误：可重试的自处理，不可重试的返回 error 让框架 log 后跳过。
+- 消费者错误：可重试的在 handler 内重试；不可重试的返回 error —— 配了 DLQ 就进死信 topic，否则框架 log 后跳过。
 
 ## 验证
 
