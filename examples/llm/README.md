@@ -47,6 +47,12 @@ for ev := range ch { /* EventText / EventToolCall / EventUsage / EventDone / Eve
 **等到响应头**（time-to-first-byte），响应体开始流动后由 `ctx` 决定何时结束——
 慢但持续的流不会被从中间截断，调用方仍可用自己的 deadline 限时。
 
+重试（默认关）：`llm.WithRetry(retry.Config{Attempts: 3})` 只重试"稍后再试"类失败——
+408/409/425/429/5xx 与传输错误，退避与抖动同 `pkg/core/retry`；400/401/403/404
+立即返回，不会白白多花 token。作用于 `Chat`、`ChatStream`（只重试建流那一次）和
+`Decide`；流到一半断开不重试（已收到的部分无法回滚）。重试耗尽返回最后一次的错误。
+注意：重试次数受 `ctx` 截止时间约束，两者一起设。
+
 ## 四种协议的转换
 
 - `Request.ToChat() / ToResponses() / ToAnthropic() / ToGemini()`：

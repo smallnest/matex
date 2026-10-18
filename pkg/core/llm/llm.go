@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/smallnest/matex/pkg/core/errs"
+	"github.com/smallnest/matex/pkg/core/retry"
 )
 
 // Protocol is a wire API the client can speak.
@@ -189,6 +190,7 @@ type Client struct {
 	maxTokens int
 	jevVia    JevVia
 	hc        *http.Client
+	retry     retry.Config // zero Attempts = one try
 }
 
 // Option configures a Client.
@@ -236,6 +238,16 @@ func WithMaxTokens(n int) Option { return func(c *Client) { c.maxTokens = n } }
 // WithJevVia sets how the System One API is asked: JevViaSystemOne (default),
 // JevViaVercelEval or JevViaCloudflare. See Decide.
 func WithJevVia(v JevVia) Option { return func(c *Client) { c.jevVia = v } }
+
+// WithRetry retries a call whose HTTP status means "try again later"
+// (408, 409, 425, 429, 5xx) or whose transport failed, with the same
+// bounded, jittered backoff pkg/core/retry uses. Non-retryable statuses
+// (400, 401, 403, 404, ...) return at once. Retrying is safe because a chat
+// completion is a read of the model, not a write. Attempts counts the first
+// try; Attempts <= 1 leaves the client without retries (the default).
+// Applies to Chat, ChatStream (the initial request only) and Decide; a
+// stream that breaks mid-body is not retried.
+func WithRetry(cfg retry.Config) Option { return func(c *Client) { c.retry = cfg } }
 
 // WithHTTPClient sets a custom HTTP client; its Timeout is left untouched.
 func WithHTTPClient(hc *http.Client) Option { return func(c *Client) { c.hc = hc } }
@@ -371,11 +383,40 @@ func (c *Client) post(ctx context.Context, path string, headers http.Header, bod
 }
 
 // postFor is post with a streaming flag: a stream is cut only by ctx, never by
-// http.Client.Timeout — a long stream is progress, not a stall.
+// http.Client.Timeout — a long stream is progress, not a stall. When retries
+// are configured, a transient failure (see retryable) is retried with the
+// same bounded, jittered backoff as pkg/core/retry; the request body is
+// rebuilt each time because http.NewRequest consumes the reader.
 func (c *Client) postFor(ctx context.Context, path string, headers http.Header, body []byte, stream bool) (*http.Response, error) {
 	if c.baseURL == "" {
 		return nil, errs.Invalid(0, "llm: base URL is required (WithBaseURL)")
 	}
+	if c.retry.Attempts <= 1 {
+		return c.sendOnce(ctx, path, headers, body, stream)
+	}
+	cfg := c.retry
+	cfg.Retryable = retryable
+	return retry.DoValue(ctx, cfg, func(ctx context.Context) (*http.Response, error) {
+		return c.sendOnce(ctx, path, headers, body, stream)
+	})
+}
+
+// retryable reports whether err is worth another attempt: a transport
+// failure or a status the upstream says is temporary.
+func retryable(err error) bool {
+	status, _, _ := errs.Status(err)
+	switch status {
+	case 0, // transport failure: the status is unknown, so the cause is unknown
+		http.StatusRequestTimeout, http.StatusConflict, http.StatusTooEarly,
+		http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// sendOnce performs one POST attempt.
+func (c *Client) sendOnce(ctx context.Context, path string, headers http.Header, body []byte, stream bool) (*http.Response, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, errs.InternalWrap(0, err, "llm: new request")

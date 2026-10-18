@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/smallnest/matex/pkg/core/errs"
+	"github.com/smallnest/matex/pkg/core/retry"
 )
 
 // The conversions are the wire contract: what a canonical Request becomes on
@@ -737,5 +738,101 @@ func TestStreamStillTimesOutWaitingForHeaders(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatalf("waited %v for headers", time.Since(start))
+	}
+}
+
+// ---- retries ----------------------------------------------------------------
+
+const okReply = `{"id":"r1","model":"m","choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`
+
+func fastRetry(attempts int) retry.Config {
+	return retry.Config{Attempts: attempts, BaseDelay: time.Millisecond, NoJitter: true}
+}
+
+// TestChatRetriesTransientStatus: a 503 from the upstream is answered by the
+// next attempt, and the caller sees the success, not the 503.
+func TestChatRetriesTransientStatus(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprint(w, "overloaded")
+			return
+		}
+		_, _ = fmt.Fprint(w, okReply)
+	}))
+	defer srv.Close()
+
+	c := New(WithBaseURL(srv.URL), WithModel("m"), WithRetry(fastRetry(3)))
+	resp, err := c.Chat(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if resp.Content != "hi" || calls != 2 {
+		t.Fatalf("content = %q, calls = %d; want hi after 2 calls", resp.Content, calls)
+	}
+}
+
+// TestChatDoesNotRetryClientErrors: a 400 is the caller's mistake; repeating
+// it wastes quota and time, so the first answer must be returned as is.
+func TestChatDoesNotRetryClientErrors(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, "bad request")
+	}))
+	defer srv.Close()
+
+	c := New(WithBaseURL(srv.URL), WithModel("m"), WithRetry(fastRetry(3)))
+	_, err := c.Chat(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "upstream 400") || strings.Contains(err.Error(), "llm: request failed") {
+		t.Fatalf("error = %v; want the upstream 400 itself, not a wrapper", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1", calls)
+	}
+}
+
+// TestChatWithoutRetryMakesOneCall: the zero retry config keeps the old
+// single-attempt behaviour.
+func TestChatWithoutRetryMakesOneCall(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	c := New(WithBaseURL(srv.URL), WithModel("m"))
+	if _, err := c.Chat(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}}); err == nil {
+		t.Fatal("expected an error")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1", calls)
+	}
+}
+
+// TestChatRetryStopsOnCancel: retries never outlive the caller's context.
+func TestChatRetryStopsOnCancel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	c := New(WithBaseURL(srv.URL), WithModel("m"),
+		WithRetry(retry.Config{Attempts: 5, BaseDelay: time.Second, NoJitter: true}))
+	start := time.Now()
+	if _, err := c.Chat(ctx, Request{Messages: []Message{{Role: "user", Content: "hi"}}}); err == nil {
+		t.Fatal("expected an error")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("retried past the deadline: %v", d)
 	}
 }
