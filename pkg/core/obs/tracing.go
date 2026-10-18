@@ -95,6 +95,10 @@ type TraceConfig struct {
 func InitTracing(ctx context.Context, service string, cfg TraceConfig) (shutdown func(context.Context) error, err error) {
 	if !cfg.Enabled {
 		setProvider(nil)
+		// Drop whatever propagator an earlier ON left behind: a stale W3C
+		// propagator would keep extracting caller traceparents even though
+		// this process no longer records spans.
+		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator())
 		return func(context.Context) error { return nil }, nil
 	}
 	if cfg.ExportTimeout <= 0 {
@@ -149,6 +153,31 @@ func traceSampler(ratio float64) sdktrace.Sampler {
 // instrumenting code never needs to check whether tracing is on.
 func StartSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
 	return Tracer().Start(ctx, name, trace.WithAttributes(attrs...))
+}
+
+// StartRPCSpan opens a span for a remote call, on either side of the wire
+// (SpanKindServer on the receiver, SpanKindClient on the caller). Call
+// Extract first with the metadata the peer sent, so the span joins the
+// peer's trace. Unlike StartHTTPSpan it does not gate on tracingEnabled():
+// with tracing off, Tracer() falls back to OpenTelemetry's global no-op
+// provider and this returns a no-op span, so gRPC/rpcx layers can call it
+// unconditionally.
+func StartRPCSpan(ctx context.Context, name string, kind trace.SpanKind, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	return Tracer().Start(ctx, name, trace.WithSpanKind(kind), trace.WithAttributes(attrs...))
+}
+
+// Extract rebuilds the trace context a caller propagated in an arbitrary
+// key-value carrier (gRPC metadata, rpcx metadata map). The carrier is
+// anything OpenTelemetry's TextMapPropagator can read.
+func Extract(ctx context.Context, carrier propagation.TextMapCarrier) context.Context {
+	return otel.GetTextMapPropagator().Extract(ctx, carrier)
+}
+
+// Inject writes the current trace context into an arbitrary key-value
+// carrier, for outgoing remote calls. Call it after StartSpan (or
+// StartRPCSpan) so the receiving side joins the same trace.
+func Inject(ctx context.Context, carrier propagation.TextMapCarrier) {
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
 }
 
 // StartHTTPSpan continues the caller's trace (reading the W3C traceparent

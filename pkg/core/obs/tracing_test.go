@@ -120,6 +120,67 @@ func TestHTTPPropagationRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRPCExtractInjectRoundTrip covers the gRPC/rpcx hop: a caller stamps
+// the trace into a key-value carrier and the receiver picks up the same
+// trace with the caller's span as parent.
+func TestRPCExtractInjectRoundTrip(t *testing.T) {
+	rec := installRecorder(t)
+
+	ctx, clientSpan := StartRPCSpan(context.Background(), "pkg.Svc/Method", trace.SpanKindClient)
+	out := propagation.MapCarrier{}
+	Inject(ctx, out)
+	if out.Get("traceparent") == "" {
+		t.Fatal("Inject wrote no traceparent")
+	}
+
+	got := Extract(context.Background(), out)
+	if SpanTraceID(got) != SpanTraceID(ctx) {
+		t.Fatalf("trace id changed across the hop: %q → %q", SpanTraceID(ctx), SpanTraceID(got))
+	}
+	_, serverSpan := StartRPCSpan(got, "pkg.Svc/Method", trace.SpanKindServer)
+	clientSpan.End()
+	serverSpan.End()
+
+	ended := rec.Ended()
+	if len(ended) != 2 {
+		t.Fatalf("recorded %d spans, want 2", len(ended))
+	}
+	var srv sdktrace.ReadOnlySpan
+	for _, s := range ended {
+		if s.SpanKind() == trace.SpanKindServer {
+			srv = s
+		}
+	}
+	if srv == nil {
+		t.Fatal("server span not recorded")
+	}
+	if srv.Parent().SpanID() != clientSpan.SpanContext().SpanID() {
+		t.Fatal("server span is not parented to the client span")
+	}
+}
+
+// TestRPCExtractContinuesInboundTrace: the receiver side joins the caller's
+// trace from a metadata carrier, exactly as a gRPC/rpcx server would.
+func TestRPCExtractContinuesInboundTrace(t *testing.T) {
+	rec := installRecorder(t)
+
+	in := propagation.MapCarrier{"traceparent": inboundHeader}
+	ctx := Extract(context.Background(), in)
+	if got := SpanTraceID(ctx); got != inboundTraceID {
+		t.Fatalf("trace id = %q, want %q", got, inboundTraceID)
+	}
+	_, span := StartRPCSpan(ctx, "Svc/M", trace.SpanKindServer)
+	span.End()
+
+	ended := rec.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("recorded %d spans", len(ended))
+	}
+	if ended[0].Parent().SpanID().String() != inboundSpanID {
+		t.Fatalf("parent span id = %q, want %q", ended[0].Parent().SpanID(), inboundSpanID)
+	}
+}
+
 func TestStartSpanNestsUnderTheRequestSpan(t *testing.T) {
 	rec := installRecorder(t)
 
@@ -179,6 +240,7 @@ func TestTraceIDPrefersTheActiveSpan(t *testing.T) {
 // again.
 func TestInitTracingDisabledIsNoop(t *testing.T) {
 	setProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(tracetest.NewSpanRecorder())))
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}))
 
 	shutdown, err := InitTracing(context.Background(), "svc", TraceConfig{})
 	if err != nil {
@@ -192,6 +254,9 @@ func TestInitTracingDisabledIsNoop(t *testing.T) {
 	defer span.End()
 	if SpanTraceID(ctx) != "" {
 		t.Fatal("tracing is disabled but spans are still being created")
+	}
+	if got := otel.GetTextMapPropagator().Fields(); len(got) != 0 {
+		t.Fatalf("propagator survived the reset: %v", got)
 	}
 }
 

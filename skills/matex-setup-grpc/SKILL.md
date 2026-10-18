@@ -55,6 +55,7 @@ func (s *DemoService) Setup(ctx context.Context, env *verticle.Env) error {
 - 服务内通信默认**明文**（insecure，集群内网）。要 TLS 时给 `env.GRPCClient` 传 `grpc.WithTransportCredentials(...)`。
 - `RegisterGRPC` 只在 `grpc.addr` 非空时被调用；未实现该接口则打 warning。
 - client 连接在 `Setup` 里初始化（fail-fast：`grpc.dial_timeout` 内连不上就启动失败）。
+- **链路追踪自动生效**：unary 与 stream 都内置 `traceparent` 传播，业务代码零改动；要加自己的 unary 拦截器请用 `grpc.ChainUnaryInterceptor` 组合，避免替换掉内置的追踪拦截器。
 
 ## 验证
 

@@ -32,12 +32,17 @@ type Server struct {
 }
 
 // New creates a server. It does not bind until Serve is called.
+//
+// Trace propagation is always wired in; it is a no-op unless obs tracing is
+// enabled, so business code does nothing.
 func New(cfg Config) *Server {
 	network := cfg.Network
 	if network == "" {
 		network = "tcp"
 	}
-	return &Server{srv: rpcxserver.NewServer(), network: network, addr: cfg.Addr}
+	srv := rpcxserver.NewServer()
+	srv.Plugins.Add(tracePlugin{})
+	return &Server{srv: srv, network: network, addr: cfg.Addr}
 }
 
 // RPCX exposes the underlying server for service registration.
@@ -74,6 +79,11 @@ func PeerClient(servicePath, target string) (rpcxclient.XClient, error) {
 
 // NewClient creates a client with a custom discovery (etcd, consul,
 // multiple servers, ...). The caller owns the returned client's lifecycle.
+//
+// The returned client stamps the trace context onto each call's metadata
+// (a no-op unless obs tracing is enabled).
 func NewClient(servicePath string, d rpcxclient.ServiceDiscovery) rpcxclient.XClient {
-	return rpcxclient.NewXClient(servicePath, rpcxclient.Failtry, rpcxclient.RandomSelect, d, rpcxclient.DefaultOption)
+	return &traceXClient{
+		XClient: rpcxclient.NewXClient(servicePath, rpcxclient.Failtry, rpcxclient.RandomSelect, d, rpcxclient.DefaultOption),
+	}
 }

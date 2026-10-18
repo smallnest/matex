@@ -288,6 +288,11 @@ func WithConf(path string) Option {
 func WithoutConfigWatch() Option { return func(o *options) { o.noWatch = true } }
 
 // Run drives the whole service lifecycle. It blocks until shutdown.
+//
+// Cross-process trace propagation is automatic for every server and client
+// Run wires: HTTP (via obs), gRPC (grpcx interceptors) and rpcx (a server
+// plugin plus a client wrapper) all continue the caller's W3C trace context
+// and are no-ops unless obs tracing is enabled.
 func Run(ctx context.Context, svc Service, opts ...Option) error {
 	var o options
 	for _, fn := range opts {

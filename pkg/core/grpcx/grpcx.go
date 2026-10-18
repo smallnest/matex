@@ -35,11 +35,20 @@ type Server struct {
 
 // New creates a server listening on cfg.Addr. The server does not start
 // serving until Serve is called.
+//
+// Trace propagation (unary + stream) is always wired in; it is a no-op
+// unless obs tracing is enabled. Pass extra ServerOptions to add your own
+// interceptors — use grpc.ChainUnaryInterceptor so they compose with the
+// tracing one instead of replacing it.
 func New(cfg Config, opts ...grpc.ServerOption) (*Server, error) {
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("grpcx: listen %s: %w", cfg.Addr, err)
 	}
+	opts = append(opts,
+		grpc.ChainUnaryInterceptor(traceUnaryServer),
+		grpc.ChainStreamInterceptor(traceStreamServer),
+	)
 	return &Server{grpc: grpc.NewServer(opts...), ln: ln}, nil
 }
 
@@ -76,8 +85,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // Dial connects to target, blocking until the connection is READY or
 // ctx expires (fail-fast at startup). The caller owns the returned conn.
+//
+// Trace propagation (unary + stream) is always wired in; it is a no-op
+// unless obs tracing is enabled. A caller-supplied unary interceptor is
+// composed (it runs outside the tracing one); use grpc.ChainUnaryInterceptor
+// for predictable ordering.
 func Dial(ctx context.Context, target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
-	all := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, opts...)
+	all := append([]grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(traceUnaryClient),
+		grpc.WithChainStreamInterceptor(traceStreamClient),
+	}, opts...)
 	conn, err := grpc.NewClient(target, all...)
 	if err != nil {
 		return nil, fmt.Errorf("grpcx: dial %s: %w", target, err)

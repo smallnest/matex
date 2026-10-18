@@ -53,6 +53,17 @@ span 续接同一条链路。
 不用改任何日志调用。开了 tracing 后 `obs.TraceID(ctx)` 返回的是当前 span 的 trace id
 （32 位 hex），日志里的 `trace_id` 字段自动跟着变，可以直接拿去追踪后端查。
 
+### 5. gRPC / rpcx 自动传播（无需任何业务代码）
+
+`grpcx`（unary + stream 拦截器）与 `rpcx`（服务端 plugin + 客户端包装）都已内置
+traceparent 传播，接上之后**跨进程链路自动续接**：
+
+- 服务端：`grpcx.New` / `rpcx.New` 会自动提取入站 `traceparent`，开一个 `SpanKindServer`
+  span，并把它挂在 `rpc.system`/`rpc.method` 属性上。
+- 客户端：`env.GRPCClient` / `env.RPCXClient` / `env.RPCXClientWith` 返回的客户端在每次
+  调用时会自动开 `SpanKindClient` span 并注入 `traceparent`。
+- 关闭 tracing 时全部是 no-op，业务代码不用写任何条件。
+
 ## 约定（必须遵守）
 
 - **span 名用低基数**：`"thing.load"`、路由模板，不要拼具体 id/路径。每个 URL 一个
@@ -70,6 +81,7 @@ span 续接同一条链路。
 | 日志里有 trace_id，但追踪后端查不到 | `endpoint` 没配，或 collector 地址不通 |
 | 下游服务的 span 是新的根链路 | 调下游时漏了 `obs.InjectHTTP`，或没把 ctx 传进 request |
 | 子 span 和父 span 平级 | `StartSpan` 返回的 ctx 被丢掉了，仍用旧 ctx |
+| rpcx handler 里的子 span 不挂在 RPC span 下 | OTel 的 span ctx 键无法从外部写入；跨进程 client→server 父子链仍完整 |
 | 关了 tracing 后日志 trace_id 变成 8 位 | 正常：回落到 `X-Request-ID` 生成值 |
 
 ## 验证
