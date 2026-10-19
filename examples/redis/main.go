@@ -1,5 +1,5 @@
-// Command redis demonstrates pkg/core/redis: cache-aside with JSON values
-// and a best-effort distributed lock.
+// Command redis demonstrates pkg/core/redis: cache-aside with JSON values,
+// a blocking reentrant Lock, and the one-shot TryLock.
 //
 // Redis must be running (make dev). A configured `redis:` section is
 // created by verticle.Run and read in Setup with the comma-ok accessor
@@ -13,7 +13,8 @@
 //	curl -i localhost:8080/api/v1/cache/world          # 第一次 miss，第二次 hit
 //	curl -i localhost:8080/api/v1/cache/world
 //	curl -i -X DELETE localhost:8080/api/v1/cache/world
-//	curl -i -X POST localhost:8080/api/v1/lock/job1     # 并发两个，第二个 409
+//	curl -i -X POST localhost:8080/api/v1/lock/job1     # 阻塞等待 + 重入 + 续租
+//	curl -i -X POST localhost:8080/api/v1/trylock/job1  # 一次尝试，忙则 409
 package main
 
 import (
@@ -33,10 +34,12 @@ import (
 )
 
 type redisConfig struct {
-	Prefix  string        `json:"prefix" default:"example:"`
-	TTL     time.Duration `json:"ttl" default:"30s"`
-	LockTTL time.Duration `json:"lock_ttl" default:"5s"`
-	Hold    time.Duration `json:"hold" default:"100ms"`
+	Prefix      string        `json:"prefix" default:"example:"`
+	TTL         time.Duration `json:"ttl" default:"30s"`
+	LockTTL     time.Duration `json:"lock_ttl" default:"5s"`
+	WaitTimeout time.Duration `json:"wait_timeout" default:"2s"`
+	Watchdog    time.Duration `json:"watchdog" default:"1s"`
+	Hold        time.Duration `json:"hold" default:"100ms"`
 }
 
 type redisService struct {
@@ -62,6 +65,7 @@ func (s *redisService) BuildRouter(srv *httpx.Server) error {
 	srv.Handle("GET", "/api/v1/cache/{key}", s.get)
 	srv.Handle("DELETE", "/api/v1/cache/{key}", s.delete)
 	srv.Handle("POST", "/api/v1/lock/{name}", s.lock)
+	srv.Handle("POST", "/api/v1/trylock/{name}", s.tryLock)
 	return nil
 }
 
@@ -111,9 +115,54 @@ func (s *redisService) delete(ctx context.Context, r *http.Request) (any, error)
 	return map[string]any{"key": key, "deleted": true}, nil
 }
 
-// lock runs a short critical section under TryLock. The lock carries a
-// TTL, so a holder that crashes cannot deadlock everyone else.
+// lock runs a short critical section under a blocking Lock: it waits up to
+// WaitTimeout for the key, re-arms its lease with a watchdog, and counts a
+// nested acquire to show reentrancy in the response body.
 func (s *redisService) lock(ctx context.Context, r *http.Request) (any, error) {
+	name := r.PathValue("name")
+	if name == "" {
+		return nil, errs.Invalid(40001, "name is required")
+	}
+	key := s.cfg.Prefix + "lock:" + name
+
+	l, err := s.rc.Lock(ctx, key,
+		redis.WithLockTTL(s.cfg.LockTTL),
+		redis.WithWaitTimeout(s.cfg.WaitTimeout),
+		redis.WithWatchdog(s.cfg.Watchdog),
+	)
+	if errors.Is(err, redis.ErrLockBusy) {
+		// The wait budget ran out: the caller may retry, queue, or give up.
+		return nil, errs.Conflict(40901, "lock %q is held by someone else", name)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = l.Release(ctx) }()
+
+	// Reentrancy: this nested Lock returns the same lease at once instead
+	// of waiting behind itself; its Release drops one of the two levels.
+	inner, err := s.rc.Lock(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = inner.Release(ctx) }()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-l.Lost():
+		// The watchdog noticed the lease lapsed (failover or a long pause).
+		return nil, errs.Internal(50001, "lease on %q was lost", name)
+	case <-time.After(s.cfg.Hold):
+	}
+
+	obs.Info(ctx, "critical section done", "lock", name, "held", l.Held())
+	return map[string]any{"acquired": true, "held": l.Held(), "hold_ms": s.cfg.Hold.Milliseconds()}, nil
+}
+
+// tryLock is the one-shot contrast to lock: a single SETNX attempt, no
+// wait, no reentrancy. It suits a caller that would rather skip than queue.
+func (s *redisService) tryLock(ctx context.Context, r *http.Request) (any, error) {
 	name := r.PathValue("name")
 	if name == "" {
 		return nil, errs.Invalid(40001, "name is required")
@@ -124,16 +173,12 @@ func (s *redisService) lock(ctx context.Context, r *http.Request) (any, error) {
 		return nil, err
 	}
 	if !ok {
-		// Let the caller decide: retry, queue, or give up.
 		return nil, errs.Conflict(40901, "lock %q is held by someone else", name)
 	}
 	defer func() { _ = release(ctx) }()
 
-	start := time.Now()
 	time.Sleep(s.cfg.Hold) // stand-in for the real critical section
-	obs.Info(ctx, "critical section done", "lock", name, "hold_ms", time.Since(start).Milliseconds())
-
-	return map[string]any{"acquired": true, "hold_ms": time.Since(start).Milliseconds()}, nil
+	return map[string]any{"acquired": true, "hold_ms": s.cfg.Hold.Milliseconds()}, nil
 }
 
 func main() {

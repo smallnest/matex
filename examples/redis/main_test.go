@@ -1,9 +1,13 @@
 package main
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
+
+	"github.com/smallnest/matex/pkg/core/redis"
 	"github.com/smallnest/matex/pkg/core/redistest"
 )
 
@@ -13,9 +17,22 @@ import (
 func newTestService(t *testing.T) *redisService {
 	t.Helper()
 	return &redisService{
-		cfg: redisConfig{Prefix: "t:", TTL: time.Minute, LockTTL: time.Minute, Hold: time.Millisecond},
+		cfg: redisConfig{Prefix: "t:", TTL: time.Minute, LockTTL: time.Minute, WaitTimeout: 2 * time.Second, Watchdog: time.Second, Hold: time.Millisecond},
 		rc:  redistest.Start(t),
 	}
+}
+
+// twoClients is for contention tests: redistest.Start would hand out two
+// different miniredis servers, so both clients must share one Addr.
+func twoClients(t *testing.T) (first, second *redis.Client) {
+	t.Helper()
+	addr := redistest.Addr(t)
+	open := func() *redis.Client {
+		g := goredis.NewClient(&goredis.Options{Addr: addr})
+		t.Cleanup(func() { _ = g.Close() })
+		return redis.New(g)
+	}
+	return open(), open()
 }
 
 func TestCacheAside(t *testing.T) {
@@ -83,5 +100,98 @@ func TestTryLockIsExclusive(t *testing.T) {
 	}
 	if err := release2(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLockReentrant(t *testing.T) {
+	svc := newTestService(t)
+	ctx := t.Context()
+	key := svc.cfg.Prefix + "lock:r"
+
+	a, err := svc.rc.Lock(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := svc.rc.Lock(ctx, key) // same client nests instead of waiting
+	if err != nil {
+		t.Fatalf("reentrant acquire: %v", err)
+	}
+	if n := a.Held(); n != 2 {
+		t.Fatalf("Held() = %d, want 2", n)
+	}
+	if err := a.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := svc.rc.Cmdable().Exists(ctx, "lock:"+key).Val(); n != 1 {
+		t.Fatal("first release deleted a nested lock")
+	}
+	if err := b.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := svc.rc.Cmdable().Exists(ctx, "lock:"+key).Val(); n != 0 {
+		t.Fatal("last release left the key behind")
+	}
+}
+
+func TestLockBlocksUntilReleased(t *testing.T) {
+	a, b := twoClients(t)
+	ctx := t.Context()
+	key := "t:lock:b"
+
+	h, err := a.Lock(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Release(ctx)
+
+	acquired := make(chan struct{})
+	go func() {
+		l, err := b.Lock(ctx, key, redis.WithWaitTimeout(2*time.Second))
+		if err != nil {
+			t.Errorf("waiter acquire: %v", err)
+			return
+		}
+		close(acquired)
+		_ = l.Release(ctx)
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("waiter acquired a held lock")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter never acquired after release")
+	}
+}
+
+func TestLockRenewsLease(t *testing.T) {
+	a, b := twoClients(t)
+	ctx := t.Context()
+	key := "t:lock:w"
+
+	l, err := a.Lock(ctx, key, redis.WithLockTTL(300*time.Millisecond), redis.WithWatchdog(200*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release(ctx)
+
+	// Hold well past the TTL: the watchdog re-arms the lease, so the key
+	// outlives it and no outsider may slip in.
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if n := a.Cmdable().Exists(ctx, "lock:"+key).Val(); n != 1 {
+			t.Fatal("lock key vanished while the watchdog was renewing")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, err := b.Lock(ctx, key, redis.WithWaitTimeout(50*time.Millisecond)); !errors.Is(err, redis.ErrLockBusy) {
+		t.Fatalf("outsider acquired a renewed lock: %v", err)
 	}
 }

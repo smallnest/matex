@@ -1,7 +1,7 @@
 # redis — 缓存与分布式锁
 
 `pkg/core/redis` 包住 go-redis：`Open` 会 ping 一次（连不上就在启动时失败），
-并提供 JSON 读写与 `TryLock`。业务代码不直接 import go-redis。
+并提供 JSON 读写、阻塞可重入的 `Lock` 与一次性 `TryLock`。业务代码不直接 import go-redis。
 
 ## 运行
 
@@ -13,8 +13,10 @@ curl -i localhost:8080/api/v1/cache/world          # cached=false（miss，回�
 curl -i localhost:8080/api/v1/cache/world          # cached=true
 curl -i -X DELETE localhost:8080/api/v1/cache/world
 
-# 并发的两个请求，第二个 409
+# 阻塞等待（wait_timeout 内没拿到就 409）+ 重入 + 看门狗续租
 curl -i -X POST localhost:8080/api/v1/lock/job1 & curl -i -X POST localhost:8080/api/v1/lock/job1
+# 一次尝试，忙则立即 409
+curl -i -X POST localhost:8080/api/v1/trylock/job1 & curl -i -X POST localhost:8080/api/v1/trylock/job1
 
 go test ./examples/redis       # 用 miniredis，离线可跑
 ```
@@ -33,7 +35,7 @@ return e.Value, false, nil
 注意 **`GetJSON` 是包级泛型函数**（`redis.GetJSON[T](ctx, c, key)`），`SetJSON` 是方法。
 `ok=false` 表示 miss；`err` 表示 redis 出错或内容损坏——**要不要把损坏当 miss 是你自己的策略**。
 
-## 分布式锁
+## 分布式锁：TryLock（一次性）
 
 ```go
 release, ok, err := rc.TryLock(ctx, key, ttl)
@@ -44,7 +46,34 @@ defer release(ctx)     // 只有仍持有锁时才会删 key（Lua 校验 token�
 
 - 锁是**带 TTL 的 SETNX**：持有者崩了会自动释放，不会死锁。
 - `release` 用 Lua 比对 token 再删，避免"锁过期后被别人拿到，自己却把它删了"。
-- 需要"必须拿到锁"时自己重试；`TryLock` 只做一次尝试。
+- `TryLock` 只做一次尝试，用在你"宁可跳过也不排队"的场景。
+
+## 分布式锁：Lock（阻塞 + 重入 + 续租）
+
+```go
+l, err := rc.Lock(ctx, key,
+    redis.WithLockTTL(5*time.Second),    // 租期
+    redis.WithWaitTimeout(2*time.Second),// 阻塞等待上限，超时返回 ErrLockBusy
+    redis.WithWatchdog(time.Second),      // 看门狗每 watchdog/3 续租一次
+)
+if errors.Is(err, redis.ErrLockBusy) { /* 409 */ }
+defer l.Release(ctx)
+
+// 重入：同一个客户端再次 Lock 同一个 key，立即返回同一个 l，计数 +1
+inner, _ := rc.Lock(ctx, key)
+defer inner.Release(ctx)   // 每层 Lock 对应一层 Release
+
+<-l.Lost()                 // 租约丢失（failover / 长暂停）时被关闭
+```
+
+- **阻塞等待**：忙时排进 Redis 里的 FIFO 队列，队头才有资格抢；`WithWaitTimeout`
+  到期或 ctx 取消会离队并返回。
+- **可重入**：同一个 `*Client` 对同一个 key 再次 `Lock` 是重入而非自等；
+  `Held()` 返回当前层数，每层 `Lock` 对应一次 `Release`。
+- **自动续租**：`WithWatchdog` 打开后看门狗每 `watchdog/3` 续租，临界区可比
+  `LockTTL` 长；续租失败时 `Lost()` 关闭、`Renew` 返回 `ErrLockLost`。
+- 锁在 Redis 里的实际 key 是 `lock:<key>`，和一个 `<key>:queue` 等待队列，
+  与 `TryLock`（直接用原始 key）互不干扰。
 
 ## key 设计
 

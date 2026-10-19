@@ -6,6 +6,7 @@ package redis
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -130,32 +131,6 @@ func (c *Client) Claim(ctx context.Context, key string, ttl time.Duration) (bool
 	return ok, nil
 }
 
-// TryLock acquires a best-effort distributed lock. The returned release
-// function deletes the key only if the caller still owns it; the lock
-// self-expires after ttl, so a crashed holder cannot deadlock others.
-//
-//	ok is false when someone else holds the lock — retry or skip.
-func (c *Client) TryLock(ctx context.Context, key string, ttl time.Duration) (release func(context.Context) error, ok bool, err error) {
-	token := randomToken()
-	ok, err = c.c.SetNX(ctx, key, token, ttl).Result()
-	if err != nil || !ok {
-		return nil, false, err
-	}
-	return func(ctx context.Context) error {
-		if err := releaseScript.Run(ctx, c.c, []string{key}, token).Err(); err != nil {
-			return fmt.Errorf("redis: release %s: %w", key, err)
-		}
-		return nil
-	}, true, nil
-}
-
-// releaseScript deletes the lock only when the token still matches.
-var releaseScript = goredis.NewScript(`if redis.call("get", KEYS[1]) == ARGV[1] then
-	return redis.call("del", KEYS[1])
-else
-	return 0
-end`)
-
 // Script is a reusable Lua script. Wrap atomic read-modify-write sequences
 // that a helper API cannot express in one round trip — counters, sliding
 // windows, compare-and-set.
@@ -199,4 +174,12 @@ func randomToken() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
+}
+
+// randomToken64 is randomToken as a number; lock.go uses its base-36 form
+// as the per-wait ticket suffix so two waiters on one client never collide.
+func randomToken64() uint64 {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return binary.BigEndian.Uint64(b[:])
 }

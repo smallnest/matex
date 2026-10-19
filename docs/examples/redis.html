@@ -6,7 +6,7 @@
 		<title>redis — 缓存读写与分布式锁 — matex</title>
 		<meta
 			name="description"
-			content="examples/redis：用 pkg/core/redis 做 cache-aside 读写与带 TTL 的 TryLock 分布式锁。"
+			content="examples/redis：用 pkg/core/redis 做 cache-aside 读写，以及阻塞可重入、自动续租的分布式锁。"
 		/>
 		<link rel="stylesheet" href="../assets/site.css" />
 	</head>
@@ -16,8 +16,9 @@
 			<h1>redis — 缓存读写与分布式锁</h1>
 			<p class="lede">
 				<code>pkg/core/redis</code> 包住 go-redis：<code>Open</code> 先 ping 一次，
-				连不上就在启动时失败；业务代码拿到的是两个 JSON 读写入口和一个带 TTL 的分布式锁，
-				不需要 import go-redis。本示例把这两件事各做成一个 HTTP 端点。
+				连不上就在启动时失败；业务代码拿到的是两个 JSON 读写入口、一把阻塞可重入的
+				<code>Lock</code>，和一次性 <code>TryLock</code>，不需要 import go-redis。
+				本示例把缓存、阻塞锁、一次性锁各做成一个 HTTP 端点。
 			</p>
 
 			<h2>运行</h2>
@@ -40,10 +41,14 @@ go run ./examples/redis       # 等价于 make example NAME=redis</code></pre>
 				<li><b>命中与未命中的区分</b>：<code>GetJSON</code> 用 <code>ok</code> 报告 miss，
 					<b>不是一个错误</b>。</li>
 				<li><b>写后失效</b>：<code>DELETE</code> 删 key，下一次读会重新回填。</li>
-				<li><b>带 TTL 的分布式锁</b>：<code>TryLock</code> 是带过期时间的 SETNX，
-					持有者崩了也能自动释放，不会死锁。</li>
-				<li><b>锁被占用时的语义</b>：第二个并发请求拿到 <code>ok=false</code>，
-					映射成 <code>409</code>，由调用方决定重试、排队还是放弃。</li>
+				<li><b>阻塞获取</b>：<code>Lock</code> 忙时排进 FIFO 队列，<code>WithWaitTimeout</code>
+					到时返回 <code>ErrLockBusy</code>，映射成 <code>409</code>。</li>
+				<li><b>可重入</b>：同一个客户端对同一个 key 再 <code>Lock</code> 立即返回同一把锁，
+					计数 +1，而不是等自己释放。</li>
+				<li><b>自动续租</b>：<code>WithWatchdog</code> 每 <code>watchdog/3</code> 续租，
+					临界区可比 <code>LockTTL</code> 长；续租失败关闭 <code>Lost()</code>。</li>
+				<li><b>一次性 TryLock</b>：带 TTL 的 SETNX，<code>ok=false</code> 即 409，
+					适合"宁可跳过也不排队"。</li>
 			</ul>
 
 			<h2>缓存：cache-aside 回填</h2>
@@ -69,9 +74,61 @@ go run ./examples/redis       # 等价于 make example NAME=redis</code></pre>
 	return e.Value, false, nil
 }</code></pre>
 
-			<h2>锁：带 TTL 的 TryLock</h2>
+			<h2>锁：阻塞可重入的 Lock</h2>
 			<p>
-				来自同一文件的 <code>lock</code> 处理器。<code>TryLock</code> 只做一次尝试，
+				来自同一文件的 <code>lock</code> 处理器。它用 <code>Lock</code> 阻塞等待取锁，
+				打开看门狗续租，并在临界区内<b>再调用一次</b> <code>Lock</code> 展示重入——
+				第二次拿到的是同一把锁，计数 +1，而不是等自己释放。
+			</p>
+			<pre><code class="language-go">l, err := s.rc.Lock(ctx, key,
+	redis.WithLockTTL(s.cfg.LockTTL),
+	redis.WithWaitTimeout(s.cfg.WaitTimeout),
+	redis.WithWatchdog(s.cfg.Watchdog),
+)
+if errors.Is(err, redis.ErrLockBusy) {
+	return nil, errs.Conflict(40901, "lock %q is held by someone else", name)
+}
+defer func() { _ = l.Release(ctx) }()
+
+// 重入：同一客户端再 Lock 同一 key，立即返回同一个 l
+inner, _ := s.rc.Lock(ctx, key)     // 计数 +1
+defer func() { _ = inner.Release(ctx) }() // 每层 Lock 对应一层 Release
+
+select {
+case &lt;-ctx.Done():
+case &lt;-l.Lost():        // 看门狗发现租约丢失
+case &lt;-time.After(s.cfg.Hold):      // 临界区（示例 sleep）
+}</code></pre>
+
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+sequenceDiagram
+    participant A as 持有者 A
+    participant B as 等待者 B
+    participant R as redis
+    A->>R: Lock: SET lock:k &lt;tokenA&gt;\n1
+    R-->>A: 拿到锁
+    B->>R: Lock: 入队 lock:k:queue（ticket B）
+    opt 看门狗开启
+        loop 每 watchdog/3
+            A->>R: Renew（PEXPIRE 锁与队列）
+        end
+    end
+    A->>A: 重入 Lock（计数 2）
+    A->>A: Release（计数 1，key 仍在）
+    A->>R: Release（最后一层，DEL 锁，保留队列）
+    B->>R: 队头轮询：取锁、出队、续队列
+    R-->>B: 拿到锁
+				</pre>
+				<figcaption>
+				Lock 的生命周期。等待者排进 FIFO 队列，只有队头能抢；看门狗续租时同步
+				刷新队列 TTL；持有者最后一层 Release 只删锁、保留队列，队头接替。
+				</figcaption>
+			</figure>
+
+			<h2>TryLock：一次性尝试</h2>
+			<p>
+				来自同一文件的 <code>tryLock</code> 处理器。<code>TryLock</code> 只做一次尝试，
 				返回的 <code>release</code> 用 Lua 比对 token 再删 key——这样即使锁已经过期、
 				别人拿到了它，也不会误删。
 			</p>
@@ -85,36 +142,20 @@ if !ok {
 }
 defer func() { _ = release(ctx) }()</code></pre>
 
-			<figure class="mermaid-figure">
-				<pre class="mermaid">
-sequenceDiagram
-    participant C as 调用方
-    participant L as redis（锁 key）
-    participant K as 临界区
-    C->>L: SETNX lock:job1 &lt;token&gt; TTL=5s
-    L-->>C: ok=true（拿到锁）
-    C->>K: 执行临界区（示例 hold=100ms）
-    Note over L: 若持有者崩溃，5s 后 key 自动过期
-    C->>L: Lua: get==token? del : 0
-    L-->>C: 释放（或已被别人持有而不删）
-				</pre>
-				<figcaption>
-					TryLock 的生命周期。TTL 保证崩溃不导致死锁；release 用 Lua 校验 token，
-					避免删掉别人的锁。
-				</figcaption>
-			</figure>
-
 			<h2>验证</h2>
 			<pre><code class="language-bash">curl -i localhost:8080/api/v1/cache/world          # cached=false（miss，回填）
 curl -i localhost:8080/api/v1/cache/world          # cached=true
 curl -i -X DELETE localhost:8080/api/v1/cache/world
 
-# 并发的两个请求，第二个 409
-curl -i -X POST localhost:8080/api/v1/lock/job1 &amp; curl -i -X POST localhost:8080/api/v1/lock/job1</code></pre>
+# Lock：等待后接替，响应里 held=2（重入计数）
+curl -i -X POST localhost:8080/api/v1/lock/job1 &amp; curl -i -X POST localhost:8080/api/v1/lock/job1
+# TryLock：一次性，忙则立即 409
+curl -i -X POST localhost:8080/api/v1/trylock/job1 &amp; curl -i -X POST localhost:8080/api/v1/trylock/job1</code></pre>
 			<p>
 				命中与未命中以 <code>{"code":0,"msg":"ok","data":{"cached":true,"key":"world","value":"computed:world"}}</code>
-				的封套返回；<code>GET</code> 命中、<code>DELETE</code> 返回
-				<code>{"key":"world","deleted":true}</code>。锁被占用时是
+				的封套返回；<code>DELETE</code> 返回 <code>{"key":"world","deleted":true}</code>。
+				<code>Lock</code> 拿到锁时 <code>data.held=2</code>；等待超时或
+				<code>TryLock</code> 遇到占用，都是
 				<code>409 {"code":40901,"msg":"lock \"job1\" is held by someone else"}</code>。
 			</p>
 
@@ -123,9 +164,10 @@ curl -i -X POST localhost:8080/api/v1/lock/job1 &amp; curl -i -X POST localhost:
 				<code>main_test.go</code> 用 <code>redistest.Start(t)</code> 拿到一个由进程内
 				miniredis 支撑的真实 <code>*redis.Client</code>（也可以用
 				<code>REDIS_TEST_ADDR</code> 指向真服务器），因此测试<b>不需要 Docker</b>。
-				它钉住三件事：第一次读必然 miss 且值是 <code>computed:k</code>、第二次读必然命中；
-				删除后重新 miss；同一把锁第二次 <code>TryLock</code> 必然 <code>ok=false</code>，
-				释放后又能拿到。
+				它钉住：第一次读必然 miss 且值是 <code>computed:k</code>、第二次读必然命中；
+				删除后重新 miss；<code>Lock</code> 重入计数为 2 且释放两次后 key 消失；阻塞
+				等待者在持有者释放后拿到锁；开着看门狗时租约越过 TTL，外人仍拿不到；以及
+				同一把锁第二次 <code>TryLock</code> 必然 <code>ok=false</code>。
 			</p>
 			<pre><code class="language-bash">go test ./examples/redis</code></pre>
 

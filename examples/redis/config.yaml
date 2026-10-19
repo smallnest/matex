@@ -18,5 +18,7 @@ redis:
 rediscache:
   prefix: "example:"     # key 前缀，方便和别的应用共用实例
   ttl: 30s               # 缓存 TTL
-  lock_ttl: 5s           # 锁的自动过期时间（持锁进程崩了也不会死锁）
+  lock_ttl: 5s           # 锁的租期（看门狗续租，临界区可比它长）
+  wait_timeout: 2s       # Lock 阻塞等待的上限，超时返回 409
+  watchdog: 1s           # 看门狗间隔（实际续租按 watchdog/3 跑）
   hold: 100ms            # 模拟临界区的耗时
