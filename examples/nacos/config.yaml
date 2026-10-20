@@ -1,0 +1,38 @@
+# examples/nacos 的配置。
+#
+# 本地文件是底座，Nacos 只覆盖它有的键。`nacos:` 段本身只能放在文件里：
+# 它决定去哪里找配置中心。
+#
+# 先去 Nacos 控制台（默认 localhost:8848，账号 nacos/nacos）建好：
+#   namespace  demo
+#   group      DEMO
+#   data_id    matex.yaml   ← 框架段（http / log / db / redis …）
+#   data_id    demo.yaml    ← 服务段（本示例的 greeting）
+# 都不存在时启动直接失败，而不是悄悄按空配置跑起来。
+
+http:
+  addr: ":8080"
+  timeout: 5s
+
+log:
+  level: info
+
+nacos:
+  server_addr: ${NACOS_ADDR:localhost:8848}   # 逗号分隔多个地址，可带 https://
+  namespace: demo                              # namespace id（不是名字）
+  group: DEMO
+  data_id: matex.yaml                          # 框架段
+  service_data_id: demo.yaml                   # 服务段；删掉这行则服务段继续读本文件
+  type: yaml                                   # yaml | properties | text
+  timeout: 10s                                 # 首次拉取预算，超时启动失败
+  # 二选一鉴权；环境变量优先
+  username: ${NACOS_USERNAME:nacos}
+  password: ${NACOS_PASSWORD:nacos}
+  # access_key: ${NACOS_ACCESS_KEY:}           # 阿里云 RAM：AK/SK（STS 再加 sts_token）
+  # secret_key: ${NACOS_SECRET_KEY:}
+  log_level: warn                              # SDK 自身日志
+  # log_dir: /var/log/matex-nacos              # 默认 <tmp>/matex-nacos/log
+  # cache_dir: /var/cache/matex-nacos          # 默认 <tmp>/matex-nacos/cache
+
+demo:
+  greeting: "Hello, "    # 只在没有 service_data_id 时使用

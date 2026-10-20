@@ -6,6 +6,7 @@
 | 示例 | 展示的能力 | 外部依赖 | 运行 |
 |---|---|---|---|
 | [config](config/) | 配置加载：tag（`default`/`env`/`optional`）、`${VAR}` 展开、环境变量覆盖 | 无 | `go run ./examples/config` |
+| [nacos](nacos/) | `nacos`：配置中心——本地文件为底、Nacos 覆盖框架段与服务段；服务段热更，namespace/group/账号密码/AK·SK | Nacos（`go test` 用假 source，离线） | `go run ./examples/nacos` |
 | [errors](errors/) | 错误模型 `errs`：Kind → HTTP 状态、业务 code、Wrap 不泄露细节 | 无 | `go run ./examples/errors` |
 | [database](database/) | `db`：三驱动、`?` 占位符、`QueryAll/One/Scalar` 泛型扫描、`WithTx`、`Querier`（DAO 进出事务） | 默认纯 Go SQLite | `go run ./examples/database` |
 | [cache](cache/) | `cache`：cache-aside、并发 miss 合并（防击穿）、TTL 抖动（防雪崩）、写后失效 | Redis | `make dev && go run ./examples/cache` |

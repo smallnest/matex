@@ -8,7 +8,10 @@
 //
 // Run sequence (fail-fast on every step):
 //
-//  1. load config.yaml (path from WithConf / CONFIG_FILE / default)
+//  1. load config.yaml (path from WithConf / CONFIG_FILE / default),
+//     overlaid by the remote config center when one is given
+//     1b. remote config center (optional)  — the file's `nacos:` section or
+//     WithConfig; merged over the file before decoding
 //  2. obs.Init(name, level)            — logging comes first
 //  3. init infra (db/redis/memcache/kafka producer/auth verifier — only
 //     the sections that are configured; the rest stay nil) plus the
@@ -17,8 +20,8 @@
 //     after env.Metrics exists, so services can register custom metrics)
 //  5. httpx server + /healthz /readyz /metrics
 //  6. svc.BuildRouter(srv)             — register routes
-//  7. serve; watch the config file and notify svc of service-section
-//     changes (ConfigWatcher)
+//  7. serve; watch the config file (and the config center, if given) and
+//     notify svc of service-section changes (ConfigWatcher)
 //  8. SIGINT/SIGTERM → graceful shutdown (env blocks → infra close)
 //
 // # Example
@@ -67,6 +70,7 @@ import (
 	"github.com/smallnest/matex/pkg/core/httpx"
 	"github.com/smallnest/matex/pkg/core/kafka"
 	"github.com/smallnest/matex/pkg/core/memcache"
+	"github.com/smallnest/matex/pkg/core/nacos"
 	"github.com/smallnest/matex/pkg/core/obs"
 	"github.com/smallnest/matex/pkg/core/redis"
 	"github.com/smallnest/matex/pkg/core/rpcx"
@@ -89,8 +93,10 @@ type Service interface {
 // ConfigWatcher is the optional hot-reload hook.
 type ConfigWatcher interface {
 	// OnServiceConfigChange is called with the new service section
-	// after the config file changed. Decode it with
-	// config.ParseMap(raw, &cfg).
+	// after the config file or the config center changed. Decode it with
+	// config.ParseMap(raw, &cfg); in a config-center deployment the
+	// section is already a decode of the center's doc, so a re-decode
+	// reports the center's key names, not tag-level errors.
 	OnServiceConfigChange(raw map[string]any)
 }
 
@@ -128,6 +134,9 @@ type FrameworkConfig struct {
 	Redis    redis.Config    `json:"redis" optional:""`
 	Memcache memcache.Config `json:"memcache" optional:""`
 	Kafka    kafka.Config    `json:"kafka" optional:""`
+	// Nacos is the `nacos:` section: it says where the config center is,
+	// so it can only come from the local file.
+	Nacos nacos.Config `json:"nacos" optional:""`
 	// Feature is the `feature:` section: flag name -> on/off. It feeds
 	// pkg/core/feature at startup (env FEATURE_<NAME> and runtime
 	// feature.Set still take precedence).
@@ -274,6 +283,7 @@ func (e *Env) setServiceSection(m map[string]any) { e.section.set(m) }
 type options struct {
 	confPath string
 	noWatch  bool
+	remote   ConfigSource
 }
 
 // Option customizes Run.
@@ -291,6 +301,16 @@ func WithConf(path string) Option {
 
 // WithoutConfigWatch disables the config-file hot reload.
 func WithoutConfigWatch() Option { return func(o *options) { o.noWatch = true } }
+
+// WithConfig merges a config center over the local file. Pass the value
+// returned by nacos.New; a nil source means "no config center".
+func WithConfig(src ConfigSource) Option {
+	return func(o *options) {
+		if src != nil {
+			o.remote = src
+		}
+	}
+}
 
 // Run drives the whole service lifecycle. It blocks until shutdown.
 //
@@ -312,16 +332,50 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 		}
 	}
 
-	// Step 1: config
+	// Step 1: config. The local file is the base; a config center, when
+	// given, overlays its framework keys and the service section.
 	raw, err := config.LoadMap(confPath)
 	if err != nil {
 		return fmt.Errorf("verticle: load config: %w", err)
+	}
+	svcKey := strings.ToLower(svc.Name())
+	var gen *remoteGen
+	var gens chan remoteGen
+	var stopRemote context.CancelFunc
+	src := o.remote
+	if src == nil {
+		// The `nacos:` section lives in the file only: it says where the
+		// center is, so the center cannot say it.
+		var nc cfgNacos
+		if err := config.ParseMap(raw, &nc); err != nil {
+			return fmt.Errorf("verticle: parse nacos config: %w", err)
+		}
+		if nc.Nacos.ServerAddr != "" {
+			c, err := nacos.New(nc.Nacos, svc.Name())
+			if err != nil {
+				return fmt.Errorf("verticle: config center: %w", err)
+			}
+			src = c
+		}
+	}
+	var serviceRaw map[string]any
+	if src != nil {
+		var err error
+		if gen, gens, stopRemote, err = seed(src); err != nil {
+			return fmt.Errorf("verticle: config center: %w", err)
+		}
+		raw = remoteOverlay(raw, gen, svcKey)
+	}
+	serviceRaw, _ = raw[svcKey].(map[string]any)
+	if gen != nil && gen.svc != nil {
+		// A service DataID owns the section: it is not a framework section
+		// and never reaches the framework decode below.
+		serviceRaw = gen.svc
 	}
 	var fc FrameworkConfig
 	if err := config.ParseMap(raw, &fc); err != nil {
 		return fmt.Errorf("verticle: parse framework config: %w", err)
 	}
-	serviceRaw, _ := raw[strings.ToLower(svc.Name())].(map[string]any)
 
 	// Step 2: logging first
 	if err := obs.Init(svc.Name(), fc.Log.Level); err != nil {
@@ -496,6 +550,16 @@ func Run(ctx context.Context, svc Service, opts ...Option) error {
 	if !o.noWatch {
 		stopWatch := watchConfig(ctx, confPath, svc, env)
 		defer stopWatch()
+	}
+	if gen != nil {
+		// The source's subscription outlives the first-fetch budget; it
+		// now ends with the process.
+		boot := *gen
+		go applyRemoteLive(ctx, gens, &boot, svc, env)
+		go func() {
+			<-ctx.Done()
+			stopRemote()
+		}()
 	}
 
 	obs.Info(ctx, "service started", "name", svc.Name(), "conf", confPath)

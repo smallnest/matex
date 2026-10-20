@@ -57,6 +57,7 @@ matex 取**中间偏简**：不做"全家桶"，也不做"迁移专用"，而是
 | 缓存模式 `cache` | 调用处 | 防击穿/防雪崩是数据访问层的职责 |
 | 定时任务 `cron` | `env.Block` | 网关不跑定时任务；多副本选主要业务语义（claim 持整个槽） |
 | 功能开关 `feature` / 审计 `audit` | `feature:` 段、`feature.Set`、`audit.Record` | 开关决定**本进程**走哪条代码路径，网关只能整体路由；审计要记录业务语义（哪笔订单、哪个用户），只有服务自己知道 |
+| 配置中心 `nacos` | `nacos:` 段（或 `verticle.WithConfig`） | 平台化部署把框架段/服务段放进 Nacos 做环境隔离；本地文件仍是底座，服务段实时热更 |
 | pprof | `http.pprof` | 排障必需，但 heap 里可能有凭证，故默认关且只该在受信网络暴露 |
 
 共同约定：**防护组件自身故障时放行**（限流器、幂等存储出错都只记 warn 不拒流量）——
@@ -76,6 +77,7 @@ type Service interface {
 
 ```
 config.LoadMap → 框架段(ParseMap) + 服务段(按 Name 取)
+→ 配置中心（配了 `nacos:` 段或 `WithConfig` 才连）：拉框架段逐键覆盖 + 服务段替换，首次失败即退出
 → obs.Init（日志先行）→ obs.InitTracing（配了 trace 段才建 provider）
 → 未知框架键告警 → feature.Configure（`feature:` 段）
 → 按配置初始化 db/redis/memcache/kafka/auth（配了才建，未配 nil）
@@ -106,7 +108,6 @@ s.hello = helloworld.New(helloworld.Deps{DB: db, Redis: redis, ...})
 
 ## 6. 演进方向（预留、未做）
 
-- 配置中心接入（config.Source 抽象点已预留）。
 - 多服务模板（当前单服务 `cmd/demo`，复制改名即可）。
 - 功能开关的跨副本一致（当前开关只作用于本进程；需一致时由控制面板推 `Set` 或统一发布配置）。
 - 审计事件的不可篡改存储（包只保证字段完整与时间戳，顺序/保留/防篡改由 sink 负责）。

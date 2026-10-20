@@ -193,7 +193,7 @@ db, err := env.RequireDB()</code></pre>
 				<li><b>不 import Web 框架</b>：第二条 depguard 规则，业务代码与示例都适用。</li>
 				<li>
 					<b>无 Docker 也能跑全量测试</b>：SQLite、miniredis、kfake、进程内 gRPC·rpcx，
-					所以 <code>make ci</code> 能验证全部 19 个示例。
+					所以 <code>make ci</code> 能验证全部 20 个示例。
 				</li>
 			</ul>
 			<p>
@@ -204,11 +204,11 @@ db, err := env.RequireDB()</code></pre>
 
 			<h2>代码生成交给 AI</h2>
 			<p>
-				仓库里的 <code>AGENTS.md</code> 加 <code>skills/</code> 下的 14 个 skill 就是生成器。
+				仓库里的 <code>AGENTS.md</code> 加 <code>skills/</code> 下的 15 个 skill 就是生成器。
 				它们随代码演进（改了 <code>httpx</code> 的中间件签名，skill 一起改），而且不要求
 				使用者额外装一个 CLI 来对齐版本。
 			</p>
-			<pre><code class="language-bash">npx skills add smallnest/matex --all   # 一次装齐 14 个 skill</code></pre>
+			<pre><code class="language-bash">npx skills add smallnest/matex --all   # 一次装齐 15 个 skill</code></pre>
 			<p>
 				之后用自然语言描述意图即可：<em>"新增一个订单业务域"</em>、
 				<em>"接 postgres 并加 Redis 缓存"</em>、<em>"给支付接口加幂等和限流"</em>。

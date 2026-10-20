@@ -192,6 +192,8 @@ sequenceDiagram
 				热更只更新服务段配置，不重建 db / redis 连接池——连接池的生命周期与配置的生命周期
 				本来就不同。要改连接参数请滚动重启。
 			</div>
+				<p>这条回调和文件 watch 是同一条：服务段来自本地文件还是 Nacos 配置中心（<code>nacos:</code> 段）没有区别，都是 <code>ConfigWatcher</code> 收到原始 map。区别只在框架段——它启动时建好，远端变化只告警不应用。</p>
+
 
 			<h2>就绪与存活</h2>
 			<p>
@@ -209,6 +211,7 @@ sequenceDiagram
 			<h2>相关示例</h2>
 			<ul>
 				<li><a href="../../examples/lifecycle.html">examples/lifecycle</a>：Block、Closer、热更、就绪门。</li>
+				<li><a href="../../examples/nacos.html">examples/nacos</a>：服务段放进 Nacos，走同一条 ConfigWatcher 热更。</li>
 				<li><a href="../../examples/http.html">examples/http</a>：最小服务的路由注册。</li>
 			</ul>
 		</main>

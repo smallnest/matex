@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>nacos — 配置中心 — matex</title>
+		<meta
+			name="description"
+			content="examples/nacos：用 pkg/core/nacos 把框架段与服务段放进 Nacos，本地文件为底座，服务段实时热更。"
+		/>
+		<link rel="stylesheet" href="../assets/site.css" />
+	</head>
+	<body data-page="examples/nacos">
+		<a class="skip-link" href="#main">跳到正文</a>
+		<main id="main" class="content prose">
+			<h1>nacos — 配置中心</h1>
+			<p class="lede">
+				<code>pkg/core/nacos</code> 把 Nacos 配置中心接到 <code>verticle</code> 上：
+				本地文件是底座，Nacos 覆盖它有的键。框架段（<code>http</code>/<code>log</code>/<code>db</code>/<code>redis</code>…）
+				来自一个 <code>data_id</code>，服务段来自另一个；服务段变化实时生效，走和改本地文件
+				完全一样的 <code>ConfigWatcher</code>。业务代码不 import Nacos SDK。
+			</p>
+
+			<h2>运行</h2>
+			<p>
+				需要一个真实的 Nacos 服务端（<code>make dev</code> 不含它，用官方镜像即可）。
+				HTTP 监听 <code>:8080</code>。先在 Nacos 控制台建好 namespace 与两个配置：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>项</th>
+							<th>值</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>namespace</td>
+							<td><code>demo</code>（填的是 <b>namespace id</b>，不是显示名）</td>
+						</tr>
+						<tr>
+							<td>group</td>
+							<td><code>DEMO</code></td>
+						</tr>
+						<tr>
+							<td>data_id</td>
+							<td><code>matex.yaml</code>：框架段，例如 <code>http: {addr: ":8080"}</code>、<code>log: {level: info}</code></td>
+						</tr>
+						<tr>
+							<td>data_id</td>
+							<td><code>demo.yaml</code>：服务段，例如 <code>greeting: "Hello from Nacos, "</code></td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<pre><code class="language-bash">go run ./examples/nacos
+curl -i localhost:8080/api/v1/greeting/world
+# 在控制台把 demo.yaml 改成 "Hi from Nacos, " → 保存
+# 日志出现 "config reloaded from the center"，接口立刻返回新文案，version +1</code></pre>
+
+			<h2>鉴权</h2>
+			<p>
+				平台化部署通常要按 namespace / group 隔离，鉴权两种方式都支持，且
+				<b>二选一</b>——同时配置会在启动时报错：
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>方式</th>
+							<th>配置</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>账号密码</td>
+							<td><code>username</code> + <code>password</code>（走 Nacos 登录接口）</td>
+						</tr>
+						<tr>
+							<td>阿里云 RAM AK/SK</td>
+							<td><code>access_key</code> + <code>secret_key</code>（走 AK/SK 凭据提供者）</td>
+						</tr>
+						<tr>
+							<td>RAM 临时凭证（STS）</td>
+							<td>AK/SK 之外再加 <code>sts_token</code>（映射到 SDK 的 <code>RamConfig.SecurityToken</code>）</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout callout--note">
+				<span class="callout__label">namespace 填 id，不填显示名</span>
+				namespace 与 group 参与每一次请求，是平台/团队/环境隔离的边界。填错成显示名
+				会导致取回空内容、启动失败。
+			</div>
+
+			<h2>配置（config.yaml）</h2>
+			<pre><code class="language-yaml">nacos:
+  server_addr: ${NACOS_ADDR:localhost:8848}   # 逗号分隔多个地址，可带 https://
+  namespace: demo                              # namespace id
+  group: DEMO
+  data_id: matex.yaml                          # 框架段
+  service_data_id: demo.yaml                   # 服务段；删掉则服务段继续读本地文件
+  type: yaml                                   # yaml | properties | text
+  timeout: 10s                                 # 首次拉取预算
+  username: ${NACOS_USERNAME:nacos}            # 二选一：账号密码
+  password: ${NACOS_PASSWORD:nacos}
+  # access_key: ${NACOS_ACCESS_KEY:}           # 或：RAM AK/SK
+  # secret_key: ${NACOS_SECRET_KEY:}
+  # sts_token: ${NACOS_STS_TOKEN:}             # 临时凭证时再加</code></pre>
+			<p>
+				<code>nacos:</code> 段<b>只能放在本地文件里</b>：它决定去哪里找配置中心，配置中心自己说不出来。
+				不配它、也不传 <code>verticle.WithConfig(...)</code>，进程根本不连 Nacos。
+			</p>
+
+			<h2>启动与热更</h2>
+			<figure class="mermaid-figure">
+				<pre class="mermaid">
+flowchart TD
+    A["读本地 config.yaml"] --> B{"有 nacos: 段\n或有 WithConfig?"}
+    B -- 否 --> L["直接用文件 + 文件 watch"]
+    B -- 是 --> C["首次拉两个 data_id\n（超时 10s，失败即退出）"]
+    C --> D["框架段逐键覆盖文件\n（本地为底座）"]
+    C --> E["服务段：有 service_data_id 用远端\n否则用文件"]
+    D --> F["启动"]
+    E --> F
+    F --> G{"任一 data_id 变化?"}
+    G -- 服务段 --> H["ConfigWatcher 实时生效"]
+    G -- 框架段 --> I["WARN：需要重启 / 滚动发布"]
+    H --> G
+				</pre>
+				<figcaption>
+				远端是本地文件之上的覆盖层。服务段热更与文件 watch 走同一条
+				<code>ConfigWatcher</code> 回调；框架段（连接池、监听、tracing）是启动时建好的，
+				变化只告警不应用，等重启或滚动发布。
+				</figcaption>
+			</figure>
+
+			<p>几个刻意的选择：</p>
+			<ul>
+				<li><b>data_id 不存在 = 启动失败</b>。Nacos 对不存在的 key 回答空内容，若当成"空配置"，
+					服务会带着缺省值悄悄跑起来——比直接退出更难排查。</li>
+				<li><b>首次拉取必须成功</b>：不会用本地缓存快照顶着跑。</li>
+				<li><b>远端 map 逐键合并</b>：远端只写 <code>redis: {addr: ...}</code> 时，本地
+					<code>redis.password</code> 仍保留。</li>
+				<li><b>重载按整体代际</b>：任一 data_id 变化，重新拉取两个 data_id 再一起交付，
+					不会出现新旧混搭。</li>
+				<li><b>半坏的重载不生效</b>：重载拉取/解析失败，保留上一代配置继续跑，不应用一半。</li>
+			</ul>
+
+			<h2>业务代码长什么样</h2>
+			<p>
+				<code>Setup</code> 用 <code>env.DecodeService</code> 读服务段；<code>OnServiceConfigChange</code>
+				热更并<b>拒绝未知键</b>——否则拼错的键会被解码成零值，服务带着空白配置继续跑。
+				除了这行校验，业务代码和"只读文件"完全一样。
+			</p>
+			<pre><code class="language-go">func (s *nacosService) Setup(ctx context.Context, env *verticle.Env) error {
+	var cfg demoConfig
+	return env.DecodeService(&amp;cfg)   // 合并后的结果，和读文件一样
+}
+
+func (s *nacosService) OnServiceConfigChange(raw map[string]any) {
+	var cfg demoConfig
+	if unknown := config.UnknownKeys(raw, &amp;cfg); len(unknown) &gt; 0 {
+		obs.Warn(context.Background(), "reload rejected: unknown keys", "keys", unknown)
+		return
+	}
+	if err := config.ParseMap(raw, &amp;cfg); err != nil {
+		obs.Warn(context.Background(), "reload rejected", "err", err)
+		return
+	}
+	s.mu.Lock()
+	s.greeting = cfg.Greeting
+	s.version++
+	s.mu.Unlock()
+}</code></pre>
+			<div class="callout callout--warn">
+				<span class="callout__label">远端服务段没有 tag 级校验</span>
+				配置中心里的服务段是<b>平铺的 map</b>，<code>ParseMap</code> 只是把值搬进结构体，
+				没有 tag 级校验；本地文件热更有 tag 级解码把关。所以重载前必须用
+				<code>config.UnknownKeys</code> 拒绝未知键。
+			</div>
+
+			<h2>测试</h2>
+			<p>
+				<code>main_test.go</code> <b>不需要 Nacos</b>：实现 <code>verticle.ConfigSource</code> 的假中心
+				起一次 <code>verticle.Run</code>，验证"启动读远端、推送后实时生效"，以及"带未知键的
+				重载被拒绝、运行中配置保持不变"。
+			</p>
+			<pre><code class="language-bash">go test ./examples/nacos</code></pre>
+
+			<h2>相关</h2>
+			<ul>
+				<li><a href="../guide/concepts/config.html">配置</a>：tag 语义、<code>${VAR}</code> 展开、热更，以及配置中心的合并规则。</li>
+				<li><a href="../guide/reference/packages.html">pkg/core 速查</a>：各包入口一览，<code>nacos</code> 这一行。</li>
+				<li><a href="config.html">examples/config</a>：先看本地文件的 tag 语义，再叠加远端。</li>
+				<li><a href="lifecycle.html">examples/lifecycle</a>：<code>ConfigWatcher</code> 的最小用法，与 Nacos 服务段共用。</li>
+				<li>Skill：<code>skills/matex-setup-nacos/SKILL.md</code>。</li>
+				<li><a href="index.html">示例索引</a>。</li>
+			</ul>
+		</main>
+		<script src="../assets/mermaid.min.js" defer></script>
+		<script src="../assets/search-index.js" defer></script>
+		<script src="../assets/site.js" defer></script>
+	</body>
+</html>

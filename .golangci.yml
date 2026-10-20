@@ -24,6 +24,8 @@ linters:
               desc: use pkg/core/memcache
             - pkg: github.com/twmb/franz-go
               desc: use pkg/core/kafka
+            - pkg: github.com/nacos-group/nacos-sdk-go
+              desc: use pkg/core/nacos (verticle.WithConfig)
         # 示例同样示范"业务不碰驱动"：examples/ 下也不得直接 import 驱动。
         # 唯一豁免是 kafka 示例测试用的进程内 broker franz-go/pkg/kfake，
         # 因此本条不 deny franz-go。
@@ -41,6 +43,8 @@ linters:
               desc: use pkg/core/redis
             - pkg: github.com/bradfitz/gomemcache
               desc: use pkg/core/memcache
+            - pkg: github.com/nacos-group/nacos-sdk-go
+              desc: use pkg/core/nacos (verticle.WithConfig)
         # kafka 包自身的测试用 franz-go/pkg/kfake 跑进程内 broker；只豁免这一个文件，
         # 其他代码（包括 kafka 的非测试代码）仍不得 import franz-go。
         kafka-test-fake-broker:

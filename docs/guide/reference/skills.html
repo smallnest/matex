@@ -4,7 +4,7 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<title>AI Skills — matex</title>
-		<meta name="description" content="matex 的 14 个 AI skill：用途、触发语，以及与 AGENTS.md 的关系。" />
+		<meta name="description" content="matex 的 15 个 AI skill：用途、触发语，以及与 AGENTS.md 的关系。" />
 		<link rel="stylesheet" href="../../assets/site.css" />
 	</head>
 	<body data-page="guide/reference/skills">
@@ -29,7 +29,7 @@
 			</div>
 
 			<h2>安装</h2>
-			<pre><code class="language-bash">npx skills add smallnest/matex --all   # 一次装齐 14 个</code></pre>
+			<pre><code class="language-bash">npx skills add smallnest/matex --all   # 一次装齐 15 个</code></pre>
 			<p>
 				插件清单位于 <code>.claude-plugin/plugin.json</code>（插件名 <code>matex-skills</code>），
 				所以也可以只装某几个。
@@ -60,6 +60,11 @@
 							<td><code>matex-setup-redis</code></td>
 							<td>接 Redis：缓存读写、分布式锁</td>
 							<td>"加 redis 做缓存"</td>
+						</tr>
+						<tr>
+							<td><code>matex-setup-nacos</code></td>
+							<td>接 Nacos 配置中心：框架段/服务段两个 data_id、namespace/group/鉴权、服务段热更</td>
+							<td>"接 nacos 配置中心，服务段热更"</td>
 						</tr>
 						<tr>
 							<td><code>matex-setup-memcache</code></td>

@@ -68,6 +68,7 @@
 	/* 示例清单：侧边栏用它列出每个示例，避免"示例页没有 active 项"。 */
 	var EXAMPLES = [
 		{ id: "config", label: "配置" },
+		{ id: "nacos", label: "Nacos 配置中心" },
 		{ id: "errors", label: "错误模型" },
 		{ id: "http", label: "HTTP 与路由" },
 		{ id: "lifecycle", label: "生命周期与热更" },

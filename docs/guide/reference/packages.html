@@ -4,7 +4,7 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<title>pkg/core 速查 — matex</title>
-		<meta name="description" content="matex pkg/core 的 25 个包：用途、是否 opt-in、关键 API 一页速查。" />
+		<meta name="description" content="matex pkg/core 的 26 个包：用途、是否 opt-in、关键 API 一页速查。" />
 		<link rel="stylesheet" href="../../assets/site.css" />
 	</head>
 	<body data-page="guide/reference/packages">
@@ -12,7 +12,7 @@
 		<main id="main" class="content prose">
 			<h1>pkg/core 速查</h1>
 			<p class="lede">
-				25 个包，全部有包级文档注释与直接测试。<b>opt-in</b> 指需要配置文件里存在对应段
+				26 个包，全部有包级文档注释与直接测试。<b>opt-in</b> 指需要配置文件里存在对应段
 				（或代码里显式挂载），否则整个包是 no-op 或干脆不存在。
 			</p>
 
@@ -26,38 +26,43 @@
 							<th>开关</th>
 						</tr>
 					</thead>
-					<tbody>
-						<tr>
-							<td><code>verticle</code></td>
-							<td>服务抽象：<code>Service</code>（Name/Setup/BuildRouter）与 <code>Run</code> 驱动的完整生命周期</td>
-							<td>入口</td>
-						</tr>
-						<tr>
-							<td><code>app</code></td>
-							<td>生命周期容器：HTTP server、后台 Block、逆序清理栈、信号驱动优雅退出</td>
-							<td>由 verticle 使用</td>
-						</tr>
-						<tr>
-							<td><code>config</code></td>
-							<td>YAML 加载、<code>${VAR}</code> 展开、struct tag 默认值与逐字段环境覆盖</td>
-							<td>始终</td>
-						</tr>
-						<tr>
-							<td><code>errs</code></td>
-							<td>错误模型：每个错误带 Kind（→ HTTP 状态）、业务 Code、消息</td>
-							<td>始终</td>
-						</tr>
-						<tr>
-							<td><code>obs</code></td>
-							<td>可观测性：slog 结构化日志、Prometheus 指标、OpenTelemetry 链路</td>
-							<td>日志/指标始终；tracing 需 <code>trace.enabled</code></td>
-						</tr>
-						<tr>
-							<td><code>httpx</code></td>
-							<td>Web 层：无框架的 <code>net/http</code> server、封套 handler 约定、两个中间件槽、默认安全头</td>
-							<td>始终（HTTP 默认形态）</td>
-						</tr>
-					</tbody>
+									<tbody>
+					<tr>
+						<td><code>verticle</code></td>
+						<td>服务抽象：<code>Service</code>（Name/Setup/BuildRouter）与 <code>Run</code> 驱动的完整生命周期</td>
+						<td>入口</td>
+					</tr>
+					<tr>
+						<td><code>app</code></td>
+						<td>生命周期容器：HTTP server、后台 Block、逆序清理栈、信号驱动优雅退出</td>
+						<td>由 verticle 使用</td>
+					</tr>
+					<tr>
+						<td><code>config</code></td>
+						<td>YAML 加载、<code>${VAR}</code> 展开、struct tag 默认值与逐字段环境覆盖</td>
+						<td>始终</td>
+					</tr>
+					<tr>
+						<td><code>nacos</code></td>
+						<td>Nacos 配置中心适配：框架段/服务段两个 data_id，namespace/group/鉴权（账号密码或 AK/SK），服务段热更</td>
+						<td><code>nacos:</code> 段（或 <code>verticle.WithConfig</code>）</td>
+					</tr>
+					<tr>
+						<td><code>errs</code></td>
+						<td>错误模型：每个错误带 Kind（→ HTTP 状态）、业务 Code、消息</td>
+						<td>始终</td>
+					</tr>
+					<tr>
+						<td><code>obs</code></td>
+						<td>可观测性：slog 结构化日志、Prometheus 指标、OpenTelemetry 链路</td>
+						<td>日志/指标始终；tracing 需 <code>trace.enabled</code></td>
+					</tr>
+					<tr>
+						<td><code>httpx</code></td>
+						<td>Web 层：无框架的 <code>net/http</code> server、封套 handler 约定、两个中间件槽、默认安全头</td>
+						<td>始终（HTTP 默认形态）</td>
+					</tr>
+				</tbody>
 				</table>
 			</div>
 

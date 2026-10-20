@@ -23,7 +23,7 @@ docs/
     reference/*.html          pkg/core 速查、目录约定、命令与部署、AI skills
   examples/
     index.html                示例索引
-    <name>.html               19 个示例各一页
+    <name>.html               20 个示例各一页
   design.md                   设计取舍（也在站点外被 README 引用）
   assets/
     site.css                  全部样式（唯一 CSS 文件）

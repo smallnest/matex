@@ -150,9 +150,38 @@ $ grep -c '^db:' configs/config.sqlite.yaml</code></pre>
 				见 <a href="service.html">服务与生命周期</a>。
 			</p>
 
+			<h2>配置中心（Nacos）</h2>
+			<p>
+				本地文件是底座，Nacos 是覆盖层。配了 <code>nacos:</code> 段（或传了
+				<code>verticle.WithConfig</code>），<code>verticle.Run</code> 在读完文件后拉取两个
+				<code>data_id</code>——框架段（<code>http</code>/<code>log</code>/<code>db</code>/<code>redis</code>…）
+				和服务段，逐键合并，再走既有的 <code>ConfigWatcher</code> 热更。
+			</p>
+			<pre><code class="language-yaml">nacos:
+  server_addr: ${NACOS_ADDR:localhost:8848}   # 逗号分隔，可带 https://
+  namespace: demo                              # namespace id，不是显示名
+  group: DEMO
+  data_id: matex.yaml                          # 框架段
+  service_data_id: demo.yaml                   # 服务段；空 = 用文件里的服务段
+  timeout: 10s                                 # 首次拉取预算，失败即退出
+  username: ${NACOS_USERNAME:nacos}            # 二选一：账号密码…
+  password: ${NACOS_PASSWORD:nacos}
+  # access_key: ${NACOS_ACCESS_KEY:}           # …或 RAM AK/SK（STS 再加 sts_token）
+  # secret_key: ${NACOS_SECRET_KEY:}</code></pre>
+			<p>与文件的几个关键差别：</p>
+			<ul>
+				<li><b>服务段实时生效</b>：变化走 <code>ConfigWatcher</code>，和改文件一样；框架段是
+					启动时建好的（连接池、监听、tracing），变化只告警，等重启或滚动发布。</li>
+				<li><b>data_id 不存在 = 启动失败</b>：Nacos 对不存在的 key 回答空内容，不把它当成空配置。</li>
+				<li><b>首次拉取必须成功</b>：不会用本地快照顶着跑。</li>
+				<li><b>远端是平铺 map</b>：重载前用 <code>config.UnknownKeys</code> 拒绝未知键，否则拼错
+					的键会解码成零值。</li>
+			</ul>
+
 			<h2>相关示例</h2>
 			<ul>
 				<li><a href="../../examples/config.html">examples/config</a>：tag 语义、<code>${VAR}</code>、环境覆盖。</li>
+				<li><a href="../../examples/nacos.html">examples/nacos</a>：把框架段与服务段放进 Nacos，服务段实时热更。</li>
 				<li><a href="../../examples/lifecycle.html">examples/lifecycle</a>：热更回调与拒绝非法新配置。</li>
 			</ul>
 		</main>
